@@ -1,0 +1,5 @@
+# Registry of custom verl agent loops. The `name` here must match the
+# dataset row's `agent_name` field (see scripts/prepare_swebench_hf.py) and the
+# string passed to @register(...) in src/agentic_grpo/agent_loop.py.
+- name: swebench_agent
+  _target_: agentic_grpo.agent_loop.SWEBenchAgentLoop

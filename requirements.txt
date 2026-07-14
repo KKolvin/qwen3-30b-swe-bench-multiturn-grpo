@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Multi-turn Agentic GRPO RL Training Pipeline
+# Pinned to known-good ranges for the Qwen3-30B-A3B / 8x B200 stack.
+# Install verl + sglang from their own extras (see README) since they carry
+# heavy CUDA-specific wheels that should match the host driver/torch build.
+# ---------------------------------------------------------------------------
+
+# --- RL framework (actor / ref / GRPO) ---
+# Installed separately with the sglang extra:
+#   pip install "verl[sglang]>=0.5.0"
+# verl>=0.5.0
+
+# --- Rollout engine ---
+# sglang is pulled in by verl[sglang]; pin if installing standalone:
+# sglang>=0.4.6
+
+# --- Multi-turn coding agent + SWE-bench environment ---
+mini-swe-agent>=2.0
+swebench>=3.0.0
+datasets>=2.18.0
+docker>=7.0.0
+
+# --- Core ML ---
+# torch is provided by the verl/sglang install to match CUDA; do not pin here.
+transformers>=4.51.0
+accelerate>=1.0.0
+
+# --- Orchestration / config / metrics ---
+ray>=2.40.0
+cachetools>=5.0
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+pydantic>=2.6
+numpy>=1.26
+
+# --- Experiment tracking (optional but wired in) ---
+wandb>=0.17
+
+# --- Dev / test ---
+pytest>=8.0

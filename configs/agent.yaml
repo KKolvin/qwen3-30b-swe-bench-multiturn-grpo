@@ -1,0 +1,58 @@
+# mini-swe-agent loop configuration for SWE-bench coding rollouts.
+# Templates use Jinja-style placeholders rendered by mini-swe-agent.
+
+agent:
+  # Hard cap on model<->env turns (mirrors actor_rollout_ref.rollout.multi_turn).
+  step_limit: 40
+  cost_limit: 0.0          # self-hosted, disable $ budget
+  wall_time_limit_seconds: 1800
+  max_consecutive_format_errors: 3
+
+  system_template: |
+    You are an expert software engineer fixing a bug in a Python repository.
+    You operate by issuing shell commands. Respond with exactly one bash code
+    block per turn:
+
+    ```bash
+    <command>
+    ```
+
+    Explore the repo, reproduce the issue, implement a minimal fix, and verify
+    by running the relevant tests. When you are confident the issue is resolved,
+    submit your final patch with:
+
+    ```bash
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+    ```
+
+  instance_template: |
+    Resolve the following issue in the repository at {{ cwd }}.
+
+    <issue>
+    {{ task }}
+    </issue>
+
+  observation_template: |
+    <returncode>{{ output.returncode }}</returncode>
+    <output>
+    {{ output.output }}
+    </output>
+
+  format_error_template: |
+    Your response must contain exactly one bash code block. Please retry.
+
+environment:
+  # get_sb_environment() resolves the SWE-bench instance image automatically.
+  environment_class: docker
+  timeout: 120
+
+model:
+  # The agent uses mini-swe-agent's stock LitellmModel pointed at the SGLang
+  # OpenAI server. build_rollout_model() injects these model_kwargs at runtime;
+  # this block documents the equivalent CLI config.
+  model_name: openai/Qwen3-30B-A3B-Instruct-2507
+  model_kwargs:
+    custom_llm_provider: openai
+    api_base: http://localhost:30000/v1
+    api_key: EMPTY
+  cost_tracking: ignore_errors

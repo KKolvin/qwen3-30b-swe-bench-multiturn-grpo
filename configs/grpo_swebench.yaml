@@ -1,0 +1,77 @@
+# verl GRPO config — Qwen3-30B-A3B / 8x B200, full SWE-bench train, 3 epochs.
+# Composes on verl's ppo_trainer defaults (required for reward_model migration, etc.).
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+data:
+  train_files: data/swebench/train.parquet
+  val_files: data/swebench/val.parquet
+  train_batch_size: 256
+  max_prompt_length: 4096
+  max_response_length: 12288
+  return_raw_chat: true
+
+actor_rollout_ref:
+  model:
+    path: /data0/shared/Qwen3-30B-A3B-Instruct-2507
+    trust_remote_code: true
+  actor:
+    optim:
+      lr: 1e-6
+    ppo_mini_batch_size: 256
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_epochs: 1
+    clip_ratio: 0.2
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    loss_agg_mode: token-mean
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  rollout:
+    name: sglang
+    mode: async
+    multi_turn:
+      enable: true
+      max_assistant_turns: 40   # mirrors agent.step_limit
+      format: hermes
+    n: 8                        # GRPO group size (>1 required)
+    tensor_model_parallel_size: 8
+    max_model_len: 16384        # enforced context_length
+    gpu_memory_utilization: 0.85
+    temperature: 1.0
+    top_p: 1.0
+    max_num_seqs: 256           # server running-batch capacity (C) -> SGLang --max-running-requests
+    log_prob_micro_batch_size_per_gpu: 1
+    engine_kwargs:
+      sglang:
+        enable_metrics: true    # expose sglang:num_running_reqs / num_queue_reqs on /metrics
+        attention_backend: flashinfer  # B200 (SM 10.0) — fa3 only supports SM 80-90
+        moe_runner_backend: triton     # avoid flashinfer_trtllm padded layout — breaks FSDP weight sync
+    agent:
+      default_agent_loop: swebench_agent
+      agent_loop_config_path: configs/agent_loop.yaml
+  ref:
+    fsdp_config:
+      param_offload: true
+    log_prob_micro_batch_size_per_gpu: 1
+
+trainer:
+  project_name: agentic-grpo-swebench
+  experiment_name: null  # set by run_grpo.sh to start timestamp (YYYYMMDD-HHMMSS)
+  n_gpus_per_node: 8
+  nnodes: 1
+  total_training_steps: 27   # overridden by run_grpo.sh (ceil(N/256)*3)
+  save_freq: 9
+  test_freq: 9
+  logger: ["console", "wandb"]
