@@ -23,6 +23,7 @@ runnable end-to-end given the engine + actor are provided.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -68,7 +69,33 @@ def rollout_group(
     return results
 
 
-def train(cfg: PipelineConfig, train_path: str, actor=None, engine=None) -> None:
+def _dump_trajectory(sink, step: int, group_idx: int, instance: dict, r, rr) -> None:
+    """Append one per-trajectory record (JSONL) for offline inspection.
+
+    Captures everything a single rollout produced — the full message trace, the
+    submitted diff, the binary reward, and the complete TrajectoryMetrics
+    (token/latency/turn breakdown + harness grading) — so a smoke run can be
+    audited without a trainer/wandb.
+    """
+    rec = {
+        "step": step,
+        "group_idx": group_idx,
+        "instance_id": instance["instance_id"],
+        "reward": rr.reward,
+        "resolved": rr.resolved,
+        "empty_patch": rr.empty_patch,
+        "eval_error": rr.eval_error,
+        "exit_status": r.exit_status,
+        "num_turns": r.metrics.num_turns,
+        "submission": r.submission,
+        "metrics": r.metrics.to_dict(),
+        "messages": r.messages,
+    }
+    sink.write(json.dumps(rec, default=str) + "\n")
+    sink.flush()
+
+
+def train(cfg: PipelineConfig, train_path: str, actor=None, engine=None, traj_out: str | None = None) -> None:
     from transformers import AutoTokenizer
 
     # mini-swe-agent's own model handles generation/parsing/formatting; we only
@@ -79,6 +106,12 @@ def train(cfg: PipelineConfig, train_path: str, actor=None, engine=None) -> None
     adaptor = TrajectoryAdaptor(tokenizer, max_length=cfg.rollout.context_length)
     instances = load_instances(train_path)
     logger.info("Loaded %d training instances.", len(instances))
+
+    traj_sink = None
+    if traj_out:
+        os.makedirs(os.path.dirname(traj_out) or ".", exist_ok=True)
+        traj_sink = open(traj_out, "w")
+        logger.info("Writing per-trajectory records -> %s", traj_out)
 
     rng_cursor = 0
     for step in range(cfg.grpo.total_steps):
@@ -108,8 +141,11 @@ def train(cfg: PipelineConfig, train_path: str, actor=None, engine=None) -> None
             rr = compute_reward(instance, r.submission)
             apply_to_metrics(r.metrics, rr)
             adapted = adaptor.adapt(r.messages, reward=rr.reward, metrics=r.metrics)
-            rewards_by_group[instance["instance_id"]].append(rr.reward)
-            adapted_by_group[instance["instance_id"]].append(adapted)
+            iid = instance["instance_id"]
+            if traj_sink is not None:
+                _dump_trajectory(traj_sink, step, len(rewards_by_group[iid]), instance, r, rr)
+            rewards_by_group[iid].append(rr.reward)
+            adapted_by_group[iid].append(adapted)
             all_metrics.append(r.metrics)
         rollout_s = time.perf_counter() - t_rollout
 
@@ -158,6 +194,9 @@ def train(cfg: PipelineConfig, train_path: str, actor=None, engine=None) -> None
         )
         _maybe_log_wandb(metrics, step, cfg)
 
+    if traj_sink is not None:
+        traj_sink.close()
+
 
 def _maybe_log_wandb(metrics: dict, step: int, cfg: PipelineConfig) -> None:
     if os.environ.get("WANDB_DISABLED", "").lower() in ("1", "true"):
@@ -176,13 +215,15 @@ def main() -> None:
     import math
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--train", default="data/swebench/train.parquet")
+    parser.add_argument("--train", default="data/swebench_verified/train.parquet")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override grpo.train_batch_size (e.g. 1 for a smoke test).")
     parser.add_argument("--group-size", type=int, default=None,
                         help="Override rollout.group_size (rollouts per issue).")
     parser.add_argument("--total-steps", type=int, default=None,
                         help="Override grpo.total_steps (e.g. 1 for a single-step verify).")
+    parser.add_argument("--traj-out", default=None,
+                        help="Write per-trajectory JSONL here (messages, submission, reward, metrics).")
     args = parser.parse_args()
 
     cfg = PipelineConfig()
@@ -207,7 +248,7 @@ def main() -> None:
         "Standalone loop: actor backward pass is an integration point "
         "(pass an FSDP/Megatron actor). Running rollout+reward+advantage only."
     )
-    train(cfg, args.train, actor=None)
+    train(cfg, args.train, actor=None, traj_out=args.traj_out)
 
 
 if __name__ == "__main__":

@@ -1,58 +1,204 @@
-# mini-swe-agent loop configuration for SWE-bench coding rollouts.
-# Templates use Jinja-style placeholders rendered by mini-swe-agent.
+# mini-swe-agent v2 (tool-calling) loop config for SWE-bench coding rollouts.
+# Mirrors the upstream canonical config (minisweagent/config/benchmarks/swebench.yaml):
+# the model drives actions via the native `bash` tool call (BASH_TOOL), NOT
+# text/bash-block parsing. Requires the SGLang server to be launched with
+# `--tool-call-parser qwen25` so the model's <tool_call>{...}</tool_call> output
+# is parsed into OpenAI tool_calls.
 
 agent:
-  # Hard cap on model<->env turns (mirrors actor_rollout_ref.rollout.multi_turn).
-  step_limit: 40
+  # Hard cap on model<->env turns. env_wrapper injects config.agent.step_limit (40)
+  # if omitted; set here to override.
   cost_limit: 0.0          # self-hosted, disable $ budget
   wall_time_limit_seconds: 1800
   max_consecutive_format_errors: 3
 
   system_template: |
-    You are an expert software engineer fixing a bug in a Python repository.
-    You operate by issuing shell commands. Respond with exactly one bash code
-    block per turn:
+    You are a helpful assistant that can interact with a computer shell to solve programming tasks.
 
-    ```bash
-    <command>
-    ```
-
-    Explore the repo, reproduce the issue, implement a minimal fix, and verify
-    by running the relevant tests. When you are confident the issue is resolved,
-    submit your final patch with:
-
-    ```bash
-    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
-    ```
+    You act ONLY by calling the `bash` tool. It is the single tool available, named
+    exactly `bash`, and its one argument `command` is the shell command to run.
+    Every action MUST be a `bash` tool call with name="bash" — never invent other
+    tool names (e.g. do not use "find", "grep", "cat" as the tool name; put those as
+    the `command` argument of a `bash` call instead).
 
   instance_template: |
-    Resolve the following issue in the repository at {{ cwd }}.
+    <pr_description>
+    Consider the following PR description:
+    {{task}}
+    </pr_description>
 
-    <issue>
-    {{ task }}
-    </issue>
+    <instructions>
+    # Task Instructions
 
-  observation_template: |
-    <returncode>{{ output.returncode }}</returncode>
-    <output>
-    {{ output.output }}
-    </output>
+    ## Overview
 
-  format_error_template: |
-    Your response must contain exactly one bash code block. Please retry.
+    You're a software engineer interacting continuously with a computer by submitting commands.
+    You'll be helping implement necessary changes to meet requirements in the PR description.
+    Your task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.
+    <IMPORTANT>This is an interactive process where you will think and issue AT LEAST ONE command, see the result, then think and issue your next command(s).</important>
+
+    For each response:
+
+    1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish
+    2. Provide one or more bash tool calls to execute
+
+    ## Important Boundaries
+
+    - MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)
+    - DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)
+
+    ## Recommended Workflow
+
+    1. Analyze the codebase by finding and reading relevant files
+    2. Create a script to reproduce the issue
+    3. Edit the source code to resolve the issue
+    4. Verify your fix works by running your script again
+    5. Test edge cases to ensure your fix is robust
+
+    ## Command Execution Rules
+
+    You are operating in an environment where
+
+    1. You issue at least one command
+    2. The system executes the command(s) in a subshell
+    3. You see the result(s)
+    4. You write your next command(s)
+
+    Each response should include:
+
+    1. **Reasoning text** where you explain your analysis and plan
+    2. At least one tool call with your command
+
+    **CRITICAL REQUIREMENTS:**
+
+    - Your response SHOULD include reasoning text explaining what you're doing
+    - Your response MUST include AT LEAST ONE bash tool call. You can make MULTIPLE tool calls in a single response when the commands are independent (e.g., searching multiple files, reading different parts of the codebase).
+    - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+
+    Example of a CORRECT response:
+    <example_response>
+    I need to understand the Builder-related code. Let me find relevant files and check the project structure.
+
+    [Makes multiple bash tool calls: {"command": "ls -la"}, {"command": "find src -name '*.java' | grep -i builder"}, {"command": "cat README.md | head -50"}]
+    </example_response>
+
+    ## Environment Details
+
+    - You have a full Linux shell environment
+    - Always use non-interactive flags (-y, -f) for commands
+    - Avoid interactive tools like vi, nano, or any that require user input
+    - You can use bash commands or invoke any tool that is available in the environment
+    - You can also create new tools or scripts to help you with the task
+    - If a tool isn't available, you can also install it
+
+    ## Submission
+
+    When you've completed your work, you MUST submit your changes as a git patch.
+    Follow these steps IN ORDER, with SEPARATE commands:
+
+    Step 1: Create the patch file
+    Run `git diff -- path/to/file1 path/to/file2 > patch.txt` listing only the source files you modified.
+    Do NOT commit your changes.
+
+    <IMPORTANT>
+    The patch must only contain changes to the specific source files you modified to fix the issue.
+    Do not submit file creations or changes to any of the following files:
+
+    - test and reproduction files
+    - helper scripts, tests, or tools that you created
+    - installation, build, packaging, configuration, or setup scripts unless they are directly part of the issue you were fixing (you can assume that the environment is already set up for your client)
+    - binary or compiled files
+    </IMPORTANT>
+
+    Step 2: Verify your patch
+    Inspect patch.txt to confirm it only contains your intended changes and headers show `--- a/` and `+++ b/` paths.
+
+    Step 3: Submit (EXACT command required)
+    You MUST use this EXACT command to submit:
+
+    ```bash
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt
+    ```
+
+    If the command fails (nonzero exit status), it will not submit.
+
+    <CRITICAL>
+    - Creating/viewing the patch and submitting it MUST be separate commands (not combined with &&).
+    - If you modify patch.txt after verifying, you SHOULD verify again before submitting.
+    - You CANNOT continue working (reading, editing, testing) in any way on this task after submitting.
+    </CRITICAL>
+    </instructions>
 
 environment:
   # get_sb_environment() resolves the SWE-bench instance image automatically.
-  environment_class: docker
+  cwd: "/testbed"
   timeout: 120
+  interpreter: ["bash", "-c"]
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: "off"
+    TQDM_DISABLE: "1"
+    # bash -c is non-login so it won't source ~/.bashrc; point BASH_ENV at it so the
+    # image's `conda activate testbed` runs (else commands use the base env, no testbed).
+    BASH_ENV: /root/.bashrc
+  environment_class: docker
 
 model:
-  # The agent uses mini-swe-agent's stock LitellmModel pointed at the SGLang
-  # OpenAI server. build_rollout_model() injects these model_kwargs at runtime;
-  # this block documents the equivalent CLI config.
-  model_name: openai/Qwen3-30B-A3B-Instruct-2507
+  # build_rollout_model() reads observation_template/format_error_template/model_kwargs
+  # from this block and overlays the SGLang connection kwargs (api_base, api_key,
+  # provider, temperature, ...) from RolloutConfig at runtime.
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>
+    The output of your last command was too long.
+    Please try a different command that produces less output.
+    If you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.
+    If you're using grep or find and it produced too much output, you can use a more selective search pattern.
+    If you really need to see something from the full command's output, you can redirect output to a file and then search in that file.
+    </warning>
+    {%- set elided_chars = output.output | length - 10000 -%}
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <elided_chars>
+    {{ elided_chars }} characters elided
+    </elided_chars>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template: |
+    {% if finish_reason is defined and finish_reason in ["length", "tool_calls"] -%}
+    Your previous response reached the output token limit (finish_reason={{ finish_reason }}) before you produced a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call. If you need to think more, do so briefly.
+    {%- else -%}
+    Tool call error:
+
+    <error>
+    {{error}}
+    </error>
+
+    Here is general guidance on how to submit correct toolcalls:
+
+    Every response needs to use the 'bash' tool at least once to execute commands.
+
+    Call the bash tool with your command as the argument:
+    - Tool: bash
+    - Arguments: {"command": "your_command_here"}
+
+    If you have completed your assignment, please consult the first message about how to
+    submit your solution (you will not be able to continue working on this task after that).
+    {%- endif %}
   model_kwargs:
-    custom_llm_provider: openai
-    api_base: http://localhost:30000/v1
-    api_key: EMPTY
-  cost_tracking: ignore_errors
+    drop_params: true
+    parallel_tool_calls: true

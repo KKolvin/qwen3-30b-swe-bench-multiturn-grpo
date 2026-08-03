@@ -47,7 +47,7 @@ class AgentConfig:
 class DataConfig:
     dataset_path: str = DATASET_PATH
     split: str = "train"
-    output_dir: str = "data/swebench"
+    output_dir: str = "data/swebench_verified"
     seed: int = 0
 
 

@@ -81,6 +81,8 @@ def apply_to_metrics(metrics, rr: RewardResult) -> None:
     """Copy harness grading onto a TrajectoryMetrics (single source of truth)."""
     metrics.resolved = rr.resolved
     metrics.reward = rr.reward
+    metrics.empty_patch = rr.empty_patch
+    metrics.eval_error = rr.eval_error
     metrics.patch_applied = rr.patch_applied
     metrics.f2p_passed = rr.f2p_passed
     metrics.f2p_total = rr.f2p_total
@@ -111,7 +113,11 @@ def _grade_with_harness(
     from swebench.harness.test_spec.test_spec import make_test_spec  # type: ignore
 
     instance_id = instance["instance_id"]
-    test_spec = make_test_spec(instance)
+    # namespace="swebench" -> instance_image_key becomes the published name
+    # `swebench/sweb.eval.x86_64.<id>_1776_...`, so run_instance pulls the prebuilt
+    # image (through the daemon-level registry mirror) and reuses the exact image the
+    # rollout cached, instead of building it locally from the env-image chain.
+    test_spec = make_test_spec(instance, namespace="swebench")
     prediction = {
         KEY_INSTANCE_ID: instance_id,
         KEY_MODEL: run_id,

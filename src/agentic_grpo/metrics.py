@@ -20,6 +20,7 @@ owns the authoritative generation-latency breakdown.
 from __future__ import annotations
 
 import time
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterator
@@ -44,6 +45,8 @@ class TrajectoryMetrics:
     edit_count: int = 0       # specific parsing of 'edit' tool calls
     num_turns: int = 0
     truncated: bool = False   # context_length breached -> trajectory cut short
+    format_errors: int = 0        # turns whose tool call we could neither parse nor salvage
+    salvaged_tool_calls: int = 0  # calls hermes rejected but we recovered (see _salvage_tool_calls)
 
     # --- Artifacts ---
     pytest_output_length: int = 0  # size of the harness test log
@@ -51,6 +54,11 @@ class TrajectoryMetrics:
     # --- Outcome (from upstream SWE-bench harness report.json) ---
     resolved: bool = False
     reward: float = 0.0
+    # Why a reward is 0. Without these, "harness is broken" and "agent produced a
+    # wrong patch" are the same number -- which is exactly how a missing swebench
+    # install went unnoticed across two full runs.
+    empty_patch: bool = False     # agent never submitted a diff
+    eval_error: str = ""          # harness raised (missing dep, docker, timeout)
     patch_applied: bool = False   # patch_successfully_applied
     f2p_passed: int = 0           # FAIL_TO_PASS tests that passed
     f2p_total: int = 0
@@ -91,7 +99,18 @@ class TrajectoryMetrics:
             tot = sum(getattr(m, total) for m in batch)
             return (sum(getattr(m, passed) for m in batch) / tot) if tot > 0 else 0.0
 
+        # How episodes ended, as a fraction of the batch. With a binary reward, an
+        # all-zero batch is otherwise opaque: this separates "agent ran out of
+        # turns" (TurnLimit) from "gave up" (NoToolCall), "couldn't emit valid
+        # calls" (FormatErrorLimit) and infra failure (Crashed:*).
+        exits = Counter(m.exit_status or "Unknown" for m in batch)
+
         return {
+            **{f"traj/exit/{status}": count / n for status, count in exits.items()},
+            # If eval_error_rate is not ~0 the reward signal is not measuring the
+            # agent at all -- treat any nonzero value as a broken run, not a hard task.
+            "reward/eval_error_rate": sum(1 for m in batch if m.eval_error) / n,
+            "reward/empty_patch_rate": sum(1 for m in batch if m.empty_patch) / n,
             "traj/resolve_rate": sum(1 for m in batch if m.resolved) / n,
             "traj/mean_reward": mean("reward"),
             "reward/patch_applied_rate": sum(1 for m in batch if m.patch_applied) / n,
@@ -101,6 +120,11 @@ class TrajectoryMetrics:
             "traj/mean_tool_calls": mean("tool_call_count"),
             "traj/mean_edits": mean("edit_count"),
             "traj/truncation_rate": sum(1 for m in batch if m.truncated) / n,
+            # Tool-call health: unparseable calls used to end the episode outright,
+            # so these two decide how much of the batch carries real signal.
+            "traj/mean_format_errors": mean("format_errors"),
+            "traj/format_error_rate": sum(1 for m in batch if m.format_errors) / n,
+            "traj/mean_salvaged_calls": mean("salvaged_tool_calls"),
             "tokens/mean_prompt": mean("prompt_tokens"),
             "tokens/mean_completion": mean("completion_tokens"),
             "tokens/mean_cached_prompt": mean("cached_prompt_tokens"),

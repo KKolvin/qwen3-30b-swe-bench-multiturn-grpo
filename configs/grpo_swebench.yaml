@@ -1,4 +1,4 @@
-# verl GRPO config — Qwen3-30B-A3B / 8x B200, full SWE-bench train, 3 epochs.
+# verl GRPO config — Qwen3-30B-A3B / 8x B200, SWE-bench_Verified train split, 3 epochs.
 # Composes on verl's ppo_trainer defaults (required for reward_model migration, etc.).
 
 hydra:
@@ -14,11 +14,15 @@ algorithm:
   use_kl_in_reward: false
 
 data:
-  train_files: data/swebench/train.parquet
-  val_files: data/swebench/val.parquet
+  train_files: data/swebench_verified/train.parquet
+  val_files: data/swebench_verified/val.parquet
   train_batch_size: 256
   max_prompt_length: 4096
-  max_response_length: 12288
+  # 80 turns of bash need far more than the old 12288: at 40 turns / 12288, 54% of
+  # episodes hit the turn cap mid-edit and 7% already hit the context cap, so
+  # raising turns alone would just convert TurnLimit into ContextLimit.
+  # 4096 + 28672 = 32768 = max_model_len (Qwen3-30B-A3B natively supports 262144).
+  max_response_length: 28672
   return_raw_chat: true
 
 actor_rollout_ref:
@@ -35,27 +39,69 @@ actor_rollout_ref:
     use_kl_loss: true
     kl_loss_coef: 0.001
     loss_agg_mode: token-mean
+    # Must be >= the full sequence length (prompt + response) or long episodes are
+    # silently split/dropped when dynamic batching is enabled.
+    ppo_max_token_len_per_gpu: 32768
     fsdp_config:
       param_offload: false
-      optimizer_offload: false
+      # AdamW allocates exp_avg + exp_avg_sq lazily on the FIRST optimizer step:
+      # 30.5B params x 8 bytes / 8 GPUs ~= 30GB/GPU that did not exist when SGLang
+      # sized its memory pool at init. That pushed the first weight sync to ~204GB
+      # on a 183GB card, so `resume_memory_occupation` OOMed after rollout had run
+      # fine. Keeping the optimizer state on CPU removes that cliff.
+      optimizer_offload: true
   rollout:
     name: sglang
     mode: async
     multi_turn:
       enable: true
-      max_assistant_turns: 40   # mirrors agent.step_limit
+      # 40 was binding: 54% of episodes were cut off mid-edit and only 2/28 ever
+      # reached the submit step. The bash-only scaffold makes editing expensive
+      # (the model burns turns on awk/perl one-liners), so it needs more room.
+      max_assistant_turns: 80
       format: hermes
+      # verl's default of 256 is applied by our loop as a CHARACTER cap on every
+      # tool observation, middle-truncated — so `cat file.py` returned only its
+      # first 128 and last 128 chars. Measured effect: tokens/mean_obs was 67, and
+      # TurnLimit episodes looped (80 actions, 7 distinct commands) because the
+      # agent could not read code or test output. The observation_template in
+      # configs/agent.yaml is written for ~10000 chars, so that logic was dead.
+      # 2000 chars (~500 tokens) is what the context budget affords: at ~46 turns
+      # x (125 assistant + ~500 obs) tokens we stay inside max_response_length,
+      # where tokens/mean_total was only 10514 of 32768. Watch
+      # traj/truncation_rate (was 0.044) if raising this further.
+      max_tool_response_length: 2000
     n: 8                        # GRPO group size (>1 required)
+    # Sized for the full node. To run on fewer cards (e.g. when another user
+    # holds one), do NOT edit this: set AGENTIC_GPUS in run_grpo.sh, which
+    # derives a matching TP + gpu_memory_utilization. TP must divide
+    # n_gpus_per_node.
     tensor_model_parallel_size: 8
-    max_model_len: 16384        # enforced context_length
-    gpu_memory_utilization: 0.85
+    max_model_len: 32768        # enforced context_length (= prompt + response)
+    # Headroom for the bf16 gradients that appear during the actor update; the
+    # pool is sized once at init, before grads/optimizer exist. 0.85 left too
+    # little and OOMed at the first weight sync (see optimizer_offload above).
+    gpu_memory_utilization: 0.75
     temperature: 1.0
     top_p: 1.0
     max_num_seqs: 256           # server running-batch capacity (C) -> SGLang --max-running-requests
     log_prob_micro_batch_size_per_gpu: 1
+    # /metrics is gated on rollout.prometheus.enable, NOT on the engine_kwargs
+    # flag below. verl only sets server_args.enable_metrics (and so only calls
+    # add_prometheus_middleware) inside `if self.config.prometheus.enable:` --
+    # see async_sglang_server.py. With this false, the rollout server answered
+    # 404 on /metrics and every srv/* drain metric silently collected nothing.
+    prometheus:
+      enable: true
+    # Required by the guard in verl/workers/rollout/llm_server.py: enabling
+    # prometheus with disable_log_stats=True (the default) raises
+    #   ValueError: PROMETHEUS needs disable_log_stats==False, but it is currently True.
+    # The stats loop is what populates the sglang:* gauges we scrape anyway.
+    disable_log_stats: false
     engine_kwargs:
       sglang:
-        enable_metrics: true    # expose sglang:num_running_reqs / num_queue_reqs on /metrics
+        # NOT sufficient on its own for /metrics -- see prometheus.enable above.
+        enable_metrics: true
         attention_backend: flashinfer  # B200 (SM 10.0) — fa3 only supports SM 80-90
         moe_runner_backend: triton     # avoid flashinfer_trtllm padded layout — breaks FSDP weight sync
     agent:
@@ -64,6 +110,7 @@ actor_rollout_ref:
   ref:
     fsdp_config:
       param_offload: true
+    log_prob_max_token_len_per_gpu: 32768   # match the widened context
     log_prob_micro_batch_size_per_gpu: 1
 
 trainer:
@@ -72,6 +119,13 @@ trainer:
   n_gpus_per_node: 8
   nnodes: 1
   total_training_steps: 27   # overridden by run_grpo.sh (ceil(N/256)*3)
-  save_freq: 9
+  # Checkpoint every 2 steps so a stop loses at most 2 steps of work (~5h at the
+  # measured ~2.5h/step). verl also always saves on the last step, so a 6-step run
+  # writes global_step_2, _4 and _6. Resume with AGENTIC_RESUME=<exp-name> in
+  # run_grpo.sh. NOTE: a 30B FSDP checkpoint is ~60GB+ and max_actor_ckpt_to_keep
+  # is unset (keep ALL), so N/2 checkpoints accumulate on /data0 — 3 x ~60GB =
+  # ~180GB for a 6-step run against ~467GB free. Set max_actor_ckpt_to_keep if
+  # total_training_steps grows.
+  save_freq: 2
   test_freq: 9
   logger: ["console", "wandb"]

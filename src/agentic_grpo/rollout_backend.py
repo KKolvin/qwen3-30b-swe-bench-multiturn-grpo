@@ -29,22 +29,37 @@ from agentic_grpo.config import RolloutConfig
 logger = logging.getLogger("agentic_grpo.rollout_backend")
 
 
-def build_rollout_model(cfg: RolloutConfig, extra_model_kwargs: dict | None = None) -> Any:
-    """Return mini-swe-agent's model, talking to the SGLang OpenAI server.
+def build_rollout_model(
+    cfg: RolloutConfig,
+    extra_model_kwargs: dict | None = None,
+    agent_config_path: str = "configs/agent.yaml",
+) -> Any:
+    """Return mini-swe-agent's v2 tool-calling model, talking to SGLang.
 
-    SGLang's server (``python -m sglang.launch_server ... --port 30000``) speaks
-    the OpenAI API, so litellm reaches it with ``custom_llm_provider="openai"``
-    and ``api_base``. mini-swe-agent then does all the agent-side work itself.
+    SGLang's server (``python -m sglang.launch_server ... --port 30000
+    --tool-call-parser qwen25``) speaks the OpenAI API *with* tool calls, so the
+    stock ``LitellmModel`` (get_model default) reaches it with
+    ``custom_llm_provider="openai"`` + ``api_base`` and drives actions via the
+    ``bash`` tool. mini-swe-agent does all the agent-side work itself.
+
+    Model-level config (``observation_template``, ``format_error_template``,
+    ``model_kwargs`` such as ``parallel_tool_calls``) is sourced from the
+    ``model:`` block of ``agent_config_path`` — the single source of truth,
+    mirroring the upstream config layout — and the SGLang connection kwargs are
+    overlaid on top of it here.
 
     We don't stream to measure TTFT client-side: the server publishes TTFT,
-    inter-token and e2e latency on its ``/metrics`` endpoint (see
-    :mod:`agentic_grpo.server_monitor`), which is ground truth and adds no
-    rollout-hot-path overhead. Token usage is read from the response
-    mini-swe-agent already builds.
+    inter-token and e2e latency on its ``/metrics`` endpoint, which is ground
+    truth. Token usage is read from the response mini-swe-agent already builds.
     """
+    import os
+
+    import yaml
+
     from minisweagent.models import get_model  # type: ignore
 
-    model_kwargs = {
+    # SGLang OpenAI connection kwargs (win over any model_kwargs from the yaml).
+    conn_kwargs = {
         "api_base": cfg.base_url,
         "api_key": "EMPTY",
         "custom_llm_provider": "openai",
@@ -52,6 +67,14 @@ def build_rollout_model(cfg: RolloutConfig, extra_model_kwargs: dict | None = No
         "top_p": cfg.top_p,
         "max_tokens": cfg.max_new_tokens,
     }
+
+    # Pull the model block (templates + model_kwargs) from the agent yaml.
+    model_cfg: dict = {}
+    if agent_config_path and os.path.isfile(agent_config_path):
+        loaded = yaml.safe_load(open(agent_config_path)) or {}
+        model_cfg = dict(loaded.get("model", {}) or {})
+    model_kwargs = dict(model_cfg.pop("model_kwargs", {}) or {})
+    model_kwargs.update(conn_kwargs)
     if extra_model_kwargs:
         model_kwargs.update(extra_model_kwargs)
 
@@ -61,6 +84,7 @@ def build_rollout_model(cfg: RolloutConfig, extra_model_kwargs: dict | None = No
             "model_kwargs": model_kwargs,
             # Self-hosted: don't fail rollouts on missing cost metadata.
             "cost_tracking": "ignore_errors",
+            **model_cfg,  # observation_template, format_error_template, ...
         }
     )
 

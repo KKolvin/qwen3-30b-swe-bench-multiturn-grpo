@@ -32,6 +32,14 @@ logger = logging.getLogger("agentic_grpo.server_monitor")
 
 _PREFIX = "sglang:"
 
+# Scrape the rollout server DIRECTLY, never through an HTTP proxy. urllib honours
+# http_proxy/HTTP_PROXY from the environment, and this host exports
+# HTTP_PROXY=http://127.0.0.1:12233 with no_proxy covering only localhost -- so
+# every scrape of the node IP was proxied and came back 404, which _fetch could
+# not distinguish from an idle server. The rollout server is always on the
+# cluster's own network, so a proxy is never correct here.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def parse_prometheus(text: str) -> dict[str, float]:
     """Parse Prometheus exposition text into ``{metric_name: value}``.
@@ -100,6 +108,7 @@ class SGLangServerMonitor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._checkpoint = 0.0  # wall time up to which samples were already summarised
+        self._warned = False  # one-shot guard for _warn_once (a poll loop would spam)
 
     # -- lifecycle -----------------------------------------------------
     def start(self) -> "SGLangServerMonitor":
@@ -127,14 +136,28 @@ class SGLangServerMonitor:
 
     def _fetch(self) -> ServerSample | None:
         try:
-            with urllib.request.urlopen(self.metrics_url, timeout=2.0) as resp:
+            with _OPENER.open(self.metrics_url, timeout=2.0) as resp:
                 text = resp.read().decode("utf-8", "replace")
-        except Exception:  # network hiccup / server busy -> skip this tick
+        except Exception as exc:  # network hiccup / server busy -> skip this tick
+            self._warn_once(f"request failed: {exc!r}")
             return None
         d = parse_prometheus(text)
         if "num_running_reqs" not in d:
+            # A 200 that lacks the gauges means we are talking to the wrong thing
+            # (a proxy, a different service) or metrics are off server-side. Both
+            # used to be indistinguishable from "server idle".
+            self._warn_once(
+                f"response has no sglang:num_running_reqs "
+                f"(first 120 chars: {text[:120]!r}) -- srv/* will stay empty"
+            )
             return None
         return ServerSample(t=time.time(), raw=d)
+
+    def _warn_once(self, msg: str) -> None:
+        """Log a scrape problem the first time only; a poll loop would spam."""
+        if not self._warned:
+            self._warned = True
+            logger.warning("server_monitor: %s (url=%s)", msg, self.metrics_url)
 
     # -- analysis ------------------------------------------------------
     def _snapshot(self) -> list[ServerSample]:
@@ -263,21 +286,117 @@ def metrics_url_from_base(base_url: str) -> str:
     return f"{root}/metrics"
 
 
+def discover_metrics_url() -> str | None:
+    """Resolve a rollout replica's ``/metrics`` URL from verl's Ray actors.
+
+    verl launches each SGLang replica on an EPHEMERAL port, so there is no static
+    URL to configure -- which is why drain metrics silently collected nothing for
+    every run before this existed. But it registers each replica as a *named* Ray
+    actor, ``sglang_server_<replica_rank>_<node_rank>``, exposing
+    ``get_server_address()``; that is how the rollout worker finds its own server
+    (verl/workers/rollout/sglang_rollout/sglang_rollout.py). We reuse the same
+    handle to build the scrape URL.
+
+    Returns None (never raises) when Ray is unavailable, no replica is registered
+    yet, or the address cannot be fetched -- the monitor is diagnostics, and must
+    never be able to take a training run down.
+    """
+    try:
+        import ray
+    except ImportError:
+        return None
+    try:
+        if not ray.is_initialized():
+            return None
+        # Reward-model and teacher servers share the prefix; exclude them so we
+        # scrape the ROLLOUT engine whose drain phase we actually care about.
+        # all_namespaces=True: the rollout servers are registered by verl's worker
+        # actors, which are not guaranteed to share this process's Ray namespace.
+        # Scoping to the current namespace can make discovery return nothing --
+        # which is exactly how this silently collected zero drain metrics.
+        try:
+            visible = ray.util.list_named_actors(all_namespaces=True)
+        except TypeError:  # older ray without the kwarg
+            visible = ray.util.list_named_actors()
+        # all_namespaces=True yields dicts {name, namespace}; the scoped call
+        # yields plain strings. Normalise to (name, namespace) pairs.
+        pairs = [
+            (a["name"], a.get("namespace")) if isinstance(a, dict) else (a, None)
+            for a in visible
+        ]
+        names = [
+            (n, ns)
+            for n, ns in pairs
+            if n.startswith("sglang_server_")
+            and not n.startswith(("sglang_server_reward_", "sglang_server_teacher_"))
+        ]
+        if not names:
+            # WARNING, not silence: this is the branch that made drain metrics
+            # vanish without a trace. Print what IS registered so a failed run is
+            # diagnosable instead of just empty.
+            logger.warning(
+                "server_monitor: no rollout sglang_server_* actor found; drain "
+                "metrics disabled this step. Visible named actors: %s",
+                ", ".join(f"{n}@{ns}" for n, ns in sorted(pairs)) or "(none)",
+            )
+            return None
+        # One URL per monitor, so with several replicas (TP < n_gpus) this samples
+        # ONE of them: running/queue counts are then per-replica, not cluster-wide.
+        # Say so rather than let the numbers look global.
+        if len(names) > 1:
+            logger.warning(
+                "server_monitor: %d rollout replicas registered (%s); scraping only %s -- "
+                "srv/* metrics describe that replica, not the whole cluster.",
+                len(names),
+                ", ".join(f"{n}@{ns}" for n, ns in sorted(names)),
+                sorted(names)[0][0],
+            )
+        name, namespace = sorted(names)[0]
+        # Pass the namespace explicitly: the actor may live outside this process's
+        # namespace, in which case a bare get_actor(name) raises ValueError.
+        handle = (
+            ray.get_actor(name, namespace=namespace) if namespace else ray.get_actor(name)
+        )
+        address, port = ray.get(handle.get_server_address.remote())
+        # verl brackets IPv6 literals before building URLs; match that or the URL
+        # is unparseable.
+        host = f"[{address}]" if ":" in str(address) else address
+        url = f"http://{host}:{port}/metrics"
+        # WARNING not INFO: nothing configures the agentic_grpo logger below
+        # WARNING in a training run, so an INFO line here is invisible and success
+        # is indistinguishable from silent failure. This fires once per run.
+        logger.warning("server_monitor: scraping %s (Ray actor %s@%s)", url, name, namespace)
+        return url
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break training
+        logger.warning("server_monitor: Ray discovery of /metrics failed: %r", exc)
+        return None
+
+
 def get_shared_monitor() -> SGLangServerMonitor | None:
-    """Lazily build+start the shared monitor from env, or return None.
+    """Lazily build+start the shared monitor, or return None.
+
+    The URL comes from ``AGENTIC_SGLANG_METRICS_URL`` if set, otherwise it is
+    discovered from verl's Ray actors (see :func:`discover_metrics_url`).
 
     Env:
-      * ``AGENTIC_SGLANG_METRICS_URL``   - full ``/metrics`` URL (required to enable)
+      * ``AGENTIC_SGLANG_METRICS_URL``   - full ``/metrics`` URL; overrides discovery
+      * ``AGENTIC_SGLANG_METRICS``       - set to "0"/"off"/"false" to disable entirely
       * ``AGENTIC_MAX_RUNNING_REQUESTS`` - server capacity C (else observed peak)
       * ``AGENTIC_METRICS_POLL_INTERVAL``- seconds between scrapes (default 1.0)
     """
     global _SHARED, _SHARED_INIT
     if _SHARED_INIT:
         return _SHARED
-    _SHARED_INIT = True
-    url = os.environ.get("AGENTIC_SGLANG_METRICS_URL")
-    if not url:
+    if os.environ.get("AGENTIC_SGLANG_METRICS", "").lower() in {"0", "off", "false", "no"}:
+        _SHARED_INIT = True
         return None
+    url = os.environ.get("AGENTIC_SGLANG_METRICS_URL") or discover_metrics_url()
+    if not url:
+        # Deliberately do NOT latch here. This is called once per step, and on the
+        # very first call the replica may not be registered yet; latching would
+        # disable drain metrics for the entire run over a startup race.
+        return None
+    _SHARED_INIT = True
     cap_env = os.environ.get("AGENTIC_MAX_RUNNING_REQUESTS", "")
     interval_env = os.environ.get("AGENTIC_METRICS_POLL_INTERVAL", "")
     capacity = int(cap_env) if cap_env.isdigit() else None
