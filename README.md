@@ -4,7 +4,7 @@ Synchronous **GRPO** (Group Relative Policy Optimization) training for a
 multi-turn coding agent evaluated on **SWE-bench**.
 
 - **Model:** Qwen3-30B-A3B-Instruct-2507 (`/data0/shared/Qwen3-30B-A3B-Instruct-2507`)
-- **Dataset:** SWE-bench train (`/data1/shared/swe_bench_train_hf`), full set, 3 epochs
+- **Dataset:** SWE-bench_Verified (`SWE-bench/SWE-bench_Verified`), 500 instances, 3 epochs
 - **Hardware:** 8× NVIDIA B200
 - **RL framework:** [verl](https://github.com/verl-project/verl) (actor / ref / GRPO)
 - **Rollout engine:** [SGLang](https://github.com/sgl-project/sglang), synchronous (`policy_lag = 0`)
@@ -33,66 +33,50 @@ python scripts/prepare_swebench_hf.py
 bash scripts/run_grpo.sh
 ```
 
-Standalone loop (for auditing without a full verl cluster):
-
-```bash
-python -m sglang.launch_server --model-path /data0/shared/Qwen3-30B-A3B-Instruct-2507 \
-    --tp 8 --context-length 16384 --port 30000 &
-
-python scripts/train_standalone.py --train data/swebench/train.parquet
-```
-
-
 
 ## Architecture
 
 ```
-                         ┌────────────────────────────────────────────┐
- SWE-bench issue ──▶     │  SWEBenchAgentWrapper  (env_wrapper.py)    │
-                         │  wraps mini-swe-agent DefaultAgent loop    │
-                         │   ├─ query()           → SGLang generation │◀─┐ weights
-                         │   └─ execute_actions() → docker tool obs   │  │ (policy_lag=0)
-                         └───────────────┬───────────────────────────┬┘  │
-                                         │ messages + submission     │   │
-                            ┌────────────▼─────────────┐   ┌─────────▼───┴────────┐
-                            │ reward.py                │   │ rollout_backend.py   │
-                            │ swebench harness → 0/1   │   │ SGLangRolloutModel   │
-                            └────────────┬─────────────┘   │ + sync_weights()     │
-                                         │                 └──────────────────────┘
-                            ┌────────────▼──────────────────────────────────────┐
-                            │ trajectory_adaptor.py                             │
-                            │ TrajectoryMetrics (token/latency profiling)       │
-                            │ TrajectoryAdaptor → input_ids + response_mask     │
-                            └────────────┬──────────────────────────────────────┘
-                                         │ group rewards
-                            ┌────────────▼───────────────┐
-                            │ grpo.py                    │
-                            │ group-normalized advantage │ → verl actor update → sync_weights ↺
-                            └────────────────────────────┘
+   verl trainer (Ray) ──── weights, policy_lag=0 ────▶  SGLang rollout server
+          │                                                      ▲
+          │ one AgentLoop.run() per sampled prompt               │ token-in / token-out
+          ▼                                                      │
+   ┌─────────────────────────────────────────────────────────────┴──────┐
+   │ agent_loop.py   SWEBenchAgentLoop                                  │
+   │   generate ─▶ parse <tool_call> ─▶ run tool in docker ─▶ append obs│
+   │   tools: bash | str_replace_based_edit_tool (editor_tool.py)       │
+   │   ends on submit marker / turn limit / context limit ─▶ patch      │
+   └───────────────┬────────────────────────────────────┬───────────────┘
+                   │ patch                              │ TrajectoryMetrics + timeline events
+      ┌────────────▼─────────────┐         ┌────────────▼──────────────────────────┐
+      │ reward.py                │         │ metrics.py · timeline.py              │
+      │ swebench harness → 0/1   │         │ sglang_timing.py · server_monitor.py  │
+      └────────────┬─────────────┘         └───────────────────────────────────────┘
+                   ▼
+      reward on last token ─▶ verl GRPO advantage ─▶ actor update ─▶ weight sync ↺
 ```
-
-
 
 ## Layout
 
 
 | Path                                     | Role                                  |
 | ---------------------------------------- | ------------------------------------- |
-| `src/agentic_grpo/config.py`             | Hardcoded paths & hyperparameters     |
-| `src/agentic_grpo/env_wrapper.py`        | Agent wrapper (reuses mini-swe-agent) |
-| `src/agentic_grpo/rollout_backend.py`    | SGLang glue + on-policy weight sync   |
-| `src/agentic_grpo/trajectory_adaptor.py` | Trajectory → masked GRPO tensors      |
+| `src/agentic_grpo/config.py`             | AgentConfig + container env resolution |
+| `src/agentic_grpo/agent_loop.py`         | verl AgentLoop: the multi-turn rollout |
+| `src/agentic_grpo/tools.py`              | Tool registry: schema + arg shaping + runner per tool |
+| `src/agentic_grpo/tool_calls.py`         | Sampled text → (tool, args): strict parse + salvage |
+| `src/agentic_grpo/editor_tool.py`        | str_replace_based_edit_tool (next to bash) |
 | `src/agentic_grpo/metrics.py`            | Per-trajectory metrics (client-side)  |
 | `src/agentic_grpo/server_monitor.py`     | Server-side latency/drain (SGLang `/metrics`) |
+| `src/agentic_grpo/sglang_timing.py`      | Per-request queue/prefill/decode timestamps |
+| `src/agentic_grpo/timeline.py`           | Run timeline: every rollout + training event, timestamped |
 | `src/agentic_grpo/reward.py`             | Binary SWE-bench reward               |
-| `src/agentic_grpo/grpo.py`               | Group-relative advantage estimation   |
-| `src/agentic_grpo/agent_loop.py`         | verl AgentLoop integration            |
 | `configs/grpo_swebench.yaml`             | verl trainer config                   |
 | `configs/agent.yaml`                     | mini-swe-agent loop config            |
 | `scripts/prepare_swebench_hf.py`         | Download + convert a gradable SWE-bench set to parquet |
-| `scripts/prepare_one.py`                 | 1-instance parquet + docker image pull recipe |
+| `scripts/prepare_one.py`                 | 1-instance parquet + docker image name (smoke test) |
 | `scripts/run_grpo.sh`                    | Launch training                       |
-| `scripts/train_standalone.py`            | Standalone synchronous loop           |
+| `scripts/build_timeline.py`              | Merge a run's timeline shards into one `timeline.json` |
 
 
 
@@ -102,4 +86,8 @@ python scripts/train_standalone.py --train data/swebench/train.parquet
 ```bash
 pytest -q
 ```
+
+The suite has no verl/sglang/CUDA dependency — `agent_loop.py` falls back to
+attribute-compatible stubs for verl's `AgentLoopBase`/`AgentLoopOutput` when the
+import fails, so the unit tests run on a bare laptop checkout.
 
