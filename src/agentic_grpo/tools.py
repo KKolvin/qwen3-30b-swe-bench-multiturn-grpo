@@ -1,21 +1,24 @@
 """The tools the agent can call: one :class:`Tool` per name, in one place.
 
 A tool is its prompt schema, how to shape the model's decoded ``arguments``
-into something its runner accepts, the runner itself, and a one-line summary
-for the timeline. ``agent_loop`` never names a tool: it advertises
-:func:`schemas`, shapes arguments through :mod:`agentic_grpo.tool_calls`, and
-executes through :func:`run`. Adding a tool is a new module plus one
-:class:`Tool` here.
+into something its runner accepts, the runner itself, a one-line summary for
+the timeline, and the phrase the format-error nudge uses for its arguments.
+Each tool's implementation lives in its own module (:mod:`agentic_grpo.bash_tool`,
+:mod:`agentic_grpo.editor_tool`); this module only adapts them to one shape and
+says which are active. ``agent_loop`` never names a tool: it advertises
+:func:`schemas`, shapes arguments through :mod:`agentic_grpo.tool_calls`,
+executes through :func:`run`, and words its prompts with :func:`names`,
+:func:`call_shapes` and :func:`edit_tool_enabled`. Adding a tool is a new
+module plus one :class:`Tool` here.
 """
 
 from __future__ import annotations
 
 import os
-import shlex
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from agentic_grpo.editor_tool import EDIT_TOOL_NAME, EDIT_TOOL_SCHEMA, run_edit_tool, summarize_call
+from agentic_grpo import bash_tool, editor_tool
 
 Observation = dict
 RunResult = tuple[Observation, "str | None"]  # (observation, submission-or-None)
@@ -31,115 +34,28 @@ class Tool:
     normalize: Callable[[Any], "dict | None"]
     run: Callable[[Any, dict], RunResult]
     summarize: Callable[[dict], str]
-
-
-# --------------------------------------------------------------------------- #
-# bash
-# --------------------------------------------------------------------------- #
-# Identical to mini-swe-agent's BASH_TOOL; used when that import is unavailable.
-BASH_TOOL_FALLBACK = {
-    "type": "function",
-    "function": {
-        "name": "bash",
-        "description": "Execute a bash command",
-        "parameters": {
-            "type": "object",
-            "properties": {"command": {"type": "string", "description": "The bash command to execute"}},
-            "required": ["command"],
-        },
-    },
-}
-
-
-def bash_tool_schema() -> dict:
-    try:
-        from minisweagent.models.utils.actions_toolcall import BASH_TOOL  # type: ignore
-
-        return BASH_TOOL
-    except Exception:
-        return BASH_TOOL_FALLBACK
-
-
-# Qwen3 does not always name the field ``command``; these are the aliases seen
-# in practice. Ordered, because a block may carry more than one.
-COMMAND_KEYS = ("command", "cmd", "shell", "script", "bash_command")
-
-
-def coerce_command(value: Any) -> str:
-    """A command written as a list is argv, not JSON — join it back into a line.
-
-    ``shlex.join`` rather than ``" ".join`` because ``["bash", "-c", "echo hi"]``
-    means ``bash -c 'echo hi'``; a bare space join would drop the grouping and
-    run something else entirely.
-    """
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list) and all(isinstance(x, str) for x in value):
-        return shlex.join(value)
-    return ""
-
-
-def first_command(d: dict) -> str:
-    """The first of :data:`COMMAND_KEYS` present in ``d`` that yields a command."""
-    for k in COMMAND_KEYS:
-        if k in d:
-            cmd = coerce_command(d[k])
-            if cmd:
-                return cmd
-    return ""
-
-
-def normalize_bash(args: Any) -> dict | None:
-    """``{"command": str}`` from a dict (any alias), a bare string, or nothing."""
-    if isinstance(args, str):
-        return {"command": args} if args else None
-    if isinstance(args, dict):
-        cmd = first_command(args)
-        return {"command": cmd} if cmd else None
-    return None
-
-
-def run_bash(env: Any, command: str) -> RunResult:
-    """Run one shell command in the container.
-
-    ``submission`` is non-None only when the command triggered mini-swe-agent's
-    submit marker (``env.execute`` raises ``Submitted`` carrying the patch).
-    """
-    from minisweagent.exceptions import Submitted  # type: ignore
-
-    if not command:
-        return {"returncode": -1, "output": "Missing 'command' argument in bash tool call."}, None
-    try:
-        return env.execute({"command": command}), None
-    except Submitted as e:
-        submission = e.messages[0].get("extra", {}).get("submission", "") if e.messages else ""
-        return {"returncode": 0, "output": ""}, submission
+    # How the malformed-call nudge describes this tool's arguments; it completes
+    # the clause ``a "name" of "<name>" with ...`` (see :func:`call_shapes`).
+    usage: str
 
 
 BASH = Tool(
-    name="bash",
-    schema=bash_tool_schema(),
-    normalize=normalize_bash,
-    # Looked up at call time so tests can stub ``run_bash`` on this module.
-    run=lambda env, args: run_bash(env, args.get("command", "")),
-    summarize=lambda args: args.get("command", ""),
+    name=bash_tool.BASH_TOOL_NAME,
+    schema=bash_tool.bash_tool_schema(),
+    normalize=bash_tool.normalize_args,
+    # Resolved on the module at call time so tests can stub ``bash_tool.run_bash``.
+    run=lambda env, args: bash_tool.run_bash(env, args.get("command", "")),
+    summarize=bash_tool.summarize_call,
+    usage='an "arguments" object holding "command"',
 )
 
-
-# --------------------------------------------------------------------------- #
-# str_replace_based_edit_tool
-# --------------------------------------------------------------------------- #
-def normalize_editor(args: Any) -> dict | None:
-    """The editor validates its own fields; only a dict with a sub-command is worth passing on."""
-    return args if isinstance(args, dict) and "command" in args else None
-
-
 EDITOR = Tool(
-    name=EDIT_TOOL_NAME,
-    schema=EDIT_TOOL_SCHEMA,
-    normalize=normalize_editor,
-    run=lambda env, args: (run_edit_tool(env, args), None),
-    summarize=summarize_call,
+    name=editor_tool.EDIT_TOOL_NAME,
+    schema=editor_tool.EDIT_TOOL_SCHEMA,
+    normalize=editor_tool.normalize_args,
+    run=lambda env, args: (editor_tool.run_edit_tool(env, args), None),
+    summarize=editor_tool.summarize_call,
+    usage='its "command"/"path"/... arguments',
 )
 
 
@@ -147,7 +63,13 @@ EDITOR = Tool(
 # the active set
 # --------------------------------------------------------------------------- #
 def edit_tool_enabled() -> bool:
-    """``AGENTIC_EDIT_TOOL=0`` runs the bash-only harness from the same code (A/B)."""
+    """``AGENTIC_EDIT_TOOL=0`` runs the bash-only harness from the same code (A/B).
+
+    Everything that mentions a tool to the model goes through this, directly or
+    via :func:`active`: the advertised schemas, the system/instance prompts (as
+    the ``edit_tool`` template variable), the format-error nudges and the
+    unknown-tool observation. A bash-only run therefore never hears of the editor.
+    """
     return os.environ.get("AGENTIC_EDIT_TOOL", "1") != "0"
 
 
@@ -164,15 +86,29 @@ def schemas() -> list[dict]:
     return [t.schema for t in active()]
 
 
+def names(quote: str = "`", sep: str = " or ") -> str:
+    """The active tool names for prompt text: ```bash` or `str_replace_based_edit_tool```."""
+    return sep.join(f"{quote}{t.name}{quote}" for t in active())
+
+
+def call_shapes() -> str:
+    """One clause per active tool, for the malformed-call nudge.
+
+    ``a "name" of "bash" with an "arguments" object holding "command", or a "name"
+    of "str_replace_based_edit_tool" with its "command"/"path"/... arguments``
+    """
+    return ", or ".join(f'a "name" of "{t.name}" with {t.usage}' for t in active())
+
+
 def summarize(name: str, args: dict) -> str:
     """One line for the timeline/dump: the command for bash, ``view /path`` for the editor."""
     return (lookup(name) or BASH).summarize(args)
 
 
 def unknown_tool_message(name: str) -> str:
-    names = " and ".join(f"'{t.name}'" for t in active())
+    available = names(quote="'", sep=" and ")
     return (
-        f"Unknown tool '{name}'. Available tools: {names}. "
+        f"Unknown tool '{name}'. Available tools: {available}. "
         "Put shell commands in the `command` argument of a `bash` call."
     )
 

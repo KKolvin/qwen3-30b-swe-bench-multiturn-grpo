@@ -22,11 +22,12 @@ What we reuse rather than reinvent:
   tokens), and ``AgentLoopOutput`` (its ``reward_score`` field drops our binary
   reward onto the last token as ``rm_scores``).
 * **mini-swe-agent** — ``get_sb_environment`` (the per-instance SWE-bench docker
-  container), the ``bash`` tool schema (``BASH_TOOL``, via :mod:`agentic_grpo.tools`),
+  container), the ``bash`` tool schema (``BASH_TOOL``, via :mod:`agentic_grpo.bash_tool`),
   and the prompt/observation templates from ``configs/agent.yaml``. ``env.execute`` raises ``Submitted`` when
   the agent runs the submit marker, carrying the final patch.
 * **ours** — ``compute_reward`` (SWE-bench harness), ``TrajectoryMetrics``, the
-  tool registry (:mod:`agentic_grpo.tools`: ``bash`` + the edit tool), and the
+  tool registry (:mod:`agentic_grpo.tools`, one adapter each over
+  :mod:`agentic_grpo.bash_tool` and :mod:`agentic_grpo.editor_tool`), and the
   tool-call parse/salvage layer (:mod:`agentic_grpo.tool_calls`).
 
 The blocking bits (docker container create / ``env.execute`` / the harness) are
@@ -46,17 +47,15 @@ import time
 import yaml
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from contextlib import nullcontext
 from typing import Any
 from uuid import uuid4
 
 from agentic_grpo.config import AgentConfig, resolve_container_env
 from agentic_grpo import tool_calls, tools
-from agentic_grpo.editor_tool import EDIT_TOOL_NAME
-from agentic_grpo.metrics import TrajectoryMetrics, TurnTiming
+from agentic_grpo.episode import Episode, truncate
+from agentic_grpo.metrics import TrajectoryMetrics
 from agentic_grpo.reward import apply_to_metrics, compute_reward
-from agentic_grpo.sglang_timing import SGLANG_TIMING_KEY
-from agentic_grpo.timeline import patch_trainer_timeline, trajectory_timeline
+from agentic_grpo.timeline import patch_trainer_timeline
 
 logger = logging.getLogger("agentic_grpo.agent_loop")
 
@@ -111,55 +110,6 @@ except Exception:  # pragma: no cover - verl not installed
         num_turns: int = 0
         extra_fields: dict = field(default_factory=dict)
         mm_processor_kwargs: Any = None
-
-
-# ---------------------------------------------------------------------------
-# Pure trajectory bookkeeping (unit-testable, no verl/tokenizer dependency)
-# ---------------------------------------------------------------------------
-class _Trajectory:
-    """Accumulate the flat token sequence + response mask for one episode.
-
-    Mirrors verl's ``tool_agent_loop`` layout: ``prompt_ids`` is the full running
-    sequence (initial prompt + every generated turn + every tool observation),
-    and ``response_mask`` covers only the post-prompt region — ``1`` for tokens
-    the policy generated (trained on), ``0`` for tool-observation tokens.
-    """
-
-    def __init__(self, prompt_ids: list[int]):
-        self._all: list[int] = list(prompt_ids)
-        self._prompt_len = len(prompt_ids)
-        self._mask: list[int] = []
-
-    def current_ids(self) -> list[int]:
-        """Full sequence so far — the prompt for the next ``generate`` call."""
-        return self._all
-
-    def add_generated(self, ids: list[int]) -> None:
-        self._all.extend(ids)
-        self._mask.extend([1] * len(ids))
-
-    def add_tool(self, ids: list[int]) -> None:
-        self._all.extend(ids)
-        self._mask.extend([0] * len(ids))
-
-    def response_len(self) -> int:
-        return len(self._mask)
-
-    def finalize(self, response_length: int, *, pad_token_id: int) -> tuple[list[int], list[int], list[int]]:
-        """Return ``(prompt_ids, response_ids, response_mask)`` for AgentLoopOutput.
-
-        ``response_ids``/``response_mask`` are right-clipped to ``response_length``.
-        If the episode produced no response tokens at all (e.g. the container
-        failed before the first generation), emit a single padding token so verl's
-        ``_pad_token_ids`` never sees an empty list — an empty response is what
-        crashed the previous HTTP-based path.
-        """
-        prompt = self._all[: self._prompt_len]
-        response = self._all[self._prompt_len :]
-        mask = self._mask
-        if not response:
-            return prompt, [pad_token_id], [1]
-        return prompt, response[:response_length], mask[:response_length]
 
 
 def _int_env(name: str, default: int) -> int:
@@ -244,92 +194,6 @@ def _eval_pool() -> ThreadPoolExecutor:
     return _EVAL_POOL
 
 
-def _dump_enabled() -> bool:
-    return bool(os.environ.get("AGENTIC_TRAJECTORY_DUMP_DIR", ""))
-
-
-def _turn_timing(turn: int, call_start: float, call_end: float, out: Any) -> TurnTiming:
-    """Build a :class:`TurnTiming` for one generate call.
-
-    ``call_start``/``call_end`` are wall clock (``time.time()``) around the Ray
-    round trip. The server's own timestamps ride on ``extra_fields`` when
-    :mod:`agentic_grpo.sglang_timing` is active — see that module for why the
-    prefill/decode boundary is unobtainable from this side. Absent them, the turn
-    carries client timing only and the trajectory reports
-    ``timing_source == "client"``.
-    """
-    t = TurnTiming(turn=turn, gen_call_start=call_start, gen_call_end=call_end)
-    srv = (getattr(out, "extra_fields", None) or {}).get(SGLANG_TIMING_KEY)
-    if isinstance(srv, dict):
-        t.request_received = float(srv.get("request_received", 0.0) or 0.0)
-        t.request_scheduled = float(srv.get("request_scheduled", 0.0) or 0.0)
-        # SGLang's prefill_finished_ts: the instant the first token was sampled,
-        # i.e. prefill done and decoding under way.
-        t.decode_start = float(srv.get("prefill_finished", 0.0) or 0.0)
-        t.decode_finished = float(srv.get("decode_finished", 0.0) or 0.0)
-        t.response_sent = float(srv.get("response_sent", 0.0) or 0.0)
-        t.completion_tokens = int(srv.get("completion_tokens", 0) or 0)
-        t.cached_tokens = int(srv.get("cached_tokens", 0) or 0)
-        t.prompt_tokens = int(srv.get("prompt_tokens", 0) or 0)
-    return t
-
-
-def _dump_trajectory(
-    instance_id: str,
-    exit_status: str,
-    reward: float,
-    actions: list[dict],
-    metrics: TrajectoryMetrics | None = None,
-) -> None:
-    """Append one JSON line describing an episode, if dumping is enabled.
-
-    Opt-in via ``AGENTIC_TRAJECTORY_DUMP_DIR``. A binary reward tells you *that* a
-    rollout scored 0, never *why* — this records the actual commands so you can
-    see whether the agent worked productively and ran out of turns, or never
-    attempted the submit marker at all.
-
-    The full :class:`TrajectoryMetrics` goes in too, including the per-turn
-    timeline that is deliberately stripped from the batch payload sent to the
-    trainer (:meth:`TrajectoryMetrics.to_dict`). This file is the only place the
-    per-turn detail survives, so it carries everything: the aggregate W&B numbers
-    can say a step had a long tail, but only these records say which instance,
-    which turn, and whether the time went to prefill, decode or docker.
-
-    Best-effort: a dump failure must never disturb a rollout.
-    """
-    dump_dir = os.environ.get("AGENTIC_TRAJECTORY_DUMP_DIR", "")
-    if not dump_dir:
-        return
-    try:
-        os.makedirs(dump_dir, exist_ok=True)
-        record = {
-            "instance_id": instance_id,
-            "exit_status": exit_status,
-            "reward": reward,
-            "num_actions": len(actions),
-            "actions": actions,
-        }
-        if metrics is not None:
-            record["metrics"] = metrics.to_dict()
-        # One file per process; each line is a complete episode.
-        path = os.path.join(dump_dir, f"trajectories-{os.getpid()}.jsonl")
-        with open(path, "a") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception:  # pragma: no cover - diagnostics must not break training
-        logger.warning("trajectory dump failed for %s", instance_id, exc_info=True)
-
-
-def _truncate(text: str, max_len: int, side: str = "middle") -> str:
-    if max_len <= 0 or len(text) <= max_len:
-        return text
-    if side == "left":
-        return "(truncated)..." + text[-max_len:]
-    if side == "right":
-        return text[:max_len] + "...(truncated)"
-    half = max_len // 2
-    return text[:half] + "...(truncated)..." + text[-half:]
-
-
 # ---------------------------------------------------------------------------
 # The agent loop
 # ---------------------------------------------------------------------------
@@ -363,14 +227,9 @@ class SWEBenchAgentLoop(AgentLoopBase):
         self._pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> "AgentLoopOutput":  # type: ignore[override]
+        """One episode: rollout in a container, then grade. Never raises into verl."""
         instance = kwargs.get("extra_info") or kwargs.get("instance") or {}
         instance_id = instance.get("instance_id", "unknown")
-
-        metrics = TrajectoryMetrics(instance_id=instance_id)
-        gen_s = tool_s = 0.0
-        submission = ""
-        exit_status = "IncompleteRollout"
-        assistant_turns = 0
 
         # Build the prompt FIRST — this is tokenizer-only (no docker), so
         # ``prompt_ids`` is always valid even if the container never starts. An
@@ -378,244 +237,173 @@ class SWEBenchAgentLoop(AgentLoopBase):
         # (``'list' object has no attribute 'dim'``), so a failed rollout must
         # still carry a real prompt and degrade to a reward-0 sample rather than
         # taking down the whole step via ``asyncio.gather``.
-        messages = self._initial_messages(instance)
-        prompt_ids = await self.apply_chat_template(messages, tools=self._tool_schemas)
-        traj = _Trajectory(prompt_ids)
+        prompt_ids = await self.apply_chat_template(self._initial_messages(instance), tools=self._tool_schemas)
+        ep = Episode(instance_id, prompt_ids)
         sp = self._with_stop_tokens(sampling_params)
 
-        # Defaults only, so an episode that dies before admission still yields a
-        # usable envelope; both are reset at admission below.
-        t_traj = time.perf_counter()
-        # Wall clock as well as perf_counter: durations come from perf_counter
-        # (monotonic), but the timeline has to be comparable against the server's
-        # own timestamps, which come from a different process.
-        metrics.t_start = time.time()
-        env = None
-        consecutive_format_errors = 0
-        actions: list[dict] = []  # only populated when dumping is enabled
-        turns: list[TurnTiming] = []  # per-turn timeline, always collected
-        # Event stream for the run timeline (None unless AGENTIC_TIMELINE_DIR is
-        # set). Generate events are derived from `turns` at finish(); what is
-        # recorded here is everything that has no other record: the two waits
-        # before the first token, each individual tool call, and cleanup.
-        tl = trajectory_timeline(instance_id)
         try:
-            # The live-container semaphore is held across the whole episode, not
-            # just the start, so the daemon never accumulates more than
-            # num_workers * cap containers.
-            t_slot = time.time()
-            async with _live_container_semaphore():
-                # Admission, not work: with 256 episodes per worker and `cap`
-                # permits, everything before this instant is a queue position --
-                # a property of the batch, not of the trajectory (admitted first
-                # waits 0s, admitted last waits most of the step; measured 1167s
-                # mean against 466s of real work). The clocks restart here so no
-                # duration below counts the queue; `admission_wait` keeps it.
-                t_traj = time.perf_counter()
-                metrics.t_start = time.time()
-                metrics.admission_wait_s = metrics.t_start - t_slot
-                if tl is not None:
-                    tl.mark("admission_wait", t_slot, metrics.t_start)
-                try:
-                    with (tl.span("container_start") if tl else nullcontext()):
-                        env = await self._make_env_bounded(instance)
-
-                    while assistant_turns < self.max_assistant_turns and traj.response_len() < self.response_length:
-                        t0 = time.perf_counter()
-                        call_start = time.time()
-                        out = await self.server_manager.generate(
-                            request_id=uuid4().hex,
-                            prompt_ids=traj.current_ids(),
-                            sampling_params=sp,
-                        )
-                        gen_s += time.perf_counter() - t0
-                        traj.add_generated(out.token_ids)
-                        assistant_turns += 1
-                        turn_t = _turn_timing(assistant_turns, call_start, time.time(), out)
-                        turns.append(turn_t)
-
-                        if traj.response_len() >= self.response_length:
-                            exit_status = "ContextLimit"
-                            metrics.truncated = True
-                            break
-
-                        _, parsed = await self.tool_parser.extract_tool_calls(out.token_ids, None)
-                        calls = [tool_calls.from_function_call(tc) for tc in parsed]
-
-                        if not calls:
-                            raw = await self._decode(out.token_ids)
-                            attempted = tool_calls.attempted(raw)
-                            calls = tool_calls.salvage(raw) if attempted else []
-                            if calls:
-                                metrics.salvaged_tool_calls += len(calls)
-                            else:
-                                # No usable action this turn. Both causes are
-                                # recoverable and must NOT end the episode:
-                                #   * no tool call at all — overwhelmingly the agent
-                                #     stopping right after `git diff > patch.txt` +
-                                #     `cat patch.txt`, i.e. two of the three submit
-                                #     steps done, patch written, never submitted.
-                                #     Terminating here threw that patch away.
-                                #   * a <tool_call> block salvage could not repair.
-                                # Nudge with the format-error template (which restates
-                                # the submit command) and let the agent finish.
-                                consecutive_format_errors += 1
-                                metrics.format_errors += 1
-                                if tl is not None:
-                                    tl.mark(
-                                        "format_error",
-                                        turn_t.gen_call_end,
-                                        turn=assistant_turns,
-                                        attempted=attempted,
-                                    )
-                                if _dump_enabled():
-                                    actions.append(
-                                        {
-                                            "turn": assistant_turns,
-                                            "tool": "<format_error>" if attempted else "<no_tool_call>",
-                                            "command": None,
-                                            "raw_response": _truncate(raw, 600),
-                                        }
-                                    )
-                                if consecutive_format_errors >= self.max_consecutive_format_errors:
-                                    exit_status = "FormatErrorLimit" if attempted else "NoToolCall"
-                                    break
-                                err_ids = await self.apply_chat_template(
-                                    [{"role": "tool", "content": self._format_error(raw, attempted=attempted)}],
-                                    remove_system_prompt=True,
-                                )
-                                metrics.tool_obs_tokens.append(len(err_ids))
-                                traj.add_tool(err_ids)
-                                if traj.response_len() >= self.response_length:
-                                    exit_status = "ContextLimit"
-                                    metrics.truncated = True
-                                    break
-                                continue
-                        consecutive_format_errors = 0
-
-                        obs_messages: list[dict] = []
-                        submitted = False
-                        turn_t.tool_start = time.time()
-                        turn_t.num_tool_calls = len(calls)
-                        for name, args in calls:
-                            metrics.tool_call_count += 1
-                            t1 = time.perf_counter()
-                            call_t = time.time()
-                            obs, sub = await self.loop.run_in_executor(None, tools.run, env, name, args)
-                            tool_s += time.perf_counter() - t1
-                            turn_t.tool_end = time.time()
-                            _count_call(metrics, name, args, obs)
-                            command = tools.summarize(name, args)
-                            if tl is not None:
-                                # Per CALL, unlike TurnTiming.tool_start/tool_end,
-                                # which collapse a turn's calls into one span.
-                                tl.tool_call(
-                                    assistant_turns, name, command, call_t,
-                                    returncode=obs.get("returncode"),
-                                    submitted=sub is not None or None,
-                                )
-                            if _dump_enabled():
-                                actions.append(
-                                    {
-                                        "turn": assistant_turns,
-                                        "tool": name,
-                                        "command": _truncate(command, 600),
-                                        "returncode": obs.get("returncode"),
-                                        "output": _truncate(obs.get("output", "") or "", 400),
-                                        "submitted": sub is not None,
-                                    }
-                                )
-                            if sub is not None:
-                                submission, submitted, exit_status = sub, True, "Submitted"
-                                break
-                            obs_messages.append({"role": "tool", "content": self._format_observation(obs)})
-
-                        if submitted:
-                            break
-
-                        tool_ids = await self.apply_chat_template(obs_messages, remove_system_prompt=True)
-                        metrics.tool_obs_tokens.append(len(tool_ids))
-                        traj.add_tool(tool_ids)
-                        if traj.response_len() >= self.response_length:
-                            exit_status = "ContextLimit"
-                            metrics.truncated = True
-                            break
-                    else:
-                        # Loop fell through its condition rather than breaking: the
-                        # agent used every turn without ever submitting a patch.
-                        if assistant_turns >= self.max_assistant_turns:
-                            exit_status = "TurnLimit"
-                finally:
-                    # Free the container (and the slot) before scoring, which runs
-                    # its own harness container.
-                    if env is not None:
-                        # Last chance to salvage a patch: every exit but
-                        # "Submitted" leaves `submission` empty even when the
-                        # agent's edits are sitting in /testbed. See
-                        # _recover_patch. Must happen before cleanup -- the
-                        # container is gone right after.
-                        if not submission and _patch_fallback_enabled():
-                            with (tl.span("patch_recover") if tl else nullcontext()):
-                                submission = await self.loop.run_in_executor(
-                                    None, _recover_patch, env, instance
-                                )
-                            metrics.patch_recovered = bool(submission)
-                        with (tl.span("cleanup") if tl else nullcontext()):
-                            await self.loop.run_in_executor(None, _safe_cleanup, env)
-                        env = None
+            await self._rollout(ep, instance, sp)
         except Exception as exc:  # pragma: no cover - defensive; keep the batch alive
             logger.exception("SWEBench agent loop crashed for %s", instance_id)
-            exit_status = f"Crashed:{type(exc).__name__}"
-        metrics.total_trajectory_time = time.perf_counter() - t_traj
-        metrics.total_tool_call_time = tool_s
-        # Rollout end = the episode is over and the container is released. Harness
-        # grading below is timed separately: it runs its own docker container and
-        # folding it in here would make the generation timeline unreadable.
-        metrics.t_end = time.time()
-        metrics.turns = turns
-        metrics.summarize_turns()
+            ep.crashed(exc)
+        ep.close()
 
-        # Binary SWE-bench reward from the official harness (blocking docker run).
-        t_eval_slot = time.time()
-        async with _eval_semaphore():
-            t_score = time.perf_counter()
-            metrics.t_score_start = time.time()
-            if tl is not None:
-                # Queueing for a grading slot is not grading. Kept as its own
-                # span so `score` stays comparable to the pre-fix timelines.
-                tl.mark("eval_wait", t_eval_slot, metrics.t_score_start)
-            rr = await self.loop.run_in_executor(_eval_pool(), compute_reward, instance, submission)
-            score_s = time.perf_counter() - t_score
-            metrics.t_score_end = time.time()
+        rr, score_s = await self._grade(ep, instance)
 
-        prompt_ids, response_ids, response_mask = traj.finalize(
-            self.response_length, pad_token_id=self._pad_token_id
-        )
-        metrics.num_turns = assistant_turns
-        metrics.exit_status = exit_status
-        metrics.prompt_tokens = len(prompt_ids)
-        metrics.completion_tokens = sum(response_mask)
-        metrics.response_tokens = sum(response_mask)
-        metrics.total_trajectory_tokens = len(prompt_ids) + len(response_ids)
-        apply_to_metrics(metrics, rr)
-        _dump_trajectory(instance_id, exit_status, rr.reward, actions, metrics)
-        if tl is not None:
-            # One write per episode, after metrics are final: finish() adds the
-            # generate events (from `turns`), the grading span and the episode
-            # envelope on top of what was buffered during the run.
-            tl.finish(metrics)
-
+        prompt_ids, response_ids, response_mask = ep.finalize(self.response_length, pad_token_id=self._pad_token_id)
+        apply_to_metrics(ep.metrics, rr)
+        ep.flush(rr.reward)
         return self._build_output(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,
             reward=rr.reward,
-            num_turns=assistant_turns * 2 + 1,
-            gen_s=gen_s,
-            tool_s=tool_s,
+            num_turns=ep.assistant_turns * 2 + 1,
+            gen_s=ep.gen_s,
+            tool_s=ep.tool_s,
             score_s=score_s,
-            metrics=metrics,
+            metrics=ep.metrics,
         )
+
+    # ------------------------------------------------------------------
+    # phases
+    # ------------------------------------------------------------------
+    async def _rollout(self, ep: Episode, instance: dict, sp: dict[str, Any]) -> None:
+        """Admission -> container -> turns until an exit -> patch fallback -> cleanup."""
+        # The live-container semaphore is held across the whole episode, not
+        # just the start, so the daemon never accumulates more than
+        # num_workers * cap containers.
+        t_slot = time.time()
+        async with _live_container_semaphore():
+            ep.admitted(t_slot)
+            env = None
+            try:
+                with ep.span("container_start"):
+                    env = await self._make_env_bounded(instance)
+                while ep.can_continue(self.max_assistant_turns, self.response_length):
+                    if not await self._step(ep, env, sp):
+                        break
+                else:
+                    # Ran out of turns without any other exit: the agent used
+                    # every turn and never submitted a patch.
+                    if ep.assistant_turns >= self.max_assistant_turns:
+                        ep.stop("TurnLimit")
+            finally:
+                # Free the container (and the slot) before scoring, which runs
+                # its own harness container.
+                if env is not None:
+                    await self._release(ep, env, instance)
+
+    async def _step(self, ep: Episode, env: Any, sp: dict[str, Any]) -> bool:
+        """One assistant turn: generate, act, observe. False when the episode is over."""
+        out = await self._generate(ep, sp)
+        if ep.context_full(self.response_length):
+            return ep.stop("ContextLimit", truncated=True)
+
+        calls, raw, attempted = await self._actions(ep, out)
+        if not calls:
+            return await self._nudge(ep, raw, attempted)
+        ep.consecutive_format_errors = 0
+
+        obs_messages = await self._execute(ep, env, calls)
+        if obs_messages is None:  # submitted
+            return False
+        ids = await self.apply_chat_template(obs_messages, remove_system_prompt=True)
+        return self._observe(ep, ids)
+
+    async def _generate(self, ep: Episode, sp: dict[str, Any]) -> Any:
+        t0 = time.perf_counter()
+        call_start = time.time()
+        out = await self.server_manager.generate(
+            request_id=uuid4().hex,
+            prompt_ids=ep.traj.current_ids(),
+            sampling_params=sp,
+        )
+        ep.generated(out, call_start, time.time(), time.perf_counter() - t0)
+        return out
+
+    async def _actions(self, ep: Episode, out: Any) -> tuple[list[tool_calls.ToolCall], str, bool]:
+        """Parsed calls for this turn, falling back to salvage of what hermes dropped.
+
+        Returns ``(calls, raw_text, attempted)``; ``raw_text`` is only decoded
+        (and ``attempted`` only meaningful) when the strict path found nothing.
+        """
+        _, parsed = await self.tool_parser.extract_tool_calls(out.token_ids, None)
+        calls = [tool_calls.from_function_call(tc) for tc in parsed]
+        if calls:
+            return calls, "", True
+        raw = await self._decode(out.token_ids)
+        attempted = tool_calls.attempted(raw)
+        calls = tool_calls.salvage(raw) if attempted else []
+        if calls:
+            ep.salvaged(len(calls))
+        return calls, raw, attempted
+
+    async def _nudge(self, ep: Episode, raw: str, attempted: bool) -> bool:
+        """No usable action this turn. Tell the model and continue, up to a budget.
+
+        Both causes are recoverable and must NOT end the episode:
+          * no tool call at all — overwhelmingly the agent stopping right after
+            `git diff > patch.txt` + `cat patch.txt`, i.e. two of the three
+            submit steps done, patch written, never submitted. Terminating here
+            threw that patch away.
+          * a <tool_call> block salvage could not repair.
+        The format-error template restates the submit command.
+        """
+        ep.format_error(attempted, raw)
+        if ep.consecutive_format_errors >= self.max_consecutive_format_errors:
+            return ep.stop("FormatErrorLimit" if attempted else "NoToolCall")
+        ids = await self.apply_chat_template(
+            [{"role": "tool", "content": self._format_error(raw, attempted=attempted)}],
+            remove_system_prompt=True,
+        )
+        return self._observe(ep, ids)
+
+    async def _execute(self, ep: Episode, env: Any, calls: list[tool_calls.ToolCall]) -> list[dict] | None:
+        """Run the turn's calls in order. None once one of them submitted."""
+        ep.tool_phase(len(calls))
+        obs_messages: list[dict] = []
+        for name, args in calls:
+            t1 = time.perf_counter()
+            call_t = time.time()
+            obs, sub = await self.loop.run_in_executor(None, tools.run, env, name, args)
+            ep.tool_called(name, args, obs, sub, call_t, time.perf_counter() - t1)
+            if sub is not None:
+                ep.submission = sub
+                ep.stop("Submitted")
+                return None
+            obs_messages.append({"role": "tool", "content": self._format_observation(obs)})
+        return obs_messages
+
+    def _observe(self, ep: Episode, ids: list[int]) -> bool:
+        """Append a tool/nudge observation; False if that filled the context."""
+        ep.add_observation(ids)
+        if ep.context_full(self.response_length):
+            return ep.stop("ContextLimit", truncated=True)
+        return True
+
+    async def _release(self, ep: Episode, env: Any, instance: dict) -> None:
+        """Patch fallback, then cleanup. Runs in ``finally``: the container must go."""
+        # Last chance to salvage a patch: every exit but "Submitted" leaves
+        # `submission` empty even when the agent's edits are sitting in
+        # /testbed. See _recover_patch. Must happen before cleanup -- the
+        # container is gone right after.
+        if not ep.submission and _patch_fallback_enabled():
+            with ep.span("patch_recover"):
+                ep.submission = await self.loop.run_in_executor(None, _recover_patch, env, instance)
+            ep.metrics.patch_recovered = bool(ep.submission)
+        with ep.span("cleanup"):
+            await self.loop.run_in_executor(None, _safe_cleanup, env)
+
+    async def _grade(self, ep: Episode, instance: dict) -> tuple[Any, float]:
+        """Binary SWE-bench reward from the official harness (its own docker run)."""
+        t_eval_slot = time.time()
+        async with _eval_semaphore():
+            t_score = time.perf_counter()
+            ep.scoring(t_eval_slot)
+            rr = await self.loop.run_in_executor(_eval_pool(), compute_reward, instance, ep.submission)
+            ep.scored()
+            return rr, time.perf_counter() - t_score
 
     # ------------------------------------------------------------------
     # helpers (the blocking ones run inside loop.run_in_executor)
@@ -664,7 +452,9 @@ class SWEBenchAgentLoop(AgentLoopBase):
 
     def _initial_messages(self, instance: dict) -> list[dict]:
         task = instance.get("problem_statement", "")
-        tvars = {**instance, "task": task}
+        # ``edit_tool`` selects the two-tool or bash-only wording in agent.yaml, so
+        # the AGENTIC_EDIT_TOOL=0 arm is not told about a tool it cannot call.
+        tvars = {**instance, "task": task, "edit_tool": tools.edit_tool_enabled()}
         return [
             {"role": "system", "content": _render(self._system_tmpl, **tvars)},
             {"role": "user", "content": _render(self._instance_tmpl, **tvars)},
@@ -689,26 +479,27 @@ class SWEBenchAgentLoop(AgentLoopBase):
 
         An unclosed ``<tool_call>`` means generation was cut off, which the template
         handles differently, so ``finish_reason`` selects that branch.
+
+        Tool names and argument shapes come from :mod:`agentic_grpo.tools`, so a
+        bash-only run (``AGENTIC_EDIT_TOOL=0``) is never pointed at the editor.
         """
         if attempted:
             error = (
                 "Could not parse a tool call from your response. The JSON inside "
-                '<tool_call>...</tool_call> must be valid: a "name" of "bash" with an '
-                '"arguments" object holding "command", or a "name" of '
-                f'"{EDIT_TOOL_NAME}" with its "command"/"path"/... arguments, with every '
+                f"<tool_call>...</tool_call> must be valid: {tools.call_shapes()}, with every "
                 "newline, quote and backslash properly escaped."
             )
         else:
             error = (
                 "Your response contained no tool call, so nothing was executed. "
-                f"Every response must make at least one `bash` or `{EDIT_TOOL_NAME}` call.\n"
+                f"Every response must make at least one {tools.names()} call.\n"
                 "If you are still working, issue the next command. If you have finished editing "
                 "and have already written and checked patch.txt, submit it now with EXACTLY "
                 "this command:\n"
                 "  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt\n"
                 "Your work is not recorded until you run that command."
             )
-        tvars: dict[str, Any] = {"error": error}
+        tvars: dict[str, Any] = {"error": error, "edit_tool": tools.edit_tool_enabled()}
         if tool_calls.unclosed(raw):
             tvars["finish_reason"] = "length"
         return _render(self._error_tmpl, **tvars)
@@ -716,7 +507,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
     def _format_observation(self, obs: dict) -> str:
         output = {
             "returncode": obs.get("returncode"),
-            "output": _truncate(obs.get("output", "") or "", self.max_tool_response_length, self.tool_response_truncate_side),
+            "output": truncate(obs.get("output", "") or "", self.max_tool_response_length, self.tool_response_truncate_side),
             "exception_info": (obs.get("extra", {}) or {}).get("exception_info", "") or obs.get("exception_info", ""),
         }
         return _render(self._obs_tmpl, output=output)
@@ -776,7 +567,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
 _DEFAULT_ERROR_TMPL = (
     "Tool call error:\n\n<error>\n{{error}}\n</error>\n\n"
     "Every response must call a tool: 'bash' with a single JSON argument, "
-    'e.g. {"command": "ls -la"}, or the file editor.'
+    'e.g. {"command": "ls -la"}{% if edit_tool %}, or the file editor{% endif %}.'
 )
 
 
@@ -811,27 +602,6 @@ def _render(template: str, **vars: Any) -> str:
     from jinja2 import Template  # lightweight; already a mini-swe-agent dependency
 
     return Template(template).render(**vars)
-
-
-# The commands that count as "ran the tests": the behaviour the edit tool is
-# meant to free turn budget for. 0.57% of bash calls on run 20260903-002235.
-_TEST_CMD_RE = re.compile(r"(?<![\w.-])(?:pytest|py\.test|tox|python[23]?\s+-m\s+(?:pytest|unittest)|runtests\.py|manage\.py\s+test)(?![\w.-])")
-
-
-def _count_call(metrics: TrajectoryMetrics, name: str, args: dict, obs: dict) -> None:
-    """Per-call behaviour counters (see ``TrajectoryMetrics.aggregate``)."""
-    if name == EDIT_TOOL_NAME:
-        if obs.get("edit"):
-            metrics.edit_count += 1
-        elif obs.get("returncode") == 0:
-            metrics.view_count += 1
-        else:
-            metrics.edit_errors += 1
-    elif name == "bash":
-        if _TEST_CMD_RE.search(args.get("command", "") or ""):
-            metrics.test_runs += 1
-    else:
-        metrics.unknown_tool_calls += 1
 
 
 _BASE_COMMIT_RE = re.compile(r"\A[0-9a-fA-F]{7,40}\Z")

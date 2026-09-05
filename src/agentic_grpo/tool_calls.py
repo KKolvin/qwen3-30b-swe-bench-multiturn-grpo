@@ -20,7 +20,7 @@ import json
 import re
 from typing import Any
 
-from agentic_grpo import tools
+from agentic_grpo import bash_tool, tools
 
 # A parsed action. Bash arguments are always ``{"command": str}``; the edit
 # tool's are whatever the model sent, validated by ``run_edit_tool``. An empty
@@ -31,7 +31,7 @@ ToolCall = tuple[str, dict]
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 _BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-_COMMAND_FIELD_RE = re.compile(r'"(?:%s)"\s*:\s*"' % "|".join(tools.COMMAND_KEYS))
+_COMMAND_FIELD_RE = re.compile(r'"(?:%s)"\s*:\s*"' % "|".join(bash_tool.COMMAND_KEYS))
 _COMMAND_END_RE = re.compile(r'"\s*(?=[,}])')
 _NAME_FIELD_RE = re.compile(r'"name"\s*:\s*"([^"]*)"')
 _JSON_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f"}

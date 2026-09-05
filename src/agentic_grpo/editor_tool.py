@@ -313,6 +313,11 @@ def list_dir(env: Any, path: str) -> str:
 _MUTATING = ("create", "str_replace", "insert")
 
 
+def normalize_args(args: Any) -> dict | None:
+    """The editor validates its own fields; only a dict with a sub-command is worth passing on."""
+    return args if isinstance(args, dict) and "command" in args else None
+
+
 def run_edit_tool(env: Any, args: dict, *, cwd: str = DEFAULT_CWD) -> dict:
     """Execute one call; return a bash-shaped observation ``{"returncode", "output", "edit"}``.
 
