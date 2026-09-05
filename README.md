@@ -44,7 +44,7 @@ bash scripts/run_grpo.sh
    ┌─────────────────────────────────────────────────────────────┴──────┐
    │ agent_loop.py   SWEBenchAgentLoop                                  │
    │   generate ─▶ parse <tool_call> ─▶ run tool in docker ─▶ append obs│
-   │   tools: bash | str_replace_based_edit_tool (editor_tool.py)       │
+   │   tools registry (tools.py): bash_tool.py | editor_tool.py         │
    │   ends on submit marker / turn limit / context limit ─▶ patch      │
    └───────────────┬────────────────────────────────────┬───────────────┘
                    │ patch                              │ TrajectoryMetrics + timeline events
@@ -62,10 +62,13 @@ bash scripts/run_grpo.sh
 | Path                                     | Role                                  |
 | ---------------------------------------- | ------------------------------------- |
 | `src/agentic_grpo/config.py`             | AgentConfig + container env resolution |
-| `src/agentic_grpo/agent_loop.py`         | verl AgentLoop: the multi-turn rollout |
-| `src/agentic_grpo/tools.py`              | Tool registry: schema + arg shaping + runner per tool |
+| `src/agentic_grpo/agent_loop.py`         | verl AgentLoop: the rollout as phases (admit → step* → release → grade) |
+| `src/agentic_grpo/episode.py`            | One rollout's state + record: tokens, turn timings, metrics, timeline, dump |
+| `src/agentic_grpo/tools.py`              | Tool registry: which tools are active, one `Tool` adapter each; `AGENTIC_EDIT_TOOL=0` drops the editor from schemas, prompts and nudges alike |
+| `src/agentic_grpo/bash_tool.py`          | `bash`: mini-swe-agent's schema + container exec, Qwen3 argument aliases, command policy (installs/network, servers, whole-repo lint refused), timeout wording |
+| `src/agentic_grpo/editor_tool.py`        | `str_replace_based_edit_tool`: view/create/str_replace/insert over base64 file I/O |
+| `src/agentic_grpo/submit_tool.py`        | `submit`: ends the episode with `git diff <base_commit>` as the patch (also the end-of-episode fallback); `AGENTIC_SUBMIT_TOOL=0` restores the marker protocol |
 | `src/agentic_grpo/tool_calls.py`         | Sampled text → (tool, args): strict parse + salvage |
-| `src/agentic_grpo/editor_tool.py`        | str_replace_based_edit_tool (next to bash) |
 | `src/agentic_grpo/metrics.py`            | Per-trajectory metrics (client-side)  |
 | `src/agentic_grpo/server_monitor.py`     | Server-side latency/drain (SGLang `/metrics`) |
 | `src/agentic_grpo/sglang_timing.py`      | Per-request queue/prefill/decode timestamps |

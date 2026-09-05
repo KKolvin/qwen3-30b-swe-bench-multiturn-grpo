@@ -18,7 +18,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from agentic_grpo import bash_tool, editor_tool
+from agentic_grpo import bash_tool, editor_tool, submit_tool
 
 Observation = dict
 RunResult = tuple[Observation, "str | None"]  # (observation, submission-or-None)
@@ -32,7 +32,8 @@ class Tool:
     # string, list, None) -> the runner's args, or None when nothing usable is
     # there. Never raises.
     normalize: Callable[[Any], "dict | None"]
-    run: Callable[[Any, dict], RunResult]
+    # ``ctx`` is the SWE-bench instance row (base_commit etc.); most tools ignore it.
+    run: Callable[[Any, dict, dict], RunResult]
     summarize: Callable[[dict], str]
     # How the malformed-call nudge describes this tool's arguments; it completes
     # the clause ``a "name" of "<name>" with ...`` (see :func:`call_shapes`).
@@ -44,7 +45,7 @@ BASH = Tool(
     schema=bash_tool.bash_tool_schema(),
     normalize=bash_tool.normalize_args,
     # Resolved on the module at call time so tests can stub ``bash_tool.run_bash``.
-    run=lambda env, args: bash_tool.run_bash(env, args.get("command", "")),
+    run=lambda env, args, ctx: bash_tool.run_bash(env, args.get("command", "")),
     summarize=bash_tool.summarize_call,
     usage='an "arguments" object holding "command"',
 )
@@ -53,9 +54,18 @@ EDITOR = Tool(
     name=editor_tool.EDIT_TOOL_NAME,
     schema=editor_tool.EDIT_TOOL_SCHEMA,
     normalize=editor_tool.normalize_args,
-    run=lambda env, args: (editor_tool.run_edit_tool(env, args), None),
+    run=lambda env, args, ctx: (editor_tool.run_edit_tool(env, args), None),
     summarize=editor_tool.summarize_call,
     usage='its "command"/"path"/... arguments',
+)
+
+SUBMIT = Tool(
+    name=submit_tool.SUBMIT_TOOL_NAME,
+    schema=submit_tool.SUBMIT_TOOL_SCHEMA,
+    normalize=submit_tool.normalize_args,
+    run=lambda env, args, ctx: submit_tool.run_submit(env, ctx),
+    summarize=submit_tool.summarize_call,
+    usage='an empty "arguments" object',
 )
 
 
@@ -73,9 +83,19 @@ def edit_tool_enabled() -> bool:
     return os.environ.get("AGENTIC_EDIT_TOOL", "1") != "0"
 
 
+def submit_tool_enabled() -> bool:
+    """``AGENTIC_SUBMIT_TOOL=0`` restores the three-step marker protocol (baseline A/B)."""
+    return submit_tool.submit_tool_enabled()
+
+
 def active() -> list[Tool]:
     """Tools advertised to the model this run, in prompt order."""
-    return [BASH, EDITOR] if edit_tool_enabled() else [BASH]
+    out = [BASH]
+    if edit_tool_enabled():
+        out.append(EDITOR)
+    if submit_tool_enabled():
+        out.append(SUBMIT)
+    return out
 
 
 def lookup(name: str) -> Tool | None:
@@ -113,9 +133,9 @@ def unknown_tool_message(name: str) -> str:
     )
 
 
-def run(env: Any, name: str, args: dict) -> RunResult:
+def run(env: Any, name: str, args: dict, ctx: dict | None = None) -> RunResult:
     """Execute one parsed call. Blocking; the loop runs it in an executor."""
     tool = lookup(name)
     if tool is None:
         return {"returncode": -1, "output": unknown_tool_message(name)}, None
-    return tool.run(env, args)
+    return tool.run(env, args, ctx or {})

@@ -82,18 +82,29 @@ print(f'{max(0.30, (util * 100 // 1) / 100):.2f}')") ;;
 fi
 
 # --- Server-side rollout drain profiling (SGLang /metrics) ---
-# ON by default. verl runs its SGLang replicas on EPHEMERAL per-replica ports, so
-# there is no static URL to configure -- which is why every run before this
-# silently recorded zero srv/* metrics. server_monitor.discover_metrics_url() now
-# resolves the address at runtime from verl's named Ray actor
-# (sglang_server_<replica>_<node>.get_server_address), the same handle the rollout
-# worker uses. Requires rollout.engine_kwargs.sglang.enable_metrics=true (it is,
-# in configs/grpo_swebench.yaml) or /metrics returns nothing.
+# OFF by default (2026-08-05). The poller itself is ~1 req/s and negligible, but
+# it is useless without the server-side flags that feed it, and THOSE cost every
+# step: rollout.prometheus.enable adds middleware to the request path and forces
+# disable_log_stats=false (SGLang's per-batch stats loop). Both are now off in
+# configs/grpo_swebench.yaml, so /metrics 404s and leaving the poller on would
+# only scrape a dead endpoint once a second. The question they answered is
+# settled: drain_ratio 1.0, running_peak 64 against capacity 256 (run
+# 20260801-072502) -- inference is never the constraint, docker slots are.
+#
+# To re-enable, set AGENTIC_SGLANG_METRICS=1 here AND flip the three rollout
+# flags in configs/grpo_swebench.yaml (see the comment block there). verl runs
+# its SGLang replicas on EPHEMERAL per-replica ports, so there is no static URL
+# to configure -- which is why every run before 2026-08-01 silently recorded
+# zero srv/* metrics. server_monitor.discover_metrics_url() resolves the address
+# at runtime from verl's named Ray actor
+# (sglang_server_<replica>_<node>.get_server_address), the same handle the
+# rollout worker uses.
 #   AGENTIC_SGLANG_METRICS_URL - pin an explicit URL, skipping discovery (needed
 #     for the standalone loop, whose server is on a known port)
 #   AGENTIC_SGLANG_METRICS=0   - disable the monitor entirely
 # Capacity C mirrors rollout.max_num_seqs and sets the saturation threshold used
-# to locate the drain start; polling is ~1 req/s, negligible against a rollout.
+# to locate the drain start; it is read only when the monitor is enabled.
+export AGENTIC_SGLANG_METRICS="${AGENTIC_SGLANG_METRICS:-0}"
 export AGENTIC_MAX_RUNNING_REQUESTS="${AGENTIC_MAX_RUNNING_REQUESTS:-256}"
 export AGENTIC_METRICS_POLL_INTERVAL="${AGENTIC_METRICS_POLL_INTERVAL:-1.0}"
 
@@ -118,7 +129,26 @@ export AGENTIC_METRICS_POLL_INTERVAL="${AGENTIC_METRICS_POLL_INTERVAL:-1.0}"
 # before MAX_CONCURRENT_CONTAINERS capped the start rate, which is the thing the
 # daemon actually chokes on.
 export AGENTIC_MAX_CONCURRENT_CONTAINERS="${AGENTIC_MAX_CONCURRENT_CONTAINERS:-8}"
-export AGENTIC_MAX_LIVE_CONTAINERS="${AGENTIC_MAX_LIVE_CONTAINERS:-16}"
+export AGENTIC_MAX_LIVE_CONTAINERS="${AGENTIC_MAX_LIVE_CONTAINERS:-33}"
+
+# --- Reward grading (a THIRD container population) ---
+# Grading runs the SWE-bench test suite in its own container, after the rollout
+# has released its live-container slot. It used to be invisible: the harness
+# caches report.json under (run_id, model_name, instance_id) with the patch NOT
+# in the key, so a constant run_id graded each instance once and replayed that
+# verdict forever -- run 20260820-023256 submitted 3870 patches and wrote 23
+# reports, `score` spans had a median of 0.02s. reward.py now hands the harness a
+# unique eval id per call, so every distinct patch really runs its tests.
+#   MAX_EVAL_CONTAINERS  - per-worker cap on concurrent grading containers, and
+#     the size of the thread pool that runs them. Budget it together with
+#     MAX_LIVE_CONTAINERS: (live + eval) x num_workers is what the daemon sees.
+#   EVAL_TIMEOUT         - per-instance test-suite timeout (was hardcoded 1800).
+#   REWARD_CACHE_DIR     - our patch-keyed cache. Keyed on sha256(patch), so a
+#     hit means an identical diff, which really does deserve the same verdict.
+#     Watch reward/cache_hit_rate: ~1.0 on a diverse batch means it broke again.
+export AGENTIC_MAX_EVAL_CONTAINERS="${AGENTIC_MAX_EVAL_CONTAINERS:-4}"
+export AGENTIC_EVAL_TIMEOUT="${AGENTIC_EVAL_TIMEOUT:-900}"
+export AGENTIC_REWARD_CACHE_DIR="${AGENTIC_REWARD_CACHE_DIR:-/data0/shared/kewen.liu/agentic-reward-cache}"
 
 # Point every docker client at the ROOTLESS daemon (store on /data1). The docker
 # CLI resolves this from its `default` context, so mini-swe-agent's subprocess
@@ -127,6 +157,35 @@ export AGENTIC_MAX_LIVE_CONTAINERS="${AGENTIC_MAX_LIVE_CONTAINERS:-16}"
 # socket and dies with PermissionError. That failure was swallowed into
 # reward=0.0, making every rollout look unresolved regardless of its patch.
 export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
+
+# --- Container egress proxy (:12233) ---
+# Containers DO have a direct route out, but it hangs at random and a hang costs
+# the whole environment timeout (60s, configs/agent.yaml) because curl waits instead of erroring. Across
+# runs 20260810/0811/0818/0820 that made network commands 0.3% of tool calls but
+# 10-22% of tool seconds, and 64-77% of every call that hit the timeout. The host
+# proxy on :12233 is reliable (32/32 requests, 0.90-2.17s) -- configs/agent.yaml
+# injects it into every container via ${AGENTIC_CONTAINER_PROXY}.
+#
+# It has to be the host's REAL IP: dockerd-rootless runs slirp4netns with
+# --disable-host-loopback, so 127.0.0.1 (the container itself), 10.0.2.2,
+# 172.17.0.1 and host.docker.internal are all unreachable from inside. Derive it
+# per host rather than hardcoding -- it is link-local here and differs per node.
+# Set AGENTIC_CONTAINER_PROXY= (empty) to disable and fall back to direct egress.
+CONTAINER_PROXY_HOST="${AGENTIC_CONTAINER_PROXY_HOST:-$(hostname -I | awk '{print $1}')}"
+if [[ -z "${AGENTIC_CONTAINER_PROXY+x}" ]]; then
+  export AGENTIC_CONTAINER_PROXY="http://${CONTAINER_PROXY_HOST}:12233"
+fi
+if [[ -n "${AGENTIC_CONTAINER_PROXY}" ]]; then
+  # Fail loud, not silent: a dead proxy would break EVERY container network call
+  # rather than the current handful, and reward would just quietly drop.
+  if timeout 10 curl -s -o /dev/null --proxy "${AGENTIC_CONTAINER_PROXY}" \
+       https://raw.githubusercontent.com/django/django/main/README.rst; then
+    echo "[run_grpo] container egress proxy OK: ${AGENTIC_CONTAINER_PROXY}"
+  else
+    echo "[run_grpo] WARNING: ${AGENTIC_CONTAINER_PROXY} did not answer -- containers" \
+         "would have no working network. Unset AGENTIC_CONTAINER_PROXY to use direct egress." >&2
+  fi
+fi
 
 EXPERIMENT_NAME="$(date +'%Y%m%d-%H%M%S')"
 
@@ -187,6 +246,79 @@ mkdir -p "${RUN_DIR}"
 LOG_FILE="${RUN_DIR}/run${LOG_SUFFIX}.log"
 echo "Run artifacts: ${RUN_DIR} (log -> ${LOG_FILE})"
 
+# --- Per-trajectory records (default: off) ---
+# W&B only ever sees batch aggregates, so a step with a long tail cannot be traced
+# back to an instance. With this on, every episode appends one JSON line carrying
+# its commands AND its full TrajectoryMetrics — including the per-turn timeline
+# (generate call boundaries, the server's prefill-finish / decode-finish
+# timestamps, tool spans), which is stripped from the batch payload and exists
+# nowhere else.
+#
+#   AGENTIC_TRAJECTORY_DUMP=1 bash scripts/run_grpo.sh
+#   AGENTIC_TRAJECTORY_DUMP_DIR=/somewhere/else bash ...   # pin an explicit path
+#
+# Volume, MEASURED at the current 80-turn / 2000-char-observation settings: up to
+# ~114 KiB per episode (~86 KiB of commands + ~28 KiB of per-turn timeline) x
+# train_batch_size x rollout.n = 2048 episodes, so up to ~230 MiB per STEP and
+# ~6 GiB over a 27-step run. That is why the default lands on /data0 and not in
+# analysis/ like the rest of a run's artifacts: the repo disk on / has ~12GB free
+# and this would fill it (a symlink under the run dir keeps it discoverable).
+# Files are per-process (trajectories-<pid>.jsonl, one per AgentLoopWorker) and
+# appended across steps. The var has to be pushed into runtime_env.env_vars to
+# reach those worker actors.
+DUMP_OVERRIDES=()
+if [ -n "${AGENTIC_TRAJECTORY_DUMP:-}" ] || [ -n "${AGENTIC_TRAJECTORY_DUMP_DIR:-}" ]; then
+  DUMP_ROOT="${AGENTIC_TRAJECTORY_DUMP_ROOT:-/data0/shared/${USER:-nobody}/agentic-trajectories}"
+  export AGENTIC_TRAJECTORY_DUMP_DIR="${AGENTIC_TRAJECTORY_DUMP_DIR:-${DUMP_ROOT}/${EXPERIMENT_NAME}}"
+  mkdir -p "${AGENTIC_TRAJECTORY_DUMP_DIR}"
+  # Keep the run's artifacts reachable from one place without putting the bytes
+  # there. -n so a resume does not nest a link inside the existing one.
+  ln -sfn "${AGENTIC_TRAJECTORY_DUMP_DIR}" "${RUN_DIR}/trajectories"
+  echo "Per-trajectory records -> ${AGENTIC_TRAJECTORY_DUMP_DIR} (up to ~230MiB/step; linked at ${RUN_DIR}/trajectories)"
+  DUMP_OVERRIDES=(
+    +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TRAJECTORY_DUMP_DIR=\"${AGENTIC_TRAJECTORY_DUMP_DIR}\"
+  )
+fi
+
+# --- Run timeline (default: ON) ---
+# Every event of every trajectory (container slot wait, container start, each
+# generate call with SGLang's own prefill/decode instants, each tool call,
+# cleanup, grading) AND every training phase (gen, reward, adv, update_actor,
+# update_weights, save_checkpoint, validate, step), each with absolute UNIX
+# timestamps -- so a slow step can be read as a timeline instead of a bag of
+# means. Written as one timeline-<pid>.jsonl per process and merged into a
+# single timeline.json by the EXIT trap below (so a killed run still gets one).
+#
+#   AGENTIC_TIMELINE=0 bash scripts/run_grpo.sh          # off
+#   AGENTIC_TIMELINE_DIR=/somewhere bash ...             # pin the path
+#
+# Volume: ~85 events x ~250B = ~20 KiB per episode, so ~45 MiB per 2048-episode
+# step. Lands on /data0 for the same reason the trajectory dump does -- the repo
+# disk on / has ~12GB free -- with a symlink in the run directory.
+TIMELINE_OVERRIDES=()
+if [ "${AGENTIC_TIMELINE:-1}" != "0" ]; then
+  TIMELINE_ROOT="${AGENTIC_TIMELINE_ROOT:-/data0/shared/${USER:-nobody}/agentic-timelines}"
+  export AGENTIC_TIMELINE_DIR="${AGENTIC_TIMELINE_DIR:-${TIMELINE_ROOT}/${EXPERIMENT_NAME}}"
+  mkdir -p "${AGENTIC_TIMELINE_DIR}"
+  ln -sfn "${AGENTIC_TIMELINE_DIR}" "${RUN_DIR}/timeline"
+  echo "Run timeline -> ${AGENTIC_TIMELINE_DIR} (merged to timeline.json on exit; linked at ${RUN_DIR}/timeline)"
+  # Has to reach the Ray actors: the trainer (TaskRunner) writes the training
+  # phases, the AgentLoopWorkers write the trajectory events.
+  TIMELINE_OVERRIDES=(
+    +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TIMELINE_DIR=\"${AGENTIC_TIMELINE_DIR}\"
+  )
+  trap 'python3 "${REPO_ROOT}/scripts/build_timeline.py" --dir "${AGENTIC_TIMELINE_DIR}" \
+        --experiment "${EXPERIMENT_NAME}" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
+fi
+
+# Per-request SGLang timestamps (prefill finish / decode finish / queue time) on
+# every generate response, which is what makes the per-turn timeline able to split
+# prefill from decode instead of just bracketing the Ray round trip. On by
+# default; the collection side is engine_kwargs.sglang.enable_metrics in
+# configs/grpo_swebench.yaml, and both have to be on. Set to 0 to skip the
+# rollout-server actor subclass entirely (timeline degrades to client-side).
+export AGENTIC_SGLANG_REQUEST_TIMING="${AGENTIC_SGLANG_REQUEST_TIMING:-1}"
+
 # Ray's session dir goes on /data0 for the same reason as the checkpoints: it
 # defaults to /tmp/ray, i.e. the root volume, which sits at 874/885GB (12GB free).
 # The raylet's file_system_monitor logs every 10s at that level --
@@ -243,6 +375,16 @@ if [ ! -f "$TRAIN_FILE" ]; then
 fi
 N_TRAIN=$(python3 -c "import pyarrow.parquet as pq; print(pq.read_metadata('${TRAIN_FILE}').num_rows)")
 TOTAL_STEPS=$(python3 -c "import math; print(math.ceil(${N_TRAIN} / 256) * 3)")
+# AGENTIC_TOTAL_STEPS truncates the run to N steps — for stability probes, where the
+# question is whether reward/memory/grad_norm hold up over a few steps rather than
+# whether 3 epochs finish. It has to be applied HERE rather than appended as another
+# `trainer.total_training_steps=` override, because hydra rejects a key given twice
+# on the same command line ("Multiple values for trainer.total_training_steps").
+#   AGENTIC_TOTAL_STEPS=3 bash scripts/run_grpo.sh
+if [ -n "${AGENTIC_TOTAL_STEPS:-}" ]; then
+  echo "AGENTIC_TOTAL_STEPS=${AGENTIC_TOTAL_STEPS} (full 3-epoch run would be ${TOTAL_STEPS} steps)"
+  TOTAL_STEPS="${AGENTIC_TOTAL_STEPS}"
+fi
 echo "Training: ${N_TRAIN} instances, batch_size=256, 3 epochs -> ${TOTAL_STEPS} steps (wandb run: ${EXPERIMENT_NAME})"
 
 # NB: launched via scripts/verl_entry.py (not `-m verl.trainer.main_ppo`) so our
@@ -258,10 +400,19 @@ python3 "${REPO_ROOT}/scripts/verl_entry.py" \
   +ray_kwargs.ray_init.runtime_env.env_vars.PATH="${REPO_ROOT}/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_CONCURRENT_CONTAINERS=\"${AGENTIC_MAX_CONCURRENT_CONTAINERS}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_LIVE_CONTAINERS=\"${AGENTIC_MAX_LIVE_CONTAINERS}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_EVAL_CONTAINERS=\"${AGENTIC_MAX_EVAL_CONTAINERS}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_EVAL_TIMEOUT=\"${AGENTIC_EVAL_TIMEOUT}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_REWARD_CACHE_DIR=\"${AGENTIC_REWARD_CACHE_DIR}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_CONTAINER_START_RETRIES=\"${AGENTIC_CONTAINER_START_RETRIES:-3}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.DOCKER_HOST=\"${DOCKER_HOST}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_CONTAINER_PROXY=\"${AGENTIC_CONTAINER_PROXY}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_ALLOC_CONF=\"${PYTORCH_ALLOC_CONF}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_SGLANG_REQUEST_TIMING=\"${AGENTIC_SGLANG_REQUEST_TIMING}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TEST_TIMEOUT=\"${AGENTIC_TEST_TIMEOUT:-300}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_REPEATED_CALLS=\"${AGENTIC_MAX_REPEATED_CALLS:-6}\" \
   +ray_kwargs.ray_init._temp_dir="${RAY_TMP_ROOT}" \
   ${GPU_OVERRIDES[@]+"${GPU_OVERRIDES[@]}"} \
   ${TRACE_OVERRIDES[@]+"${TRACE_OVERRIDES[@]}"} \
+  ${DUMP_OVERRIDES[@]+"${DUMP_OVERRIDES[@]}"} \
+  ${TIMELINE_OVERRIDES[@]+"${TIMELINE_OVERRIDES[@]}"} \
   "$@" 2>&1 | tee "${LOG_FILE}"

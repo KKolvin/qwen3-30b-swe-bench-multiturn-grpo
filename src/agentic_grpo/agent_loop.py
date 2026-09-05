@@ -50,7 +50,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from agentic_grpo.config import AgentConfig, resolve_container_env
+from agentic_grpo import submit_tool
+from agentic_grpo.config import AgentConfig, int_env as _int_env, resolve_container_env
 from agentic_grpo import tool_calls, tools
 from agentic_grpo.episode import Episode, truncate
 from agentic_grpo.metrics import TrajectoryMetrics
@@ -110,11 +111,6 @@ except Exception:  # pragma: no cover - verl not installed
         num_turns: int = 0
         extra_fields: dict = field(default_factory=dict)
         mm_processor_kwargs: Any = None
-
-
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name, "")
-    return int(raw) if raw.isdigit() else default
 
 
 _CONTAINER_SEM: "asyncio.Semaphore | None" = None
@@ -225,6 +221,12 @@ class SWEBenchAgentLoop(AgentLoopBase):
         ) = _load_agent_templates(self._agent_config_path)
         self._tool_schemas = tools.schemas()
         self._pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
+        # verl asks the server for per-token logprobs when
+        # rollout.calculate_log_probs is on (``sampling_params["logprobs"]``);
+        # then EVERY output in the batch must carry ``response_logprobs`` -- the
+        # worker concatenates them and a lone None would break the step -- so a
+        # rollout that crashed before generating still emits the zero vector.
+        self._want_logprobs = bool(getattr(self.rollout_config, "calculate_log_probs", False))
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> "AgentLoopOutput":  # type: ignore[override]
         """One episode: rollout in a container, then grade. Never raises into verl."""
@@ -257,6 +259,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,
+            response_logprobs=self._response_logprobs(ep, response_ids),
             reward=rr.reward,
             num_turns=ep.assistant_turns * 2 + 1,
             gen_s=ep.gen_s,
@@ -281,7 +284,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
                 with ep.span("container_start"):
                     env = await self._make_env_bounded(instance)
                 while ep.can_continue(self.max_assistant_turns, self.response_length):
-                    if not await self._step(ep, env, sp):
+                    if not await self._step(ep, env, instance, sp):
                         break
                 else:
                     # Ran out of turns without any other exit: the agent used
@@ -294,7 +297,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
                 if env is not None:
                     await self._release(ep, env, instance)
 
-    async def _step(self, ep: Episode, env: Any, sp: dict[str, Any]) -> bool:
+    async def _step(self, ep: Episode, env: Any, instance: dict, sp: dict[str, Any]) -> bool:
         """One assistant turn: generate, act, observe. False when the episode is over."""
         out = await self._generate(ep, sp)
         if ep.context_full(self.response_length):
@@ -305,8 +308,8 @@ class SWEBenchAgentLoop(AgentLoopBase):
             return await self._nudge(ep, raw, attempted)
         ep.consecutive_format_errors = 0
 
-        obs_messages = await self._execute(ep, env, calls)
-        if obs_messages is None:  # submitted
+        obs_messages = await self._execute(ep, env, instance, calls)
+        if obs_messages is None:  # submitted, or the repetition limit ended the episode
             return False
         ids = await self.apply_chat_template(obs_messages, remove_system_prompt=True)
         return self._observe(ep, ids)
@@ -359,20 +362,36 @@ class SWEBenchAgentLoop(AgentLoopBase):
         )
         return self._observe(ep, ids)
 
-    async def _execute(self, ep: Episode, env: Any, calls: list[tool_calls.ToolCall]) -> list[dict] | None:
-        """Run the turn's calls in order. None once one of them submitted."""
+    async def _execute(self, ep: Episode, env: Any, instance: dict, calls: list[tool_calls.ToolCall]) -> list[dict] | None:
+        """Run the turn's calls in order. None once the episode is over (submitted or repetition limit).
+
+        Every call passes through ``ep.repeats`` (:class:`agentic_grpo.episode.Repeats`):
+        a command that timed out before is refused without running, and a result
+        identical to the last result of the same call is collapsed to a one-line
+        pointer. ``submit`` is exempt: it ends the episode when it succeeds and
+        its refusal wording is the thing the model needs to read each time.
+        """
         ep.tool_phase(len(calls))
         obs_messages: list[dict] = []
         for name, args in calls:
             t1 = time.perf_counter()
             call_t = time.time()
-            obs, sub = await self.loop.run_in_executor(None, tools.run, env, name, args)
+            guarded = name != submit_tool.SUBMIT_TOOL_NAME
+            obs = ep.repeats.refusal(name, args) if guarded else None
+            sub = None
+            if obs is None:
+                obs, sub = await self.loop.run_in_executor(None, tools.run, env, name, args, instance)
+                if guarded and sub is None:
+                    obs = ep.repeats.observe(name, args, obs, ep.assistant_turns)
             ep.tool_called(name, args, obs, sub, call_t, time.perf_counter() - t1)
             if sub is not None:
                 ep.submission = sub
                 ep.stop("Submitted")
                 return None
             obs_messages.append({"role": "tool", "content": self._format_observation(obs)})
+            if ep.repeats.exhausted():
+                ep.stop("RepetitionLimit")
+                return None
         return obs_messages
 
     def _observe(self, ep: Episode, ids: list[int]) -> bool:
@@ -454,7 +473,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
         task = instance.get("problem_statement", "")
         # ``edit_tool`` selects the two-tool or bash-only wording in agent.yaml, so
         # the AGENTIC_EDIT_TOOL=0 arm is not told about a tool it cannot call.
-        tvars = {**instance, "task": task, "edit_tool": tools.edit_tool_enabled()}
+        tvars = {**instance, "task": task, "edit_tool": tools.edit_tool_enabled(), "submit_tool": tools.submit_tool_enabled()}
         return [
             {"role": "system", "content": _render(self._system_tmpl, **tvars)},
             {"role": "user", "content": _render(self._instance_tmpl, **tvars)},
@@ -490,24 +509,50 @@ class SWEBenchAgentLoop(AgentLoopBase):
                 "newline, quote and backslash properly escaped."
             )
         else:
+            if tools.submit_tool_enabled():
+                how = (
+                    "If you have finished editing, call the `submit` tool now (no arguments). "
+                    "Your work is not recorded until you do."
+                )
+            else:
+                how = (
+                    "If you have finished editing and have already written and checked patch.txt, "
+                    "submit it now with EXACTLY this command:\n"
+                    "  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt\n"
+                    "Your work is not recorded until you run that command."
+                )
             error = (
                 "Your response contained no tool call, so nothing was executed. "
                 f"Every response must make at least one {tools.names()} call.\n"
-                "If you are still working, issue the next command. If you have finished editing "
-                "and have already written and checked patch.txt, submit it now with EXACTLY "
-                "this command:\n"
-                "  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt\n"
-                "Your work is not recorded until you run that command."
+                f"If you are still working, issue the next command. {how}"
             )
-        tvars: dict[str, Any] = {"error": error, "edit_tool": tools.edit_tool_enabled()}
+        tvars: dict[str, Any] = {
+            "error": error, "edit_tool": tools.edit_tool_enabled(), "submit_tool": tools.submit_tool_enabled(),
+        }
         if tool_calls.unclosed(raw):
             tvars["finish_reason"] = "length"
         return _render(self._error_tmpl, **tvars)
 
     def _format_observation(self, obs: dict) -> str:
+        """Render one tool result for the model, within the observation budget.
+
+        ``max_tool_response_length`` is a CHARACTER cap (2000 on
+        grpo_swebench.yaml, ~500 tokens). A tool that has already sized its
+        output to its own budget marks the observation ``bounded`` and is not
+        cut again: the editor's ``view`` says how many lines remain and how to
+        page, and a second blind cut on top of that (measured: a 150-line view
+        came back as 12 head + 12 tail lines) destroys exactly the coherence
+        the tool exists to provide. A tool may also name the side to cut
+        (``truncate_side``): bash keeps the tail of a test run or a script and
+        the head of a search.
+        """
+        text = obs.get("output", "") or ""
+        if not obs.get("bounded"):
+            side = obs.get("truncate_side") or self.tool_response_truncate_side
+            text = truncate(text, self.max_tool_response_length, side)
         output = {
             "returncode": obs.get("returncode"),
-            "output": truncate(obs.get("output", "") or "", self.max_tool_response_length, self.tool_response_truncate_side),
+            "output": text,
             "exception_info": (obs.get("extra", {}) or {}).get("exception_info", "") or obs.get("exception_info", ""),
         }
         return _render(self._obs_tmpl, output=output)
@@ -520,12 +565,29 @@ class SWEBenchAgentLoop(AgentLoopBase):
         sp["stop_token_ids"] = list(set((sp.get("stop_token_ids") or []) + stop))
         return sp
 
+    def _response_logprobs(self, ep: Episode, response_ids: list[int]) -> list[float] | None:
+        """Rollout logprobs for ``response_ids`` when verl asked for them, else None."""
+        if not getattr(self, "_want_logprobs", False):
+            return None
+        lp = ep.traj.logprobs(self.response_length)
+        if lp is None or len(lp) != len(response_ids):
+            # No server logprobs (or a length mismatch, which would misalign the
+            # correction): a zero vector keeps the batch well-formed and yields
+            # importance weight exp(0 - logp) for those tokens, which the
+            # threshold caps. Counted so it is visible.
+            if lp is not None:
+                logger.warning("rollout logprobs length %d != response %d for %s", len(lp), len(response_ids), ep.instance_id)
+            ep.metrics.missing_logprobs = True
+            return [0.0] * len(response_ids)
+        return lp
+
     def _build_output(
         self,
         *,
         prompt_ids: list[int],
         response_ids: list[int],
         response_mask: list[int],
+        response_logprobs: list[float] | None = None,
         reward: float,
         num_turns: int,
         gen_s: float,
@@ -539,6 +601,8 @@ class SWEBenchAgentLoop(AgentLoopBase):
             prompt_ids = [self._pad_token_id]
         if not response_ids:
             response_ids, response_mask = [self._pad_token_id], [1]
+            if response_logprobs is not None:
+                response_logprobs = [0.0]
 
         extra_fields = {
             # include_turns=False: the per-turn timeline is for the dump file, not
@@ -554,6 +618,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,
+            response_logprobs=response_logprobs,
             reward_score=reward,
             num_turns=num_turns,
             metrics=loop_metrics,
@@ -604,59 +669,17 @@ def _render(template: str, **vars: Any) -> str:
     return Template(template).render(**vars)
 
 
-_BASE_COMMIT_RE = re.compile(r"\A[0-9a-fA-F]{7,40}\Z")
-
-
 def _patch_fallback_enabled() -> bool:
     return os.environ.get("AGENTIC_PATCH_FALLBACK", "1") != "0"
 
 
-def _recover_patch(env: Any, instance: dict) -> str:
-    """Read the working tree's diff out of the container, as a last-resort submission.
-
-    ``submission`` normally arrives only through mini-swe-agent's submit marker
-    -- the agent echoing ``COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`` as the first
-    line of a bash call that exits 0. Every other ending (TurnLimit,
-    ContextLimit, NoToolCall, FormatErrorLimit) leaves it empty and the episode
-    grades as ``empty_patch`` no matter what the agent actually wrote into
-    /testbed. On run 20260828-052125 that was 2113 of 5282 episodes, and 951 of
-    them had already written patch.txt: real work, thrown away because the model
-    forgot one echo. Their resolve rate is 0.0% by construction while submitted
-    episodes score 16.5%, so the loss is also a large block of all-zero GRPO
-    groups that carry no advantage.
-
-    So ask git what changed before the container goes away. ``diff
-    <base_commit>`` rather than a bare ``diff``, so the patch survives an agent
-    that staged or committed its work; ``core.fileMode=false`` mirrors the
-    harness's own eval script. Untracked files (repro scripts, patch.txt itself)
-    are excluded by construction -- which is what the submission instructions in
-    ``configs/agent.yaml`` ask for anyway.
-
-    Best effort throughout: anything unexpected returns "" and the episode keeps
-    the reward 0 it already had.
-    """
-    base = str(instance.get("base_commit") or "")
-    ref = base if _BASE_COMMIT_RE.match(base) else ""
-    try:
-        out = env.execute({"command": f"git -c core.fileMode=false diff {ref}".rstrip()})
-    except Exception as exc:  # noqa: BLE001 - the container may already be gone
-        logger.warning("patch recovery failed for %s: %s", instance.get("instance_id", "?"), exc)
-        return ""
-    if out.get("returncode") != 0:
-        return ""
-    patch = out.get("output") or ""
-    if not patch.strip():
-        return ""
-    # A cut diff cannot apply, so an oversized one is dropped whole rather than
-    # truncated: both grade 0, but only the truncated one would masquerade as a
-    # real submission in patch_applied_rate.
-    if len(patch) > _int_env("AGENTIC_PATCH_FALLBACK_MAX_BYTES", 1_000_000):
-        logger.warning(
-            "patch recovery discarded %d bytes for %s (over cap)",
-            len(patch), instance.get("instance_id", "?"),
-        )
-        return ""
-    return patch
+# Read the working tree's diff out of the container as a last-resort submission.
+# Every exit but "Submitted" leaves ``submission`` empty even when the agent's
+# edits are sitting in /testbed: on run 20260828-052125 that was 2113 of 5282
+# episodes, 951 of which had already written patch.txt -- real work thrown away
+# because the model forgot one echo, and a large block of all-zero GRPO groups.
+# Same function as the ``submit`` tool, so both views of the tree are identical.
+_recover_patch = submit_tool.git_diff_patch
 
 
 def _safe_cleanup(env: Any) -> None:

@@ -47,6 +47,12 @@ def resolve_container_env(env: dict) -> dict:
     return resolved
 
 
+def int_env(name: str, default: int) -> int:
+    """An integer knob from the environment; anything but digits means the default."""
+    raw = os.environ.get(name, "")
+    return int(raw) if raw.isdigit() else default
+
+
 @dataclass
 class AgentConfig:
     # Fallback turn cap when verl's multi_turn.max_assistant_turns is unset. The

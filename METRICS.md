@@ -15,7 +15,7 @@ There is no metrics writer in this repo. The chain is:
    `_balance_batch`.
 2. **We inject our own keys into that same dict** by monkey-patching
    `verl.trainer.ppo.metric_utils.compute_data_metrics` from
-   [agent_loop.py:874-957](src/agentic_grpo/agent_loop.py#L874-L957). The patch adds
+   [`_patch_verl_data_metrics`](src/agentic_grpo/agent_loop.py). The patch adds
    `TrajectoryMetrics.aggregate(...)` (`traj/*`, `reward/*`, `tokens/*`, `latency/*`,
    `timeline/*`) and `SGLangServerMonitor.summarize_since_last(...)` (`srv/*`). It also
    installs the per-request timing hook described in 5a.
@@ -32,7 +32,7 @@ Four independent sources feed it:
 | Source | Prefixes | Measured by |
 |---|---|---|
 | verl core trainer | `actor/*`, `critic/*`, `perf/*`, `timing_*`, `global_seqlen/*`, `prompt_length/*`, `response_length*`, `response/*`, `num_turns/*`, `training/*`, `val-*` | verl, on the tensors it trains on |
-| our agent loop | `traj/*`, `tokens/*`, `latency/*`, `reward/*`, `timeline/*` | [`TrajectoryMetrics`](src/agentic_grpo/metrics.py), filled in [`SWEBenchAgentLoop.run`](src/agentic_grpo/agent_loop.py#L436) |
+| our agent loop | `traj/*`, `tokens/*`, `latency/*`, `reward/*`, `timeline/*` | [`TrajectoryMetrics`](src/agentic_grpo/metrics.py), filled by [`Episode`](src/agentic_grpo/episode.py) as [`SWEBenchAgentLoop.run`](src/agentic_grpo/agent_loop.py) drives it |
 | SWE-bench harness | the `reward/*` contents and `traj/resolve_rate` | official `swebench` `run_instance` -> `report.json`, read by [reward.py](src/agentic_grpo/reward.py) |
 | SGLang server | `srv/*` (aggregate), plus the per-request timestamps behind `timeline/*` and `latency/*server*` | Prometheus `/metrics` scrape, [server_monitor.py](src/agentic_grpo/server_monitor.py); per-request `meta_info` via [sglang_timing.py](src/agentic_grpo/sglang_timing.py) |
 
@@ -47,31 +47,39 @@ not means (see 5a).
 ## 2. Our metrics — trajectory bookkeeping (`traj/*`)
 
 All of these come from a `TrajectoryMetrics` object created per episode at
-[agent_loop.py:440](src/agentic_grpo/agent_loop.py#L440), shipped back to the trainer inside
+[`Episode.__init__`](src/agentic_grpo/episode.py), shipped back to the trainer inside
 `AgentLoopOutput.extra_fields["trajectory_metrics"]`, and reduced by
 [`TrajectoryMetrics.aggregate`](src/agentic_grpo/metrics.py#L213).
 
 | Metric | Meaning | How collected |
 |---|---|---|
 | `traj/exit/<Status>` | Fraction of the batch that ended with that exit status. Keys are dynamic — a status only appears if some episode hit it. | `Counter(m.exit_status)/n`; `exit_status` is set at the single point where the episode stops. |
-| `traj/exit/Submitted` | Agent ran the submit marker; `env.execute` raised `Submitted` carrying a patch. **The only path that can produce reward 1.** | [agent_loop.py:562](src/agentic_grpo/agent_loop.py#L562) |
-| `traj/exit/TurnLimit` | Used all `max_assistant_turns` without submitting. | loop `else` branch, [agent_loop.py:577-580](src/agentic_grpo/agent_loop.py#L577-L580) |
-| `traj/exit/ContextLimit` | Response tokens reached `data.max_response_length`; episode cut short. | the three `traj.response_len() >= self.response_length` checks |
-| `traj/exit/NoToolCall` | `max_consecutive_format_errors` turns in a row contained **no** `<tool_call>` block at all (agent believes it is finished). | [agent_loop.py:525](src/agentic_grpo/agent_loop.py#L525) |
-| `traj/exit/FormatErrorLimit` | Same budget exhausted, but those turns *did* contain `<tool_call>` blocks we could neither parse nor salvage. | same line, `attempted=True` branch |
-| `traj/exit/Crashed:<Type>` | Infra failure (container start, docker, tokenizer). The sample degrades to reward 0 instead of killing the step. | `except Exception` at [agent_loop.py:587](src/agentic_grpo/agent_loop.py#L587) |
+| `traj/exit/Submitted` | Agent called the `submit` tool (harness ran `git diff <base_commit>`; an empty diff is refused and the episode continues) — or, under `AGENTIC_SUBMIT_TOOL=0`, ran the marker command. With `patch_recovered`, the only paths that can produce reward 1. | `ep.stop("Submitted")` in [`_execute`](src/agentic_grpo/agent_loop.py) |
+| `traj/exit/TurnLimit` | Used all `max_assistant_turns` without submitting. | `while ... else` in [`_rollout`](src/agentic_grpo/agent_loop.py) |
+| `traj/exit/ContextLimit` | Response tokens reached `data.max_response_length`; episode cut short. | `ep.context_full(...)` after generate ([`_step`](src/agentic_grpo/agent_loop.py)) and after each observation ([`_observe`](src/agentic_grpo/agent_loop.py)) |
+| `traj/exit/NoToolCall` | `max_consecutive_format_errors` turns in a row contained **no** `<tool_call>` block at all (agent believes it is finished). | budget check in [`_nudge`](src/agentic_grpo/agent_loop.py) |
+| `traj/exit/FormatErrorLimit` | Same budget exhausted, but those turns *did* contain `<tool_call>` blocks we could neither parse nor salvage. | same check, `attempted=True` branch |
+| `traj/exit/RepetitionLimit` | The episode made `AGENTIC_MAX_REPEATED_CALLS` (default 6) tool calls whose result was identical to an earlier call of the same command; a looper, ended early. Its working tree is still diffed and graded like a `TurnLimit` episode. | `ep.repeats.exhausted()` in [`_execute`](src/agentic_grpo/agent_loop.py); the guard is [`episode.Repeats`](src/agentic_grpo/episode.py) |
+| `traj/exit/Crashed:<Type>` | Infra failure (container start, docker, tokenizer). The sample degrades to reward 0 instead of killing the step. | `except Exception` around `_rollout` in [`run`](src/agentic_grpo/agent_loop.py) |
 | `traj/resolve_rate` | Fraction of trajectories the SWE-bench harness marked `resolved` (all FAIL_TO_PASS + PASS_TO_PASS pass). The headline number. | `report.json["resolved"]` |
 | `traj/mean_reward` | Mean binary reward. Identical to `traj/resolve_rate` by construction (`reward = 1.0 if resolved else 0.0`). | [reward.py:69](src/agentic_grpo/reward.py#L69) |
 | `traj/mean_turns` | Mean assistant turns (one generate call = one turn). | `assistant_turns` counter |
-| `traj/mean_tool_calls` | Mean bash tool calls executed. Exceeds turns when one turn emits several calls. | incremented per call, [agent_loop.py:545](src/agentic_grpo/agent_loop.py#L545) |
-| `traj/mean_edits` | Mean `str_replace_based_edit_tool` calls per episode that **changed a file** (`str_replace`, `insert`, `create`). Live since the edit tool landed (2026-09-05); 0.0 on older runs and when `AGENTIC_EDIT_TOOL=0`. | `metrics.edit_count`, [`_count_call`](src/agentic_grpo/agent_loop.py) |
+| `traj/mean_tool_calls` | Mean bash tool calls executed. Exceeds turns when one turn emits several calls. | incremented per call in [`Episode.tool_called`](src/agentic_grpo/episode.py) |
+| `traj/mean_edits` | Mean `str_replace_based_edit_tool` calls per episode that **changed a file** (`str_replace`, `insert`, `create`). Live since the edit tool landed (2026-09-05); 0.0 on older runs and when `AGENTIC_EDIT_TOOL=0`. | `metrics.edit_count`, [`episode.count_call`](src/agentic_grpo/episode.py) |
 | `traj/mean_edit_errors` | Mean edit-tool calls the tool **refused** (old_str not found / matched more than once, bad arguments, missing file). Nothing was written on these. | `metrics.edit_errors` |
 | `traj/edit_error_rate` | Refused edits over all edit *attempts* (`edit_errors / (edit_count + edit_errors)`). High = the model is not copying `old_str` exactly (whitespace) or edits without `view`ing first. | `rate(...)` in `aggregate` |
 | `traj/mean_views` | Mean edit-tool `view` calls per episode: reads that did not go through `cat`. | `metrics.view_count` |
 | `traj/edit_tool_use_rate` | Fraction of episodes that called the edit tool at all. The adoption number to watch first: if it stays near 0 the prior is not there and prompting, not training, is the fix. | `sum(edit_count or view_count or edit_errors > 0)/n` |
 | `traj/mean_unknown_tool_calls` | Mean calls per episode naming a tool that does not exist (typically the shell command in the `name` field: 2,654 such calls on run 20260903-002235). Each is an instant `rc=-1` and a wasted turn. | `metrics.unknown_tool_calls` |
-| `traj/mean_test_runs` | Mean bash calls per episode that ran a test runner (`pytest`, `py.test`, `tox`, `python -m pytest/unittest`, `runtests.py`, `manage.py test`). Baseline 0.57% of bash calls. | `_TEST_CMD_RE` in [agent_loop.py](src/agentic_grpo/agent_loop.py) |
+| `traj/mean_test_runs` | Mean bash calls per episode that ran a test runner (`pytest`, `py.test`, `tox`, `python -m pytest/unittest`, `runtests.py`, `manage.py test`). Baseline 0.57% of bash calls. | `TEST_CMD_RE` in [episode.py](src/agentic_grpo/episode.py) |
 | `traj/test_run_rate` | Fraction of episodes with at least one test run. Baseline ~2%; the edit tool exists to free turn budget for this, so it is the outcome metric of that change. | `sum(m.test_runs > 0)/n` |
+| `traj/mean_policy_denials` | Mean bash calls per episode refused by [`bash_tool.POLICIES`](src/agentic_grpo/bash_tool.py) before running: package installs / network fetches, servers (`runserver` etc.), whole-repo lint. On run 20260903-002235 these were 11.7% of tool time and 58 of 130 timeouts. A refusal is an instant observation, not a 60s slot hold. | `metrics.policy_denials` |
+| `traj/policy_denial_rate` | Fraction of episodes with at least one refusal. Should fall as the habit trains out; a rising value means the prompt is inviting the behaviour. | `sum(m.policy_denials > 0)/n` |
+| `traj/mean_tool_timeouts` | Mean bash calls per episode killed at the environment timeout (60s, `configs/agent.yaml`). Baseline 130/238,597 calls, 11.1% of tool time. What survives the policy layer: stuck `sed`/`awk` edits, linters, loops. | `obs["timeout"]` from `bash_tool._clarify_timeout` |
+| `traj/timeout_rate` | Fraction of episodes with at least one timeout. | `sum(m.tool_timeouts > 0)/n` |
+| `traj/mean_repeated_calls` | Mean calls per episode that repeated an earlier call of the exact same tool+arguments with an unchanged result (collapsed to a one-line pointer, output not re-sent) or re-issued a command that had already timed out (refused without running). On run 20260903-002235 `TurnLimit` episodes had ~9% distinct commands. | `obs["repeat"]` set by [`episode.Repeats`](src/agentic_grpo/episode.py), counted in `count_call` |
+| `traj/repeat_rate` | Fraction of episodes with at least one such repeat. | `sum(m.repeated_calls > 0)/n` |
+| `traj/missing_logprobs_rate` | Fraction of episodes whose `rollout_log_probs` are zeros because the server returned none (crash before the first generate) or their length did not match the response. Only meaningful with `rollout.calculate_log_probs: true`; anything but ~0 means the importance correction is being fed padding. | `metrics.missing_logprobs`, set in [`_response_logprobs`](src/agentic_grpo/agent_loop.py) |
 | `traj/truncation_rate` | Fraction of episodes that hit the context ceiling. Always equals `traj/exit/ContextLimit`, since `truncated` is set at exactly the same three places. | `sum(m.truncated)/n` |
 | `traj/mean_format_errors` | Mean number of turns per episode that produced no usable action (unparseable call *or* no call). | `metrics.format_errors` |
 | `traj/format_error_rate` | Fraction of episodes with **at least one** such turn. High here alongside a healthy `Submitted` rate means the nudge-and-continue recovery is working. | `sum(m.format_errors > 0)/n` |
@@ -104,7 +112,7 @@ tests dominate, and instances that never reached grading contribute 0/0 and drop
 ## 4. Our metrics — token accounting (`tokens/*`)
 
 Counted on the exact token ids the loop assembled (no re-tokenization), at
-[agent_loop.py:606-614](src/agentic_grpo/agent_loop.py#L606-L614).
+[`Episode.finalize`](src/agentic_grpo/episode.py).
 
 | Metric | Meaning | How collected |
 |---|---|---|
@@ -112,7 +120,7 @@ Counted on the exact token ids the loop assembled (no re-tokenization), at
 | `tokens/mean_completion` | Mean tokens the model generated across all turns of an episode. | `sum(response_mask)`; the mask is 1 for generated tokens, 0 for tool observations |
 | `tokens/mean_response` | **Identical to `tokens/mean_completion`** (both assigned `sum(response_mask)`). Kept as the "tokens actually trained on" name. | same |
 | `tokens/mean_cached_prompt` | Prefix-cache hits **summed over all of an episode's turns**. Was a **dead metric (always 0.0)** until the per-request `meta_info` plumbing of 5a — the server owns cache accounting, so there was no client-side source. Still 0.0 whenever `timeline/server_timing_rate` is 0. **Do not compare it to `tokens/mean_prompt`**: this is a per-episode sum over ~42 turns while that is a single-turn value, so the ratio is meaningless (it reads 22000% on run 20260806-040804). For a real hit rate use `TurnTiming.cache_hit_rate()` per turn in the dump — measured at **~0.93** (10527 cached of 11300 context), i.e. prefix caching is working and each turn re-prefills only its own new tokens. | `meta_info["cached_tokens"]` per turn, summed in [`summarize_turns`](src/agentic_grpo/metrics.py#L186) |
-| `tokens/mean_total` | Mean `len(prompt_ids) + len(response_ids)` after right-clipping to `max_response_length`. Compare against `rollout.max_model_len` (32768) to see how much context budget is really used. | [agent_loop.py:614](src/agentic_grpo/agent_loop.py#L614) |
+| `tokens/mean_total` | Mean `len(prompt_ids) + len(response_ids)` after right-clipping to `max_response_length`. Compare against `rollout.max_model_len` (32768) to see how much context budget is really used. | [`Episode.finalize`](src/agentic_grpo/episode.py) |
 | `tokens/mean_obs` | Mean size of a **single** tool observation, pooled over every observation in the batch (not per episode). Directly reflects `multi_turn.max_tool_response_length`. | `tool_obs_tokens` lists, flattened across the batch |
 | `tokens/max_obs` | Largest single observation in the batch. | `max(flat_obs)` |
 
@@ -126,9 +134,9 @@ standalone path).
 
 | Metric | Meaning | How collected |
 |---|---|---|
-| `latency/mean_trajectory_s` | Mean wall time of a whole episode: container start -> terminal exit, excluding grading. | `t_traj` bracket, [agent_loop.py:457](src/agentic_grpo/agent_loop.py#L457) and [:590](src/agentic_grpo/agent_loop.py#L590) |
+| `latency/mean_trajectory_s` | Mean wall time of a whole episode: container start -> terminal exit, excluding grading. | `perf_counter` bracket from [`Episode.admitted`](src/agentic_grpo/episode.py) to `Episode.close` |
 | `latency/max_trajectory_s` | Slowest single episode. The step barrier waits on this, so it — not the mean — sets rollout wall time. | `max(...)` over the batch |
-| `latency/mean_tool_s` | Mean time inside `env.execute(...)`, i.e. docker command execution, summed over an episode. | `t1` bracket around `_run_bash`, [agent_loop.py:546-548](src/agentic_grpo/agent_loop.py#L546-L548) |
+| `latency/mean_tool_s` | Mean time inside `env.execute(...)`, i.e. docker command execution, summed over an episode. | `perf_counter` bracket around `tools.run` in [`_execute`](src/agentic_grpo/agent_loop.py), summed by `Episode.tool_called` |
 | `latency/mean_generation_s` | **Derived, not measured**: `max(trajectory - tool, 0)`. Includes queueing, generation, tokenization and container setup, so it is an upper bound on generation. The authoritative split is the per-request timestamps in 5a and `timing_s/agent_loop/*`. | [`generation_time()`](src/agentic_grpo/metrics.py#L178) |
 
 ---
@@ -315,7 +323,7 @@ Derived from `attention_mask` / `response_mask` on the padded batch.
 | `response_length/clip_ratio` | Fraction of samples at exactly `data.max_response_length` (28672) — the context ceiling. Should track `traj/truncation_rate`. | same pattern |
 | `response_length_non_aborted/{mean,max,min,clip_ratio}` | The same four statistics excluding zero-length responses, so aborted samples do not drag the mean down. | `non_aborted_mask` |
 | `response/aborted_ratio` | Fraction of samples with a **zero-length** response. Our loop emits a single pad token for degenerate rollouts, so this should stay ~0; nonzero means samples are being dropped upstream. | `mean(response_length == 0)` |
-| `num_turns/{mean,max,min}` | verl's turn count, taken from `AgentLoopOutput.num_turns`, which we set to `assistant_turns * 2 + 1` (initial prompt plus one assistant and one tool message per turn). **So this is ~2x `traj/mean_turns` + 1** — the two are consistent, not contradictory. | `batch.non_tensor_batch["__num_turns__"]`, set at [agent_loop.py:623](src/agentic_grpo/agent_loop.py#L623) |
+| `num_turns/{mean,max,min}` | verl's turn count, taken from `AgentLoopOutput.num_turns`, which we set to `assistant_turns * 2 + 1` (initial prompt plus one assistant and one tool message per turn). **So this is ~2x `traj/mean_turns` + 1** — the two are consistent, not contradictory. | `batch.non_tensor_batch["__num_turns__"]`, set at [`run`](src/agentic_grpo/agent_loop.py) |
 | `global_seqlen/{min,max,mean}` | Total tokens summed per DP-rank chunk **before** load balancing. | `_balance_batch` -> `log_seqlen_unbalance` |
 | `global_seqlen/minmax_diff` | `max - min` of the above: the imbalance a naive split would cause. | same |
 | `global_seqlen/balanced_{min,max}` | Per-rank token sums **after** the rebalance. The gap between `balanced_max` and `max` is what balancing bought. | same |
@@ -342,7 +350,7 @@ only; `ref`/`adv`/`update_actor` use prompt + response).
 ### `timing_s/agent_loop/*` — per-trajectory breakdown
 
 Produced by verl's `AgentLoopManager` from the `AgentLoopMetrics` **we** return at
-[agent_loop.py:789](src/agentic_grpo/agent_loop.py#L789) (`generate_sequences=gen_s`,
+[`_build_output`](src/agentic_grpo/agent_loop.py) (`generate_sequences=gen_s`,
 `tool_calls=tool_s`, `compute_score=score_s`), then reduced across the batch.
 
 | Metric | Meaning |

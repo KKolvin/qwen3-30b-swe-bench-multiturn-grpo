@@ -77,8 +77,6 @@ def main() -> None:
     out = args.out or os.path.join(DataConfig().output_dir, "one.parquet")
     pq.write_table(pa.Table.from_pylist([row]), out)
     print(f"Wrote 1-instance dataset -> {out}")
-    print("Then run one step:")
-    print(f"    python scripts/train_standalone.py --train {out} --batch-size 1 --group-size 2 --total-steps 1")
 
 
 if __name__ == "__main__":

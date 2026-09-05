@@ -175,7 +175,15 @@ class TrajectoryMetrics:
     edit_errors: int = 0      # edit-tool calls refused (no/ambiguous match, bad args, missing file)
     view_count: int = 0       # edit-tool `view` calls (reads that did not go through cat)
     unknown_tool_calls: int = 0  # calls naming a tool that does not exist (e.g. the command as name)
-    test_runs: int = 0        # bash calls that ran pytest/tox/unittest (see agent_loop._TEST_CMD_RE)
+    test_runs: int = 0        # bash calls that ran pytest/tox/unittest (see episode.TEST_CMD_RE)
+    policy_denials: int = 0   # bash calls refused by bash_tool.POLICIES (install/network, servers, whole-repo lint)
+    tool_timeouts: int = 0    # bash calls killed at the environment timeout
+    repeated_calls: int = 0   # calls identical to an earlier one with an unchanged result (episode.Repeats)
+    # rollout.calculate_log_probs was on but this episode's output carried no
+    # usable server logprobs (crash before generating, or a length mismatch), so
+    # its rollout_log_probs are zeros. Should be ~0; nonzero means the
+    # importance correction is being fed padding for those episodes.
+    missing_logprobs: bool = False
     num_turns: int = 0
     truncated: bool = False   # context_length breached -> trajectory cut short
     format_errors: int = 0        # turns whose tool call we could neither parse nor salvage
@@ -320,6 +328,18 @@ class TrajectoryMetrics:
             # calls / ~2% of episodes ran any test on run 20260903-002235.
             "traj/mean_test_runs": mean("test_runs"),
             "traj/test_run_rate": sum(1 for m in batch if m.test_runs) / n,
+            # Structurally useless commands the harness refused before running
+            # them (7.0% + 3.6% + 1.1% of tool time on run 20260903-002235), and
+            # the timeouts that survive the policy layer.
+            "traj/mean_policy_denials": mean("policy_denials"),
+            "traj/policy_denial_rate": sum(1 for m in batch if m.policy_denials) / n,
+            "traj/mean_tool_timeouts": mean("tool_timeouts"),
+            "traj/timeout_rate": sum(1 for m in batch if m.tool_timeouts) / n,
+            # Looping: identical calls with an unchanged result, collapsed by
+            # episode.Repeats. Pair with traj/exit/RepetitionLimit.
+            "traj/mean_repeated_calls": mean("repeated_calls"),
+            "traj/repeat_rate": sum(1 for m in batch if m.repeated_calls) / n,
+            "traj/missing_logprobs_rate": sum(1 for m in batch if m.missing_logprobs) / n,
             "traj/truncation_rate": sum(1 for m in batch if m.truncated) / n,
             # Tool-call health: unparseable calls used to end the episode outright,
             # so these two decide how much of the batch carries real signal.
