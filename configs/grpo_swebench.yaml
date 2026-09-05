@@ -33,15 +33,30 @@ actor_rollout_ref:
     optim:
       lr: 1e-6
     ppo_mini_batch_size: 256
+    # Inert while use_dynamic_bsz is true: verl skips the micro-batch validation
+    # entirely in that branch (workers/config/actor.py). Kept for an easy revert.
     ppo_micro_batch_size_per_gpu: 1
     ppo_epochs: 1
     clip_ratio: 0.2
     use_kl_loss: true
     kl_loss_coef: 0.001
     loss_agg_mode: token-mean
-    # Must be >= the full sequence length (prompt + response) or long episodes are
-    # silently split/dropped when dynamic batching is enabled.
-    ppo_max_token_len_per_gpu: 32768
+    # Pack micro-batches by token budget instead of one sequence per GPU. Episodes
+    # span 331..32768 tokens, so a fixed micro-batch has to be sized for the worst
+    # case and idles on the average one; rearrange_micro_batches also balances tokens
+    # across DP ranks, which matters because FSDP syncs every micro-step at the
+    # slowest rank. At 1 seq/GPU a step was 256 micro-steps at 18.2s each: the
+    # 128-expert Python loop in HF's Qwen3MoeSparseMoeBlock charges per micro-step,
+    # not per token, which is what pinned perf/mfu/actor at 1.5% (~34 of 2250
+    # TFLOPS/GPU). Cascades to rollout+ref log_prob_use_dynamic_bsz.
+    use_dynamic_bsz: true
+    # Must be >= the padded attention_mask width (32768) or rearrange_micro_batches
+    # asserts. 65536 gives ~56 micro-steps per step instead of 256.
+    # Do NOT raise further without use_fused_kernels: the lm_head output is
+    # tokens x 151936 vocab, so 65536 tokens already materializes ~20GB of logits in
+    # bf16 (~40GB once log_softmax goes fp32) on top of the 72-100GB peak measured in
+    # run 20260903-002235. Watch actor/perf/max_memory_allocated_gb before going up.
+    ppo_max_token_len_per_gpu: 65536
     fsdp_config:
       param_offload: false
       # AdamW allocates exp_avg + exp_avg_sq lazily on the FIRST optimizer step:
@@ -85,22 +100,44 @@ actor_rollout_ref:
     temperature: 1.0
     top_p: 1.0
     max_num_seqs: 256           # server running-batch capacity (C) -> SGLang --max-running-requests
+    # Inert under dynamic bsz; the budget cascades from actor.ppo_max_token_len_per_gpu.
     log_prob_micro_batch_size_per_gpu: 1
-    # /metrics is gated on rollout.prometheus.enable, NOT on the engine_kwargs
-    # flag below. verl only sets server_args.enable_metrics (and so only calls
-    # add_prometheus_middleware) inside `if self.config.prometheus.enable:` --
-    # see async_sglang_server.py. With this false, the rollout server answered
-    # 404 on /metrics and every srv/* drain metric silently collected nothing.
+    # --- srv/* drain metrics: OFF (2026-08-05) ---------------------------------
+    # Turned off because collection is not free: prometheus.enable installs
+    # add_prometheus_middleware on the rollout server's request path, and it
+    # forces disable_log_stats=false, which runs SGLang's per-batch stats loop
+    # for the whole run. The measurement they were bought for is already in --
+    # drain_ratio 1.0 / running_peak 64 vs capacity 256 (run 20260801-072502),
+    # i.e. the server is never the constraint. Not worth paying every step to
+    # keep re-confirming it.
+    #
+    # To re-enable (all three lines together, plus AGENTIC_SGLANG_METRICS=1 in
+    # scripts/run_grpo.sh) -- e.g. to re-measure at the full batch of 256:
+    #   * /metrics is gated on rollout.prometheus.enable, NOT on the
+    #     engine_kwargs flag below: verl only sets server_args.enable_metrics
+    #     (and so only calls add_prometheus_middleware) inside
+    #     `if self.config.prometheus.enable:` -- see async_sglang_server.py.
+    #     With it false the server answers 404 on /metrics.
+    #   * disable_log_stats MUST then be false: the guard in
+    #     verl/workers/rollout/llm_server.py raises
+    #       ValueError: PROMETHEUS needs disable_log_stats==False, ...
+    #     and that stats loop is what populates the sglang:* gauges anyway.
     prometheus:
-      enable: true
-    # Required by the guard in verl/workers/rollout/llm_server.py: enabling
-    # prometheus with disable_log_stats=True (the default) raises
-    #   ValueError: PROMETHEUS needs disable_log_stats==False, but it is currently True.
-    # The stats loop is what populates the sglang:* gauges we scrape anyway.
-    disable_log_stats: false
+      enable: false
+    disable_log_stats: true
     engine_kwargs:
       sglang:
-        # NOT sufficient on its own for /metrics -- see prometheus.enable above.
+        # ON, but NOT for /metrics -- see prometheus.enable above, which is the
+        # switch that actually installs the endpoint and its middleware, and which
+        # stays off. This flag is what makes SGLang's tokenizer manager attach its
+        # per-request timestamps (request_received_ts, prefill_finished_ts,
+        # decode_finished_ts, queue_time) to each response's meta_info; without it
+        # that block is skipped and the per-turn timeline in
+        # agentic_grpo.metrics.TurnTiming degrades to client-side call boundaries
+        # (timing_source == "client"), which cannot separate prefill from decode.
+        # Cost is a few observe() calls on in-process counters per response: no
+        # HTTP route, no request-path middleware, and independent of
+        # disable_log_stats (ServerArgs.enable_metrics has no coupling to it).
         enable_metrics: true
         attention_backend: flashinfer  # B200 (SM 10.0) — fa3 only supports SM 80-90
         moe_runner_backend: triton     # avoid flashinfer_trtllm padded layout — breaks FSDP weight sync
@@ -110,7 +147,10 @@ actor_rollout_ref:
   ref:
     fsdp_config:
       param_offload: true
-    log_prob_max_token_len_per_gpu: 32768   # match the widened context
+    # Forward-only, but the same logits wall applies (log_prob materializes
+    # [tokens x vocab] before gathering), so keep it in step with the actor budget.
+    log_prob_max_token_len_per_gpu: 65536
+    # Inert under dynamic bsz (ref.log_prob_use_dynamic_bsz cascades from the actor).
     log_prob_micro_batch_size_per_gpu: 1
 
 trainer:
@@ -126,6 +166,6 @@ trainer:
   # is unset (keep ALL), so N/2 checkpoints accumulate on /data0 — 3 x ~60GB =
   # ~180GB for a 6-step run against ~467GB free. Set max_actor_ckpt_to_keep if
   # total_training_steps grows.
-  save_freq: 2
+  save_freq: 3
   test_freq: 9
   logger: ["console", "wandb"]

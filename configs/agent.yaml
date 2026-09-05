@@ -6,8 +6,8 @@
 # is parsed into OpenAI tool_calls.
 
 agent:
-  # Hard cap on model<->env turns. env_wrapper injects config.agent.step_limit (40)
-  # if omitted; set here to override.
+  # Hard cap on model<->env turns comes from verl's multi_turn.max_assistant_turns,
+  # falling back to config.agent.step_limit (40).
   cost_limit: 0.0          # self-hosted, disable $ budget
   wall_time_limit_seconds: 1800
   max_consecutive_format_errors: 3
@@ -15,11 +15,21 @@ agent:
   system_template: |
     You are a helpful assistant that can interact with a computer shell to solve programming tasks.
 
-    You act ONLY by calling the `bash` tool. It is the single tool available, named
-    exactly `bash`, and its one argument `command` is the shell command to run.
-    Every action MUST be a `bash` tool call with name="bash" — never invent other
-    tool names (e.g. do not use "find", "grep", "cat" as the tool name; put those as
-    the `command` argument of a `bash` call instead).
+    You have exactly two tools:
+    - `bash`: run a shell command. Its one argument `command` is the command to run.
+      Use it to explore the repository (ls, grep, find), to run scripts and tests,
+      and to submit your work.
+    - `str_replace_based_edit_tool`: view and edit files. `view` shows a file with
+      line numbers (use `view_range` for a section), `str_replace` replaces an exact
+      `old_str` with `new_str`, `insert` adds lines after `insert_line`, `create`
+      writes a new file.
+
+    Read and edit source files with `str_replace_based_edit_tool`, NOT with cat,
+    sed -i, echo >, heredocs or python one-liners: it matches exactly, refuses
+    ambiguous edits instead of guessing, and shows you the edited region. Every
+    action MUST be a call to one of these two tool names — never invent other tool
+    names (do not use "find", "grep", "cat" as the tool name; put those in the
+    `command` argument of a `bash` call instead).
 
   instance_template: |
     <pr_description>
@@ -49,11 +59,12 @@ agent:
 
     ## Recommended Workflow
 
-    1. Analyze the codebase by finding and reading relevant files
-    2. Create a script to reproduce the issue
-    3. Edit the source code to resolve the issue
+    1. Analyze the codebase: locate the relevant files with `bash` (grep, find), then read them with `str_replace_based_edit_tool` `view`
+    2. Create a script that reproduces the issue (`create`) and run it with `bash` to confirm the failure
+    3. Edit the source code with `str_replace` to resolve the issue
     4. Verify your fix works by running your script again
-    5. Test edge cases to ensure your fix is robust
+    5. Run the existing tests that cover the code you changed (e.g. `pytest path/to/test_file.py -x -q`) and fix any regression
+    6. Test edge cases to ensure your fix is robust
 
     ## Command Execution Rules
 
@@ -67,20 +78,28 @@ agent:
     Each response should include:
 
     1. **Reasoning text** where you explain your analysis and plan
-    2. At least one tool call with your command
+    2. At least one tool call (`bash` or `str_replace_based_edit_tool`)
 
     **CRITICAL REQUIREMENTS:**
 
     - Your response SHOULD include reasoning text explaining what you're doing
-    - Your response MUST include AT LEAST ONE bash tool call. You can make MULTIPLE tool calls in a single response when the commands are independent (e.g., searching multiple files, reading different parts of the codebase).
+    - Your response MUST include AT LEAST ONE tool call. You can make MULTIPLE tool calls in a single response when they are independent (e.g., searching multiple files, viewing different parts of the codebase).
+    - Edit files ONLY with `str_replace_based_edit_tool`. `old_str` must be copied exactly from a `view` (same indentation and whitespace) and must be unique in the file; if the tool reports no match or several matches, `view` the region and try again with more context. Never edit with sed -i, echo/printf redirection, heredocs or python scripts.
     - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
 
-    Example of a CORRECT response:
+    Example of a CORRECT exploration response:
     <example_response>
     I need to understand the Builder-related code. Let me find relevant files and check the project structure.
 
-    [Makes multiple bash tool calls: {"command": "ls -la"}, {"command": "find src -name '*.java' | grep -i builder"}, {"command": "cat README.md | head -50"}]
+    [Makes multiple tool calls: bash {"command": "ls -la"}, bash {"command": "grep -rn 'class Builder' src/"}, str_replace_based_edit_tool {"command": "view", "path": "/testbed/src/builder.py", "view_range": [40, 90]}]
+    </example_response>
+
+    Example of a CORRECT edit response:
+    <example_response>
+    The bug is that `limit` is compared before it is converted to an int. I'll fix the comparison.
+
+    [Makes one tool call: str_replace_based_edit_tool {"command": "str_replace", "path": "/testbed/src/builder.py", "old_str": "        if limit > self.max:\n            raise ValueError(limit)", "new_str": "        limit = int(limit)\n        if limit > self.max:\n            raise ValueError(limit)"}]
     </example_response>
 
     ## Environment Details
@@ -133,7 +152,7 @@ agent:
 environment:
   # get_sb_environment() resolves the SWE-bench instance image automatically.
   cwd: "/testbed"
-  timeout: 120
+  timeout: 60 # was 120
   interpreter: ["bash", "-c"]
   env:
     PAGER: cat
@@ -144,12 +163,40 @@ environment:
     # bash -c is non-login so it won't source ~/.bashrc; point BASH_ENV at it so the
     # image's `conda activate testbed` runs (else commands use the base env, no testbed).
     BASH_ENV: /root/.bashrc
+    # --- Container egress proxy ---------------------------------------------
+    # The container's DIRECT route to the internet exists but hangs at random:
+    # measured from a SWE-bench image, one `curl raw.githubusercontent.com` was
+    # 0.2s and the next timed out at 30s, and a burst of 24 containers had all
+    # 72 direct requests hang past 130s while the host itself stayed at 0.95s.
+    # A hang costs the full `command_timeout` (120s) because curl never errors,
+    # it just waits -- which is why network commands are 0.3% of tool calls but
+    # 10-22% of tool seconds across runs 20260810/0811/0818/0820, and 64-77% of
+    # every call that hit the timeout.
+    #
+    # The host runs an HTTP proxy on :12233 that is reliable (32/32 requests,
+    # 0.90-2.17s, no failures under the same test). It is NOT reachable at
+    # 127.0.0.1 (that is the container itself), nor at 10.0.2.2 /
+    # host.docker.internal / 172.17.0.1 -- dockerd-rootless runs slirp4netns
+    # with --disable-host-loopback, so only the host's real IP gets through.
+    # AGENTIC_CONTAINER_PROXY carries that IP; run_grpo.sh derives it per host.
+    #
+    # ${VAR} is expanded by resolve_container_env(); if the variable is unset
+    # these four keys are DROPPED (falling back to direct egress) rather than
+    # passed through literally, which curl would read as a proxy hostname and
+    # fail every request.
+    http_proxy: ${AGENTIC_CONTAINER_PROXY}
+    https_proxy: ${AGENTIC_CONTAINER_PROXY}
+    HTTP_PROXY: ${AGENTIC_CONTAINER_PROXY}
+    HTTPS_PROXY: ${AGENTIC_CONTAINER_PROXY}
+    # Keep container-local traffic off the proxy: the agent starts dev servers
+    # (`manage.py runserver`) and talks to them on loopback.
+    no_proxy: localhost,127.0.0.1,::1
+    NO_PROXY: localhost,127.0.0.1,::1
   environment_class: docker
 
 model:
-  # build_rollout_model() reads observation_template/format_error_template/model_kwargs
-  # from this block and overlays the SGLang connection kwargs (api_base, api_key,
-  # provider, temperature, ...) from RolloutConfig at runtime.
+  # agent_loop._load_agent_templates() reads observation_template and
+  # format_error_template from this block; model_kwargs is informational.
   observation_template: |
     {% if output.exception_info -%}
     <exception>{{output.exception_info}}</exception>
@@ -190,11 +237,16 @@ model:
 
     Here is general guidance on how to submit correct toolcalls:
 
-    Every response needs to use the 'bash' tool at least once to execute commands.
+    Every response needs to call a tool at least once.
 
-    Call the bash tool with your command as the argument:
+    Run a shell command:
     - Tool: bash
     - Arguments: {"command": "your_command_here"}
+
+    View or edit a file:
+    - Tool: str_replace_based_edit_tool
+    - Arguments: {"command": "view", "path": "/testbed/path/to/file.py"}
+    - Arguments: {"command": "str_replace", "path": "/testbed/path/to/file.py", "old_str": "exact existing text", "new_str": "replacement text"}
 
     If you have completed your assignment, please consult the first message about how to
     submit your solution (you will not be able to continue working on this task after that).

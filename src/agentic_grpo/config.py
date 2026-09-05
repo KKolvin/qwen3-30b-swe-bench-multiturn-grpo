@@ -1,46 +1,59 @@
-"""Typed configuration objects shared across the pipeline."""
+"""Agent-side configuration: the turn-cap fallback, dataset paths, and container env resolution."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+import os
+import re
+from dataclasses import dataclass
 
-MODEL_PATH = "/data0/shared/Qwen3-30B-A3B-Instruct-2507"
+logger = logging.getLogger("agentic_grpo.config")
+
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
 DATASET_PATH = "/data1/shared/swe_bench_train_hf"
-TRAIN_BATCH_SIZE = 256
-CONTEXT_LENGTH = 16384
-NUM_EPOCHS = 3
 
 
-@dataclass
-class RolloutConfig:
-    model_path: str = MODEL_PATH
-    base_url: str = "http://localhost:30000/v1"
-    policy_lag: int = 0
-    context_length: int = CONTEXT_LENGTH
-    temperature: float = 1.0
-    top_p: float = 1.0
-    max_new_tokens: int = 2048
-    group_size: int = 8
-    tensor_parallel_size: int = 8
-    return_logprobs: bool = True
-    # Server running-batch capacity: the GPU is saturated while at least this
-    # many generation requests are in flight. Must match the SGLang launch flag
-    # (`--max-running-requests`). Used to locate the drain-phase start (when
-    # in-flight requests fall below this and the GPU begins to idle). None ->
-    # fall back to the batch's observed peak concurrency.
-    max_running_requests: int | None = None
+def resolve_container_env(env: dict) -> dict:
+    """Expand ``${VAR}`` references in a mini-swe-agent ``environment.env`` block.
 
-    def __post_init__(self) -> None:
-        if self.policy_lag != 0:
-            raise ValueError(f"policy_lag must be 0, got {self.policy_lag}")
+    mini-swe-agent passes this dict straight to ``docker exec -e KEY=VALUE`` on
+    every command, and does no substitution of its own, so anything host-specific
+    (the egress proxy's IP, see ``configs/agent.yaml``) has to be resolved here.
+
+    A key referencing an **unset** variable is dropped rather than forwarded
+    literally. That distinction matters: ``-e http_proxy=${AGENTIC_CONTAINER_PROXY}``
+    is not "no proxy", it is a proxy whose hostname is the literal string, and
+    curl/pip/urllib would then fail *every* request instead of falling back to
+    direct egress.
+    """
+    resolved: dict = {}
+    dropped: list[str] = []
+    for key, value in env.items():
+        if not isinstance(value, str):
+            resolved[key] = value
+            continue
+        missing = [m.group(1) for m in _ENV_REF.finditer(value) if os.getenv(m.group(1)) is None]
+        if missing:
+            dropped.append(key)
+            continue
+        resolved[key] = _ENV_REF.sub(lambda m: os.environ[m.group(1)], value)
+    if dropped:
+        logger.warning(
+            "container env: dropped %s (unset ${...} reference); the container falls "
+            "back to direct egress",
+            ", ".join(sorted(dropped)),
+        )
+    return resolved
 
 
 @dataclass
 class AgentConfig:
+    # Fallback turn cap when verl's multi_turn.max_assistant_turns is unset. The
+    # bash timeout and observation cap live in configs/agent.yaml and
+    # configs/grpo_swebench.yaml respectively.
     step_limit: int = 40
-    command_timeout: int = 120
     agent_config_path: str = "configs/agent.yaml"
-    max_obs_tokens: int = 2048
 
 
 @dataclass
@@ -49,29 +62,3 @@ class DataConfig:
     split: str = "train"
     output_dir: str = "data/swebench_verified"
     seed: int = 0
-
-
-@dataclass
-class GRPOConfig:
-    train_batch_size: int = TRAIN_BATCH_SIZE
-    ppo_mini_batch_size: int = TRAIN_BATCH_SIZE
-    ppo_micro_batch_size_per_gpu: int = 1
-    ppo_epochs: int = 1
-    learning_rate: float = 1e-6
-    clip_ratio: float = 0.2
-    kl_loss_coef: float = 0.001
-    use_kl_loss: bool = True
-    loss_agg_mode: str = "token-mean"
-    num_epochs: int = NUM_EPOCHS
-    total_steps: int = 0  # computed from dataset size
-    adv_estimator: str = "grpo"
-
-
-@dataclass
-class PipelineConfig:
-    rollout: RolloutConfig = field(default_factory=RolloutConfig)
-    agent: AgentConfig = field(default_factory=AgentConfig)
-    data: DataConfig = field(default_factory=DataConfig)
-    grpo: GRPOConfig = field(default_factory=GRPOConfig)
-    project_name: str = "agentic-grpo-swebench"
-    experiment_name: str = "qwen3-30b-a3b-grpo"

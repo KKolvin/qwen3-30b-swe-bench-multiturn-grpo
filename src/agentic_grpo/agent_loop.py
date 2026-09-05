@@ -22,18 +22,16 @@ What we reuse rather than reinvent:
   tokens), and ``AgentLoopOutput`` (its ``reward_score`` field drops our binary
   reward onto the last token as ``rm_scores``).
 * **mini-swe-agent** — ``get_sb_environment`` (the per-instance SWE-bench docker
-  container), the ``bash`` tool schema (``BASH_TOOL``), and the prompt/observation
-  templates from ``configs/agent.yaml``. ``env.execute`` raises ``Submitted`` when
+  container), the ``bash`` tool schema (``BASH_TOOL``, via :mod:`agentic_grpo.tools`),
+  and the prompt/observation templates from ``configs/agent.yaml``. ``env.execute`` raises ``Submitted`` when
   the agent runs the submit marker, carrying the final patch.
-* **ours** — ``compute_reward`` (SWE-bench harness) and ``TrajectoryMetrics``.
+* **ours** — ``compute_reward`` (SWE-bench harness), ``TrajectoryMetrics``, the
+  tool registry (:mod:`agentic_grpo.tools`: ``bash`` + the edit tool), and the
+  tool-call parse/salvage layer (:mod:`agentic_grpo.tool_calls`).
 
 The blocking bits (docker container create / ``env.execute`` / the harness) are
 run in the loop's default executor so verl's event loop keeps serving the other
 concurrent rollouts.
-
-The standalone reference loop (``scripts/train_standalone.py``) still drives
-mini-swe-agent's own ``DefaultAgent`` via ``env_wrapper`` + ``build_rollout_model``
-against a plain SGLang server; that path is unchanged and independent of this one.
 """
 
 from __future__ import annotations
@@ -45,29 +43,22 @@ import logging
 import os
 import re
 import time
+import yaml
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from contextlib import nullcontext
 from typing import Any
 from uuid import uuid4
 
-from agentic_grpo.config import AgentConfig
-from agentic_grpo.metrics import TrajectoryMetrics
+from agentic_grpo.config import AgentConfig, resolve_container_env
+from agentic_grpo import tool_calls, tools
+from agentic_grpo.editor_tool import EDIT_TOOL_NAME
+from agentic_grpo.metrics import TrajectoryMetrics, TurnTiming
 from agentic_grpo.reward import apply_to_metrics, compute_reward
+from agentic_grpo.sglang_timing import SGLANG_TIMING_KEY
+from agentic_grpo.timeline import patch_trainer_timeline, trajectory_timeline
 
 logger = logging.getLogger("agentic_grpo.agent_loop")
-
-# Fallback bash tool schema, identical to mini-swe-agent's BASH_TOOL, used if the
-# import isn't available (e.g. unit tests without minisweagent installed).
-_BASH_TOOL_FALLBACK = {
-    "type": "function",
-    "function": {
-        "name": "bash",
-        "description": "Execute a bash command",
-        "parameters": {
-            "type": "object",
-            "properties": {"command": {"type": "string", "description": "The bash command to execute"}},
-            "required": ["command"],
-        },
-    },
-}
 
 try:  # verl >= 0.5
     from verl.experimental.agent_loop.agent_loop import (  # type: ignore
@@ -95,13 +86,31 @@ except Exception:  # pragma: no cover - verl not installed
             self.tokenizer = kwargs.get("tokenizer")
             self.config = kwargs.get("config")
 
+    # Attribute-carrying stand-ins for verl's pydantic models, with the same
+    # field names and defaults. They must be *objects*, not dicts: ``run()``
+    # builds one output object on both paths, and the tests read it back as
+    # ``out.extra_fields[...]``. A dict here would make the whole suite
+    # verl-only, which is the thing this fallback exists to avoid.
+    @dataclass
     class AgentLoopMetrics:  # type: ignore
-        def __init__(self, generate_sequences=0.0, tool_calls=0.0, compute_score=0.0):
-            self.generate_sequences = generate_sequences
-            self.tool_calls = tool_calls
-            self.compute_score = compute_score
+        generate_sequences: float = 0.0
+        tool_calls: float = 0.0
+        compute_score: float = 0.0
+        num_preempted: int = -1
 
-    AgentLoopOutput = dict  # type: ignore
+    @dataclass
+    class AgentLoopOutput:  # type: ignore
+        prompt_ids: list = field(default_factory=list)
+        response_ids: list = field(default_factory=list)
+        response_mask: list = field(default_factory=list)
+        metrics: "AgentLoopMetrics" = field(default_factory=AgentLoopMetrics)
+        response_logprobs: Any = None
+        routed_experts: Any = None
+        multi_modal_data: Any = None
+        reward_score: float | None = None
+        num_turns: int = 0
+        extra_fields: dict = field(default_factory=dict)
+        mm_processor_kwargs: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -153,126 +162,6 @@ class _Trajectory:
         return prompt, response[:response_length], mask[:response_length]
 
 
-def _command_from_tool_call(tool_call: Any) -> tuple[str, str]:
-    """Extract ``(name, command)`` from a verl ``FunctionCall``.
-
-    Returns an empty command (never raises) so a malformed call becomes an error
-    observation the agent can recover from rather than killing the rollout.
-    """
-    name = getattr(tool_call, "name", "") or ""
-    raw_args = getattr(tool_call, "arguments", "") or "{}"
-    try:
-        args = json.loads(raw_args)
-        command = args.get("command", "") if isinstance(args, dict) else ""
-    except (json.JSONDecodeError, TypeError):
-        command = ""
-    return name, command
-
-
-# --- recovering tool calls verl's hermes parser threw away -------------------
-#
-# ``HermesToolParser.extract_tool_calls`` logs ``Failed to decode tool call`` and
-# *silently drops* any ``<tool_call>`` block whose JSON won't parse, returning an
-# empty list — indistinguishable from "the model made no tool call at all". The
-# first full-batch run died on exactly this: every drop ended the episode, so all
-# rewards were 0 and GRPO advantages were identically zero. The observed causes
-# are all recoverable, so we salvage first and only fall back to telling the model
-# it erred.
-_TOOL_CALL_OPEN = "<tool_call>"
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-_COMMAND_FIELD_RE = re.compile(r'"command"\s*:\s*"')
-_COMMAND_END_RE = re.compile(r'"\s*(?=[,}])')
-_NAME_FIELD_RE = re.compile(r'"name"\s*:\s*"([^"]*)"')
-_JSON_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f"}
-
-
-def _attempted_tool_call(text: str) -> bool:
-    """True if the model tried to call a tool, even if the call is unusable.
-
-    Only the opening marker is required: a response cut off mid-call has no
-    ``</tool_call>``, and that is a format error to report, not a finished turn.
-    """
-    return _TOOL_CALL_OPEN in text
-
-
-def _unescape_json_string(raw: str) -> str:
-    """Apply the escapes the model got right, leaving unknown ones literal.
-
-    A single left-to-right pass, so ``\\\\n`` becomes a literal backslash + ``n``
-    rather than a newline, and a regex like ``\\d+`` inside a bash command
-    survives untouched.
-    """
-    return re.sub(r"\\(.)", lambda m: _JSON_ESCAPES.get(m.group(1), m.group(0)), raw, flags=re.DOTALL)
-
-
-def _command_from_obj(obj: Any) -> tuple[str, str] | None:
-    """Pull ``(name, command)`` out of a decoded ``<tool_call>`` payload.
-
-    Accepts the near-miss shapes Qwen3 emits alongside the canonical
-    ``{"name": ..., "arguments": {"command": ...}}`` — above all the
-    ``arguments``-less form, which is what makes hermes raise ``KeyError:
-    'arguments'`` (the single most common failure in the first full-batch run).
-    """
-    if not isinstance(obj, dict):
-        return None
-    name = obj["name"] if isinstance(obj.get("name"), str) else "bash"
-    args = obj.get("arguments")
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except (json.JSONDecodeError, TypeError):
-            return (name, args)  # ``arguments`` held the bare command string
-    if isinstance(args, dict) and isinstance(args.get("command"), str):
-        return (name, args["command"])
-    if isinstance(obj.get("command"), str):
-        return (name, obj["command"])  # ``arguments`` key absent entirely
-    return None
-
-
-def _lenient_command(block: str) -> tuple[str, str] | None:
-    """Last-resort extraction of ``command`` from a block ``json.loads`` rejected.
-
-    Takes everything from the opening quote of the ``"command"`` value to the last
-    quote that closes a JSON value (one followed by ``,`` or ``}``), so embedded
-    raw newlines and unescaped inner quotes survive intact — these are the
-    ``Invalid control character`` / ``Invalid \\escape`` / ``Expecting ','
-    delimiter`` failures. Assumes ``command`` is the block's last field, which is
-    the shape Qwen3 emits; if it isn't, the command may capture trailing JSON and
-    fail in bash, which still yields an error observation rather than a dead
-    episode.
-    """
-    start = _COMMAND_FIELD_RE.search(block)
-    if start is None:
-        return None
-    ends = [m.start() for m in _COMMAND_END_RE.finditer(block, start.end())]
-    if not ends:
-        return None
-    name_m = _NAME_FIELD_RE.search(block)
-    name = name_m.group(1) if name_m else "bash"
-    return (name, _unescape_json_string(block[start.end() : ends[-1]]))
-
-
-def _salvage_tool_calls(text: str) -> list[tuple[str, str]]:
-    """Recover ``(name, command)`` pairs from ``<tool_call>`` blocks hermes dropped.
-
-    Only *closed* blocks are salvaged: a block with no ``</tool_call>`` was cut
-    off mid-generation, and running a truncated shell command is worse than
-    reporting the format error.
-    """
-    calls: list[tuple[str, str]] = []
-    for block in _TOOL_CALL_BLOCK_RE.findall(text):
-        block = block.strip()
-        try:
-            got = _command_from_obj(json.loads(block))
-        except (json.JSONDecodeError, TypeError):
-            got = None
-        if got is None:
-            got = _lenient_command(block)
-        if got is not None and got[1]:
-            calls.append(got)
-    return calls
-
-
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
     return int(raw) if raw.isdigit() else default
@@ -316,18 +205,97 @@ def _live_container_semaphore() -> "asyncio.Semaphore":
     return _LIVE_CONTAINER_SEM
 
 
+_EVAL_SEM: "asyncio.Semaphore | None" = None
+_EVAL_POOL: "ThreadPoolExecutor | None" = None
+
+
+def _eval_semaphore() -> "asyncio.Semaphore":
+    """Per-process cap on concurrent reward-eval containers (lazy, loop-bound).
+
+    Grading runs its own docker container, and it runs *after* the rollout has
+    released its live-container slot -- so nothing bounded it. That was harmless
+    only while the harness cache made grading a 20 ms file read; with the cache
+    keyed on the patch (see :mod:`agentic_grpo.reward`) every submitted patch now
+    starts a real container, and an unbounded 2048-per-step fan-out would put the
+    daemon straight back into ``exit status 125``.
+
+    Size it so ``AGENTIC_MAX_LIVE_CONTAINERS + AGENTIC_MAX_EVAL_CONTAINERS``,
+    times ``rollout.agent.num_workers``, stays under the daemon's ceiling.
+    """
+    global _EVAL_SEM
+    if _EVAL_SEM is None:
+        _EVAL_SEM = asyncio.Semaphore(max(1, _int_env("AGENTIC_MAX_EVAL_CONTAINERS", 4)))
+    return _EVAL_SEM
+
+
+def _eval_pool() -> ThreadPoolExecutor:
+    """Threads reserved for the blocking harness call.
+
+    ``run_in_executor(None, ...)`` would put a 900 s test run into the loop's
+    default pool, the same one container creation and cleanup use; a batch of
+    slow evals would then starve the rollouts still in flight.
+    """
+    global _EVAL_POOL
+    if _EVAL_POOL is None:
+        _EVAL_POOL = ThreadPoolExecutor(
+            max_workers=max(1, _int_env("AGENTIC_MAX_EVAL_CONTAINERS", 4)),
+            thread_name_prefix="reward-eval",
+        )
+    return _EVAL_POOL
+
+
 def _dump_enabled() -> bool:
     return bool(os.environ.get("AGENTIC_TRAJECTORY_DUMP_DIR", ""))
 
 
-def _dump_trajectory(instance_id: str, exit_status: str, reward: float, actions: list[dict]) -> None:
+def _turn_timing(turn: int, call_start: float, call_end: float, out: Any) -> TurnTiming:
+    """Build a :class:`TurnTiming` for one generate call.
+
+    ``call_start``/``call_end`` are wall clock (``time.time()``) around the Ray
+    round trip. The server's own timestamps ride on ``extra_fields`` when
+    :mod:`agentic_grpo.sglang_timing` is active — see that module for why the
+    prefill/decode boundary is unobtainable from this side. Absent them, the turn
+    carries client timing only and the trajectory reports
+    ``timing_source == "client"``.
+    """
+    t = TurnTiming(turn=turn, gen_call_start=call_start, gen_call_end=call_end)
+    srv = (getattr(out, "extra_fields", None) or {}).get(SGLANG_TIMING_KEY)
+    if isinstance(srv, dict):
+        t.request_received = float(srv.get("request_received", 0.0) or 0.0)
+        t.request_scheduled = float(srv.get("request_scheduled", 0.0) or 0.0)
+        # SGLang's prefill_finished_ts: the instant the first token was sampled,
+        # i.e. prefill done and decoding under way.
+        t.decode_start = float(srv.get("prefill_finished", 0.0) or 0.0)
+        t.decode_finished = float(srv.get("decode_finished", 0.0) or 0.0)
+        t.response_sent = float(srv.get("response_sent", 0.0) or 0.0)
+        t.completion_tokens = int(srv.get("completion_tokens", 0) or 0)
+        t.cached_tokens = int(srv.get("cached_tokens", 0) or 0)
+        t.prompt_tokens = int(srv.get("prompt_tokens", 0) or 0)
+    return t
+
+
+def _dump_trajectory(
+    instance_id: str,
+    exit_status: str,
+    reward: float,
+    actions: list[dict],
+    metrics: TrajectoryMetrics | None = None,
+) -> None:
     """Append one JSON line describing an episode, if dumping is enabled.
 
     Opt-in via ``AGENTIC_TRAJECTORY_DUMP_DIR``. A binary reward tells you *that* a
     rollout scored 0, never *why* — this records the actual commands so you can
     see whether the agent worked productively and ran out of turns, or never
-    attempted the submit marker at all. Best-effort: a dump failure must never
-    disturb a rollout.
+    attempted the submit marker at all.
+
+    The full :class:`TrajectoryMetrics` goes in too, including the per-turn
+    timeline that is deliberately stripped from the batch payload sent to the
+    trainer (:meth:`TrajectoryMetrics.to_dict`). This file is the only place the
+    per-turn detail survives, so it carries everything: the aggregate W&B numbers
+    can say a step had a long tail, but only these records say which instance,
+    which turn, and whether the time went to prefill, decode or docker.
+
+    Best-effort: a dump failure must never disturb a rollout.
     """
     dump_dir = os.environ.get("AGENTIC_TRAJECTORY_DUMP_DIR", "")
     if not dump_dir:
@@ -341,6 +309,8 @@ def _dump_trajectory(instance_id: str, exit_status: str, reward: float, actions:
             "num_actions": len(actions),
             "actions": actions,
         }
+        if metrics is not None:
+            record["metrics"] = metrics.to_dict()
         # One file per process; each line is a complete episode.
         path = os.path.join(dump_dir, f"trajectories-{os.getpid()}.jsonl")
         with open(path, "a") as fh:
@@ -389,7 +359,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
             self._error_tmpl,
             self.max_consecutive_format_errors,
         ) = _load_agent_templates(self._agent_config_path)
-        self._bash_schema = _bash_tool_schema()
+        self._tool_schemas = tools.schemas()
         self._pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> "AgentLoopOutput":  # type: ignore[override]
@@ -409,24 +379,50 @@ class SWEBenchAgentLoop(AgentLoopBase):
         # still carry a real prompt and degrade to a reward-0 sample rather than
         # taking down the whole step via ``asyncio.gather``.
         messages = self._initial_messages(instance)
-        prompt_ids = await self.apply_chat_template(messages, tools=[self._bash_schema])
+        prompt_ids = await self.apply_chat_template(messages, tools=self._tool_schemas)
         traj = _Trajectory(prompt_ids)
         sp = self._with_stop_tokens(sampling_params)
 
+        # Defaults only, so an episode that dies before admission still yields a
+        # usable envelope; both are reset at admission below.
         t_traj = time.perf_counter()
+        # Wall clock as well as perf_counter: durations come from perf_counter
+        # (monotonic), but the timeline has to be comparable against the server's
+        # own timestamps, which come from a different process.
+        metrics.t_start = time.time()
         env = None
         consecutive_format_errors = 0
         actions: list[dict] = []  # only populated when dumping is enabled
+        turns: list[TurnTiming] = []  # per-turn timeline, always collected
+        # Event stream for the run timeline (None unless AGENTIC_TIMELINE_DIR is
+        # set). Generate events are derived from `turns` at finish(); what is
+        # recorded here is everything that has no other record: the two waits
+        # before the first token, each individual tool call, and cleanup.
+        tl = trajectory_timeline(instance_id)
         try:
             # The live-container semaphore is held across the whole episode, not
             # just the start, so the daemon never accumulates more than
             # num_workers * cap containers.
+            t_slot = time.time()
             async with _live_container_semaphore():
+                # Admission, not work: with 256 episodes per worker and `cap`
+                # permits, everything before this instant is a queue position --
+                # a property of the batch, not of the trajectory (admitted first
+                # waits 0s, admitted last waits most of the step; measured 1167s
+                # mean against 466s of real work). The clocks restart here so no
+                # duration below counts the queue; `admission_wait` keeps it.
+                t_traj = time.perf_counter()
+                metrics.t_start = time.time()
+                metrics.admission_wait_s = metrics.t_start - t_slot
+                if tl is not None:
+                    tl.mark("admission_wait", t_slot, metrics.t_start)
                 try:
-                    env = await self._make_env_bounded(instance)
+                    with (tl.span("container_start") if tl else nullcontext()):
+                        env = await self._make_env_bounded(instance)
 
                     while assistant_turns < self.max_assistant_turns and traj.response_len() < self.response_length:
                         t0 = time.perf_counter()
+                        call_start = time.time()
                         out = await self.server_manager.generate(
                             request_id=uuid4().hex,
                             prompt_ids=traj.current_ids(),
@@ -435,6 +431,8 @@ class SWEBenchAgentLoop(AgentLoopBase):
                         gen_s += time.perf_counter() - t0
                         traj.add_generated(out.token_ids)
                         assistant_turns += 1
+                        turn_t = _turn_timing(assistant_turns, call_start, time.time(), out)
+                        turns.append(turn_t)
 
                         if traj.response_len() >= self.response_length:
                             exit_status = "ContextLimit"
@@ -442,12 +440,12 @@ class SWEBenchAgentLoop(AgentLoopBase):
                             break
 
                         _, parsed = await self.tool_parser.extract_tool_calls(out.token_ids, None)
-                        calls = [_command_from_tool_call(tc) for tc in parsed]
+                        calls = [tool_calls.from_function_call(tc) for tc in parsed]
 
                         if not calls:
                             raw = await self._decode(out.token_ids)
-                            attempted = _attempted_tool_call(raw)
-                            calls = _salvage_tool_calls(raw) if attempted else []
+                            attempted = tool_calls.attempted(raw)
+                            calls = tool_calls.salvage(raw) if attempted else []
                             if calls:
                                 metrics.salvaged_tool_calls += len(calls)
                             else:
@@ -463,6 +461,13 @@ class SWEBenchAgentLoop(AgentLoopBase):
                                 # the submit command) and let the agent finish.
                                 consecutive_format_errors += 1
                                 metrics.format_errors += 1
+                                if tl is not None:
+                                    tl.mark(
+                                        "format_error",
+                                        turn_t.gen_call_end,
+                                        turn=assistant_turns,
+                                        attempted=attempted,
+                                    )
                                 if _dump_enabled():
                                     actions.append(
                                         {
@@ -490,11 +495,25 @@ class SWEBenchAgentLoop(AgentLoopBase):
 
                         obs_messages: list[dict] = []
                         submitted = False
-                        for name, command in calls:
+                        turn_t.tool_start = time.time()
+                        turn_t.num_tool_calls = len(calls)
+                        for name, args in calls:
                             metrics.tool_call_count += 1
                             t1 = time.perf_counter()
-                            obs, sub = await self.loop.run_in_executor(None, self._run_bash, env, name, command)
+                            call_t = time.time()
+                            obs, sub = await self.loop.run_in_executor(None, tools.run, env, name, args)
                             tool_s += time.perf_counter() - t1
+                            turn_t.tool_end = time.time()
+                            _count_call(metrics, name, args, obs)
+                            command = tools.summarize(name, args)
+                            if tl is not None:
+                                # Per CALL, unlike TurnTiming.tool_start/tool_end,
+                                # which collapse a turn's calls into one span.
+                                tl.tool_call(
+                                    assistant_turns, name, command, call_t,
+                                    returncode=obs.get("returncode"),
+                                    submitted=sub is not None or None,
+                                )
                             if _dump_enabled():
                                 actions.append(
                                     {
@@ -530,18 +549,44 @@ class SWEBenchAgentLoop(AgentLoopBase):
                     # Free the container (and the slot) before scoring, which runs
                     # its own harness container.
                     if env is not None:
-                        await self.loop.run_in_executor(None, _safe_cleanup, env)
+                        # Last chance to salvage a patch: every exit but
+                        # "Submitted" leaves `submission` empty even when the
+                        # agent's edits are sitting in /testbed. See
+                        # _recover_patch. Must happen before cleanup -- the
+                        # container is gone right after.
+                        if not submission and _patch_fallback_enabled():
+                            with (tl.span("patch_recover") if tl else nullcontext()):
+                                submission = await self.loop.run_in_executor(
+                                    None, _recover_patch, env, instance
+                                )
+                            metrics.patch_recovered = bool(submission)
+                        with (tl.span("cleanup") if tl else nullcontext()):
+                            await self.loop.run_in_executor(None, _safe_cleanup, env)
                         env = None
         except Exception as exc:  # pragma: no cover - defensive; keep the batch alive
             logger.exception("SWEBench agent loop crashed for %s", instance_id)
             exit_status = f"Crashed:{type(exc).__name__}"
         metrics.total_trajectory_time = time.perf_counter() - t_traj
         metrics.total_tool_call_time = tool_s
+        # Rollout end = the episode is over and the container is released. Harness
+        # grading below is timed separately: it runs its own docker container and
+        # folding it in here would make the generation timeline unreadable.
+        metrics.t_end = time.time()
+        metrics.turns = turns
+        metrics.summarize_turns()
 
         # Binary SWE-bench reward from the official harness (blocking docker run).
-        t_score = time.perf_counter()
-        rr = await self.loop.run_in_executor(None, compute_reward, instance, submission)
-        score_s = time.perf_counter() - t_score
+        t_eval_slot = time.time()
+        async with _eval_semaphore():
+            t_score = time.perf_counter()
+            metrics.t_score_start = time.time()
+            if tl is not None:
+                # Queueing for a grading slot is not grading. Kept as its own
+                # span so `score` stays comparable to the pre-fix timelines.
+                tl.mark("eval_wait", t_eval_slot, metrics.t_score_start)
+            rr = await self.loop.run_in_executor(_eval_pool(), compute_reward, instance, submission)
+            score_s = time.perf_counter() - t_score
+            metrics.t_score_end = time.time()
 
         prompt_ids, response_ids, response_mask = traj.finalize(
             self.response_length, pad_token_id=self._pad_token_id
@@ -553,7 +598,12 @@ class SWEBenchAgentLoop(AgentLoopBase):
         metrics.response_tokens = sum(response_mask)
         metrics.total_trajectory_tokens = len(prompt_ids) + len(response_ids)
         apply_to_metrics(metrics, rr)
-        _dump_trajectory(instance_id, exit_status, rr.reward, actions)
+        _dump_trajectory(instance_id, exit_status, rr.reward, actions, metrics)
+        if tl is not None:
+            # One write per episode, after metrics are final: finish() adds the
+            # generate events (from `turns`), the grading span and the episode
+            # envelope on top of what was buffered during the run.
+            tl.finish(metrics)
 
         return self._build_output(
             prompt_ids=prompt_ids,
@@ -600,8 +650,6 @@ class SWEBenchAgentLoop(AgentLoopBase):
 
     def _make_env(self, instance: dict) -> Any:
         """Build the per-instance SWE-bench docker environment (mini-swe-agent)."""
-        import yaml
-
         from minisweagent.run.benchmarks.swebench import get_sb_environment  # type: ignore
 
         config: dict = {}
@@ -609,27 +657,10 @@ class SWEBenchAgentLoop(AgentLoopBase):
             config = yaml.safe_load(open(self._agent_config_path)) or {}
         env_cfg = config.setdefault("environment", {})
         env_cfg.setdefault("environment_class", "docker")
+        # The yaml's `environment.env` carries ${VAR} references (the egress
+        # proxy's host-specific IP); mini-swe-agent does no substitution.
+        env_cfg["env"] = resolve_container_env(env_cfg.get("env", {}))
         return get_sb_environment(config, instance)
-
-    def _run_bash(self, env: Any, name: str, command: str) -> tuple[dict, str | None]:
-        """Run one bash tool call in the container.
-
-        Returns ``(observation_dict, submission)``. ``submission`` is non-None only
-        when the command triggered mini-swe-agent's submit marker (``env.execute``
-        raises ``Submitted`` carrying the final patch).
-        """
-        from minisweagent.exceptions import Submitted  # type: ignore
-
-        if name != "bash":
-            return {"returncode": -1, "output": f"Unknown tool '{name}'. Only 'bash' is available."}, None
-        if not command:
-            return {"returncode": -1, "output": "Missing 'command' argument in bash tool call."}, None
-        try:
-            out = env.execute({"command": command})
-            return out, None
-        except Submitted as e:
-            submission = e.messages[0].get("extra", {}).get("submission", "") if e.messages else ""
-            return {"returncode": 0, "output": ""}, submission
 
     def _initial_messages(self, instance: dict) -> list[dict]:
         task = instance.get("problem_statement", "")
@@ -661,15 +692,16 @@ class SWEBenchAgentLoop(AgentLoopBase):
         """
         if attempted:
             error = (
-                "Could not parse a `bash` tool call from your response. The JSON inside "
-                '<tool_call>...</tool_call> must be valid: it needs a "name" of "bash" and an '
-                '"arguments" object holding "command", with every newline, quote and backslash '
-                "properly escaped."
+                "Could not parse a tool call from your response. The JSON inside "
+                '<tool_call>...</tool_call> must be valid: a "name" of "bash" with an '
+                '"arguments" object holding "command", or a "name" of '
+                f'"{EDIT_TOOL_NAME}" with its "command"/"path"/... arguments, with every '
+                "newline, quote and backslash properly escaped."
             )
         else:
             error = (
-                "Your response contained no `bash` tool call, so nothing was executed. "
-                "Every response must make at least one `bash` tool call.\n"
+                "Your response contained no tool call, so nothing was executed. "
+                f"Every response must make at least one `bash` or `{EDIT_TOOL_NAME}` call.\n"
                 "If you are still working, issue the next command. If you have finished editing "
                 "and have already written and checked patch.txt, submit it now with EXACTLY "
                 "this command:\n"
@@ -677,7 +709,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
                 "Your work is not recorded until you run that command."
             )
         tvars: dict[str, Any] = {"error": error}
-        if _TOOL_CALL_OPEN in raw and "</tool_call>" not in raw:
+        if tool_calls.unclosed(raw):
             tvars["finish_reason"] = "length"
         return _render(self._error_tmpl, **tvars)
 
@@ -718,19 +750,15 @@ class SWEBenchAgentLoop(AgentLoopBase):
             response_ids, response_mask = [self._pad_token_id], [1]
 
         extra_fields = {
-            "trajectory_metrics": metrics.to_dict(),
+            # include_turns=False: the per-turn timeline is for the dump file, not
+            # for the batch. It rides in non_tensor_batch all the way to the
+            # trainer, and 80 turns x a dozen floats x 2048 trajectories of
+            # Ray-serialised object arrays buys nothing that summarize_turns()
+            # has not already reduced to a scalar.
+            "trajectory_metrics": metrics.to_dict(include_turns=False),
             "exit_status": metrics.exit_status,
         }
         loop_metrics = AgentLoopMetrics(generate_sequences=gen_s, tool_calls=tool_s, compute_score=score_s)
-        if not _HAS_VERL:  # pragma: no cover - test/standalone stub
-            return {
-                "prompt_ids": prompt_ids,
-                "response_ids": response_ids,
-                "response_mask": response_mask,
-                "reward_score": reward,
-                "num_turns": num_turns,
-                "extra_fields": extra_fields,
-            }
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
@@ -747,8 +775,8 @@ class SWEBenchAgentLoop(AgentLoopBase):
 # ---------------------------------------------------------------------------
 _DEFAULT_ERROR_TMPL = (
     "Tool call error:\n\n<error>\n{{error}}\n</error>\n\n"
-    "Every response must call the 'bash' tool with a single JSON argument, "
-    'e.g. {"command": "ls -la"}.'
+    "Every response must call a tool: 'bash' with a single JSON argument, "
+    'e.g. {"command": "ls -la"}, or the file editor.'
 )
 
 
@@ -756,12 +784,10 @@ def _load_agent_templates(path: str) -> tuple[str, str, str, str, int]:
     """Return the templates + format-error budget from the agent yaml.
 
     ``(system, instance, observation, format_error, max_consecutive_format_errors)``.
-    The last two were previously read only by :mod:`agentic_grpo.rollout_backend`
-    (the standalone litellm loop), leaving this loop with no way to tell the model
-    it had emitted an unusable tool call.
+    The last two were once read only by the retired standalone litellm loop,
+    leaving this loop with no way to tell the model it had emitted an unusable
+    tool call.
     """
-    import yaml
-
     cfg: dict = {}
     if os.path.isfile(path):
         cfg = yaml.safe_load(open(path)) or {}
@@ -787,13 +813,80 @@ def _render(template: str, **vars: Any) -> str:
     return Template(template).render(**vars)
 
 
-def _bash_tool_schema() -> dict:
-    try:
-        from minisweagent.models.utils.actions_toolcall import BASH_TOOL  # type: ignore
+# The commands that count as "ran the tests": the behaviour the edit tool is
+# meant to free turn budget for. 0.57% of bash calls on run 20260903-002235.
+_TEST_CMD_RE = re.compile(r"(?<![\w.-])(?:pytest|py\.test|tox|python[23]?\s+-m\s+(?:pytest|unittest)|runtests\.py|manage\.py\s+test)(?![\w.-])")
 
-        return BASH_TOOL
-    except Exception:
-        return _BASH_TOOL_FALLBACK
+
+def _count_call(metrics: TrajectoryMetrics, name: str, args: dict, obs: dict) -> None:
+    """Per-call behaviour counters (see ``TrajectoryMetrics.aggregate``)."""
+    if name == EDIT_TOOL_NAME:
+        if obs.get("edit"):
+            metrics.edit_count += 1
+        elif obs.get("returncode") == 0:
+            metrics.view_count += 1
+        else:
+            metrics.edit_errors += 1
+    elif name == "bash":
+        if _TEST_CMD_RE.search(args.get("command", "") or ""):
+            metrics.test_runs += 1
+    else:
+        metrics.unknown_tool_calls += 1
+
+
+_BASE_COMMIT_RE = re.compile(r"\A[0-9a-fA-F]{7,40}\Z")
+
+
+def _patch_fallback_enabled() -> bool:
+    return os.environ.get("AGENTIC_PATCH_FALLBACK", "1") != "0"
+
+
+def _recover_patch(env: Any, instance: dict) -> str:
+    """Read the working tree's diff out of the container, as a last-resort submission.
+
+    ``submission`` normally arrives only through mini-swe-agent's submit marker
+    -- the agent echoing ``COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`` as the first
+    line of a bash call that exits 0. Every other ending (TurnLimit,
+    ContextLimit, NoToolCall, FormatErrorLimit) leaves it empty and the episode
+    grades as ``empty_patch`` no matter what the agent actually wrote into
+    /testbed. On run 20260828-052125 that was 2113 of 5282 episodes, and 951 of
+    them had already written patch.txt: real work, thrown away because the model
+    forgot one echo. Their resolve rate is 0.0% by construction while submitted
+    episodes score 16.5%, so the loss is also a large block of all-zero GRPO
+    groups that carry no advantage.
+
+    So ask git what changed before the container goes away. ``diff
+    <base_commit>`` rather than a bare ``diff``, so the patch survives an agent
+    that staged or committed its work; ``core.fileMode=false`` mirrors the
+    harness's own eval script. Untracked files (repro scripts, patch.txt itself)
+    are excluded by construction -- which is what the submission instructions in
+    ``configs/agent.yaml`` ask for anyway.
+
+    Best effort throughout: anything unexpected returns "" and the episode keeps
+    the reward 0 it already had.
+    """
+    base = str(instance.get("base_commit") or "")
+    ref = base if _BASE_COMMIT_RE.match(base) else ""
+    try:
+        out = env.execute({"command": f"git -c core.fileMode=false diff {ref}".rstrip()})
+    except Exception as exc:  # noqa: BLE001 - the container may already be gone
+        logger.warning("patch recovery failed for %s: %s", instance.get("instance_id", "?"), exc)
+        return ""
+    if out.get("returncode") != 0:
+        return ""
+    patch = out.get("output") or ""
+    if not patch.strip():
+        return ""
+    # A cut diff cannot apply, so an oversized one is dropped whole rather than
+    # truncated: both grade 0, but only the truncated one would masquerade as a
+    # real submission in patch_applied_rate.
+    if len(patch) > _int_env("AGENTIC_PATCH_FALLBACK_MAX_BYTES", 1_000_000):
+        logger.warning(
+            "patch recovery discarded %d bytes for %s (over cap)",
+            len(patch), instance.get("instance_id", "?"),
+        )
+        return ""
+    return patch
 
 
 def _safe_cleanup(env: Any) -> None:
@@ -812,10 +905,34 @@ def _patch_verl_data_metrics() -> None:
     if _METRICS_PATCHED or not _HAS_VERL:
         return
 
-    from agentic_grpo.metrics import TrajectoryMetrics
+    from agentic_grpo.metrics import TrajectoryMetrics, guard_infra_failures
     from agentic_grpo.server_monitor import get_shared_monitor
+    from agentic_grpo.sglang_timing import patch_verl_rollout_timing
     import verl.trainer.ppo.metric_utils as metric_utils
     import verl.trainer.ppo.ray_trainer as ray_trainer
+
+    # Per-request SGLang timestamps on every generate response. Must happen here,
+    # in the trainer process: SGLangReplica.__init__ (which picks the server actor
+    # class) is called from RayPPOTrainer.init_workers, i.e. this process. Doing it
+    # in the AgentLoopWorker would be too late and in the wrong process.
+    patch_verl_rollout_timing()
+
+    # Absolute timestamps for every training phase (gen, reward, update_actor,
+    # ...). Same reasoning as above: fit() runs in THIS process, so the
+    # marked_timer rebinding has to happen here.
+    patch_trainer_timeline()
+
+    # Hermes logs ``Failed to decode tool call`` at ERROR for every block it
+    # drops -- 4769 lines in a 3-step run -- but we salvage 84% of those (see
+    # tool_calls.salvage) and count the rest as ``format_errors`` with the
+    # timeline's ``attempted`` flag. The log line therefore reports a handled
+    # condition, and at ERROR it swamps the run log and reads like a fault.
+    # Silence it and trust traj/mean_salvaged_calls + traj/mean_format_errors.
+    try:
+        from verl.experimental.agent_loop import tool_parser as _verl_tool_parser
+        _verl_tool_parser.logger.setLevel(logging.CRITICAL)
+    except Exception:  # noqa: BLE001 - never let logging config break a run
+        logger.debug("could not quiet verl tool_parser logger", exc_info=True)
 
     original = metric_utils.compute_data_metrics
 
@@ -830,6 +947,11 @@ def _patch_verl_data_metrics() -> None:
         if raw is not None:
             objs = [TrajectoryMetrics(**item) if isinstance(item, dict) else item for item in raw]
             out.update(TrajectoryMetrics.aggregate(objs))
+            # Stop a run whose batches are infrastructure failure rather than the
+            # agent failing the task -- the two are the same reward 0.0 and only
+            # this exit-status breakdown can tell them apart. Deliberately allowed
+            # to propagate: it is the one way to halt verl's fit() loop.
+            guard_infra_failures(out, step=batch.meta_info.get("global_steps"))
         # Server-side latency + drain breakdown from SGLang's own /metrics for
         # this step's rollout window. Started by the generate_sequences hook below,
         # so by now it has been sampling for the whole rollout.

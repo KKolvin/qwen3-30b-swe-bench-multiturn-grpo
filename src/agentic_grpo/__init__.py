@@ -1,14 +1,17 @@
 """Multi-turn Agentic GRPO RL training pipeline for SWE-bench.
 
-Public surface mirrors the components described in SKILL.md:
+Everything runs inside verl's agentic rollout path:
 
-* :mod:`agentic_grpo.env_wrapper`        - SWEBenchAgentWrapper (mini-swe-agent hook)
-* :mod:`agentic_grpo.rollout_backend`    - SGLang synchronous rollout backend (policy_lag=0)
-* :mod:`agentic_grpo.metrics`            - per-trajectory metrics (client-side)
-* :mod:`agentic_grpo.server_monitor`     - server-side latency / drain from SGLang /metrics
-* :mod:`agentic_grpo.trajectory_adaptor` - verl tensor adaptor (masked GRPO tensors)
-* :mod:`agentic_grpo.reward`             - binary SWE-bench outcome reward
-* :mod:`agentic_grpo.agent_loop`         - verl AgentLoop integration
+* :mod:`agentic_grpo.agent_loop`     - the verl AgentLoop: generate -> tool -> observe, token-in/token-out
+* :mod:`agentic_grpo.tools`          - the tool registry: bash + str_replace_based_edit_tool
+* :mod:`agentic_grpo.tool_calls`     - sampled text -> (tool, args): strict parse + salvage of dropped blocks
+* :mod:`agentic_grpo.editor_tool`    - the edit tool itself (view/create/str_replace/insert)
+* :mod:`agentic_grpo.reward`         - binary SWE-bench outcome reward (official harness, patch-keyed cache)
+* :mod:`agentic_grpo.metrics`        - per-trajectory metrics and their batch aggregation
+* :mod:`agentic_grpo.timeline`       - run timeline: every rollout + training event, timestamped
+* :mod:`agentic_grpo.sglang_timing`  - per-request server timestamps (queue / prefill / decode)
+* :mod:`agentic_grpo.server_monitor` - SGLang /metrics scrape (srv/*)
+* :mod:`agentic_grpo.config`         - AgentConfig + container env resolution
 """
 
 from agentic_grpo.metrics import TrajectoryMetrics
