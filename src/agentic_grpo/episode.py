@@ -13,6 +13,7 @@ and clocks, which is what makes it unit-testable without either.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -21,8 +22,9 @@ import time
 from contextlib import nullcontext
 from typing import Any
 
-from agentic_grpo import tools
+from agentic_grpo import bash_tool, tools
 from agentic_grpo.bash_tool import BASH_TOOL_NAME
+from agentic_grpo.config import int_env
 from agentic_grpo.editor_tool import EDIT_TOOL_NAME
 from agentic_grpo.metrics import TrajectoryMetrics, TurnTiming
 from agentic_grpo.sglang_timing import SGLANG_TIMING_KEY
@@ -47,18 +49,46 @@ class Trajectory:
         self._all: list[int] = list(prompt_ids)
         self._prompt_len = len(prompt_ids)
         self._mask: list[int] = []
+        # Rollout-engine logprob per response token (0.0 on tool tokens, which
+        # the response mask excludes anyway). Only meaningful when the server
+        # returned them; see ``logprobs``.
+        self._logprobs: list[float] = []
+        self._has_logprobs = False
 
     def current_ids(self) -> list[int]:
         """Full sequence so far — the prompt for the next ``generate`` call."""
         return self._all
 
-    def add_generated(self, ids: list[int]) -> None:
+    def add_generated(self, ids: list[int], logprobs: list[float] | None = None) -> None:
         self._all.extend(ids)
         self._mask.extend([1] * len(ids))
+        if logprobs is not None and len(logprobs) == len(ids):
+            self._logprobs.extend(float(x) for x in logprobs)
+            self._has_logprobs = True
+        else:
+            self._logprobs.extend([0.0] * len(ids))
 
     def add_tool(self, ids: list[int]) -> None:
         self._all.extend(ids)
         self._mask.extend([0] * len(ids))
+        self._logprobs.extend([0.0] * len(ids))
+
+    def logprobs(self, response_length: int) -> list[float] | None:
+        """Rollout logprobs aligned with ``finalize``'s ``response_ids``, or None if the server sent none.
+
+        verl pads these to ``response_length`` and ships them as
+        ``rollout_log_probs``, which ``algorithm.rollout_correction`` compares
+        with the actor's recomputed logprobs to weight (or reject) tokens whose
+        sampling distribution drifted from the training one. That drift is what
+        makes MoE training unstable: SGLang and FSDP route the experts
+        differently for the same weights. The degenerate no-response case
+        mirrors ``finalize``: one 0.0 for the single pad token.
+        """
+        if not self._has_logprobs:
+            return None
+        if not self._logprobs:
+            return [0.0]
+        return self._logprobs[:response_length]
 
     def response_len(self) -> int:
         return len(self._mask)
@@ -83,15 +113,53 @@ class Trajectory:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+def _omitted(text: str) -> str:
+    """``"N lines (M chars)"`` for the part of an observation that was cut."""
+    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    return f"{lines} line{'' if lines == 1 else 's'} ({len(text)} chars)"
+
+
+def _cut_back_to_line(head: str) -> str:
+    """Drop the partial last line of ``head`` when it has whole lines to keep."""
+    nl = head.rfind("\n")
+    return head[: nl + 1] if nl > 0 else head
+
+
+def _cut_forward_to_line(tail: str) -> str:
+    """Drop the partial first line of ``tail`` when it has whole lines to keep."""
+    nl = tail.find("\n")
+    return tail[nl + 1 :] if 0 <= nl < len(tail) - 1 else tail
+
+
 def truncate(text: str, max_len: int, side: str = "middle") -> str:
+    """Cap an observation at ``max_len`` chars, saying how much was cut.
+
+    ``side`` follows verl's ``tool_response_truncate_side`` convention and names
+    the side that is cut: ``"right"`` keeps the head, ``"left"`` keeps the
+    tail, ``"middle"`` keeps both ends. Cuts land on line
+    boundaries when there are lines to cut on, and the marker carries the
+    omitted line count. The bare ``...(truncated)...`` it replaces gave the
+    model no idea whether it lost a line or a thousand, and run
+    20260903-002235 showed the effect: TurnLimit episodes re-ran the same
+    ``cat``/``grep`` hoping to see the rest.
+    """
     if max_len <= 0 or len(text) <= max_len:
         return text
     if side == "left":
-        return "(truncated)..." + text[-max_len:]
+        tail = _cut_forward_to_line(text[-max_len:])
+        return f"(first {_omitted(text[: len(text) - len(tail)])} omitted; only the end is shown)\n{tail}"
     if side == "right":
-        return text[:max_len] + "...(truncated)"
+        head = _cut_back_to_line(text[:max_len])
+        omitted = _omitted(text[len(head) :])
+        return (
+            f"{head.rstrip(chr(10))}\n...({omitted} omitted). Narrow the command "
+            "(head, grep -m, a smaller view_range) to see a specific part."
+        )
     half = max_len // 2
-    return text[:half] + "...(truncated)..." + text[-half:]
+    head = _cut_back_to_line(text[:half])
+    tail = _cut_forward_to_line(text[-half:])
+    omitted = _omitted(text[len(head) : len(text) - len(tail)])
+    return f"{head.rstrip(chr(10))}\n...({omitted} omitted from the middle)...\n{tail}"
 
 
 def turn_timing(turn: int, call_start: float, call_end: float, out: Any) -> TurnTiming:
@@ -120,15 +188,102 @@ def turn_timing(turn: int, call_start: float, call_end: float, out: Any) -> Turn
     return t
 
 
-# The commands that count as "ran the tests": the behaviour the edit tool is
-# meant to free turn budget for. 0.57% of bash calls on run 20260903-002235.
-TEST_CMD_RE = re.compile(
-    r"(?<![\w.-])(?:pytest|py\.test|tox|python[23]?\s+-m\s+(?:pytest|unittest)|runtests\.py|manage\.py\s+test)(?![\w.-])"
-)
+# Re-exported: the test-command pattern lives with the bash tool, which also
+# uses it to pick the longer timeout.
+TEST_CMD_RE = bash_tool.TEST_CMD_RE
+
+
+# ---------------------------------------------------------------------------
+# repetition guard
+# ---------------------------------------------------------------------------
+class Repeats:
+    """Identical tool calls within one episode, and what to do about them.
+
+    TurnLimit episodes on run 20260903-002235 were 16.5% of the batch and were
+    not working: one had 80 actions with 7 distinct commands, the same
+    ``find``/``grep``/``cat`` cycle over and over ([[turn-cap-not-the-bottleneck]]),
+    and 43 of 130 timed-out commands were re-issued verbatim. More turns buys
+    more looping; the fix is to make the loop visible to the model and to stop
+    paying for it.
+
+    Three rules, all keyed on the exact ``(tool, arguments)``:
+
+    * A call whose result is identical to the last result of that same call is
+      not shown again. The observation says which turn already showed it and
+      that nothing has changed. That is also a context saving: a repeated
+      ``view`` or ``cat`` no longer costs its tokens twice.
+    * A call that timed out before is refused outright: the same command will
+      hold a container slot for another 60s and time out again.
+    * After ``limit`` such repeats in one episode the episode ends
+      (``RepetitionLimit``). Its edits are still recovered by the git-diff
+      fallback and graded, so a looper that already fixed the bug keeps its
+      reward; what it loses is the tail of generate calls that were never
+      going to change anything. ``AGENTIC_MAX_REPEATED_CALLS`` (default 6; 0
+      disables the stop, keeping the collapse and the timeout refusal).
+
+    A call whose output *differs* from last time resets its baseline: re-running
+    the tests after an edit is progress, not repetition.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._seen: dict[str, dict] = {}
+        self.identical = 0
+
+    @staticmethod
+    def key(name: str, args: dict) -> str:
+        return json.dumps([name, args], sort_keys=True, default=str)
+
+    @staticmethod
+    def _digest(obs: dict) -> str:
+        parts = [obs.get("returncode"), obs.get("output"), obs.get("exception_info"), (obs.get("extra") or {}).get("exception_info")]
+        return hashlib.sha1(json.dumps(parts, default=str).encode("utf-8", "replace")).hexdigest()
+
+    def refusal(self, name: str, args: dict) -> dict | None:
+        """The observation to return WITHOUT running the call, or None to run it."""
+        prior = self._seen.get(self.key(name, args))
+        if prior is None or not prior["timeout"]:
+            return None
+        prior["same"] += 1
+        self.identical += 1
+        return {
+            "returncode": -1,
+            "output": (
+                f"Not run: this exact command already timed out at turn {prior['turn']} "
+                f"(repeat #{prior['same']}). Re-running it unchanged would time out again. "
+                "Use a different command or a non-interactive form."
+            ),
+            "repeat": prior["same"],
+        }
+
+    def observe(self, name: str, args: dict, obs: dict, turn: int) -> dict:
+        """Record this call's result; return the observation to show the model."""
+        k = self.key(name, args)
+        digest = self._digest(obs)
+        prior = self._seen.get(k)
+        if prior is None or prior["digest"] != digest:
+            self._seen[k] = {"turn": turn, "digest": digest, "same": 0, "timeout": bool(obs.get("timeout"))}
+            return obs
+        prior["same"] += 1
+        self.identical += 1
+        return {
+            "returncode": obs.get("returncode"),
+            "output": (
+                f"Identical result to the same call at turn {prior['turn']} (repeat #{prior['same']}); "
+                "the output is not shown again. Nothing has changed since, so repeating it will not help: "
+                "take a different action, or call `submit` if your fix is complete."
+            ),
+            "repeat": prior["same"],
+        }
+
+    def exhausted(self) -> bool:
+        return self.limit > 0 and self.identical >= self.limit
 
 
 def count_call(metrics: TrajectoryMetrics, name: str, args: dict, obs: dict) -> None:
     """Per-call behaviour counters (see ``TrajectoryMetrics.aggregate``)."""
+    if obs.get("repeat"):
+        metrics.repeated_calls += 1
     if name == EDIT_TOOL_NAME:
         if obs.get("edit"):
             metrics.edit_count += 1
@@ -137,9 +292,13 @@ def count_call(metrics: TrajectoryMetrics, name: str, args: dict, obs: dict) -> 
         else:
             metrics.edit_errors += 1
     elif name == BASH_TOOL_NAME:
-        if TEST_CMD_RE.search(args.get("command", "") or ""):
+        if obs.get("policy"):
+            metrics.policy_denials += 1
+        elif bash_tool.is_test_command(args.get("command", "") or ""):
             metrics.test_runs += 1
-    else:
+        if obs.get("timeout"):
+            metrics.tool_timeouts += 1
+    elif tools.lookup(name) is None:
         metrics.unknown_tool_calls += 1
 
 
@@ -222,6 +381,7 @@ class Episode:
         self.tool_s = 0.0
         self.assistant_turns = 0
         self.consecutive_format_errors = 0
+        self.repeats = Repeats(int_env("AGENTIC_MAX_REPEATED_CALLS", 6))
         self.submission = ""
         self.exit_status = "IncompleteRollout"
         self._turn: TurnTiming | None = None
@@ -278,7 +438,7 @@ class Episode:
     # --- per-turn events ---------------------------------------------------------
     def generated(self, out: Any, call_start: float, call_end: float, elapsed: float) -> None:
         self.gen_s += elapsed
-        self.traj.add_generated(out.token_ids)
+        self.traj.add_generated(out.token_ids, getattr(out, "log_probs", None))
         self.assistant_turns += 1
         self._turn = turn_timing(self.assistant_turns, call_start, call_end, out)
         self.turns.append(self._turn)
@@ -323,16 +483,17 @@ class Episode:
                 submitted=sub is not None or None,
             )
         if dump_enabled():
-            self.actions.append(
-                {
-                    "turn": self.assistant_turns,
-                    "tool": name,
-                    "command": truncate(command, 600),
-                    "returncode": obs.get("returncode"),
-                    "output": truncate(obs.get("output", "") or "", 400),
-                    "submitted": sub is not None,
-                }
-            )
+            record = {
+                "turn": self.assistant_turns,
+                "tool": name,
+                "command": truncate(command, 600),
+                "returncode": obs.get("returncode"),
+                "output": truncate(obs.get("output", "") or "", 400),
+                "submitted": sub is not None,
+            }
+            if obs.get("repeat"):
+                record["repeat"] = obs["repeat"]
+            self.actions.append(record)
 
     def add_observation(self, ids: list[int]) -> None:
         self.metrics.tool_obs_tokens.append(len(ids))
