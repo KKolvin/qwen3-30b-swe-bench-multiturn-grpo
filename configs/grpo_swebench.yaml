@@ -12,6 +12,23 @@ defaults:
 algorithm:
   adv_estimator: grpo
   use_kl_in_reward: false
+  # Training/inference mismatch correction. Qwen3-30B-A3B is MoE, and SGLang and
+  # FSDP do not route the experts identically for the same weights, so the
+  # logprob of a sampled token under the actor is not the logprob it was
+  # sampled with. actor/pg_clipfrac reads 0.0 on every run only because the
+  # update is structurally on-policy (one mini-batch, ppo_epochs 1); the drift
+  # itself was never measured. Decoupled mode: old_log_probs are still
+  # recomputed by the actor (the PPO anchor), and each token gets an
+  # importance weight exp(old_logp - rollout_logp), truncated at the threshold.
+  # Needs actor_rollout_ref.rollout.calculate_log_probs below. Metrics arrive as
+  # rollout_corr/* (weights, off-policy fraction) plus training/rollout_probs_diff_*;
+  # traj/missing_logprobs_rate must stay ~0.
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+    rollout_rs: null
+    bypass_mode: false
 
 data:
   train_files: data/swebench_verified/train.parquet
@@ -100,6 +117,11 @@ actor_rollout_ref:
     temperature: 1.0
     top_p: 1.0
     max_num_seqs: 256           # server running-batch capacity (C) -> SGLang --max-running-requests
+    # Ask SGLang for the logprob of every sampled token (``return_logprob``);
+    # the agent loop carries them as response_logprobs -> rollout_log_probs for
+    # algorithm.rollout_correction above. Tool-observation tokens get 0.0 and
+    # are masked out anyway.
+    calculate_log_probs: true
     # Inert under dynamic bsz; the budget cascades from actor.ppo_max_token_len_per_gpu.
     log_prob_micro_batch_size_per_gpu: 1
     # --- srv/* drain metrics: OFF (2026-08-05) ---------------------------------

@@ -1,4 +1,10 @@
 # mini-swe-agent v2 (tool-calling) loop config for SWE-bench coding rollouts.
+#
+# The prompt templates are Jinja and branch on `edit_tool` and `submit_tool`
+# (agent_loop passes tools.edit_tool_enabled() / tools.submit_tool_enabled()):
+# the full wording by default; AGENTIC_EDIT_TOOL=0 drops the editor and
+# AGENTIC_SUBMIT_TOOL=0 restores the three-step marker protocol, so an A/B arm
+# is never told about a tool it cannot call.
 # Mirrors the upstream canonical config (minisweagent/config/benchmarks/swebench.yaml):
 # the model drives actions via the native `bash` tool call (BASH_TOOL), NOT
 # text/bash-block parsing. Requires the SGLang server to be launched with
@@ -15,21 +21,30 @@ agent:
   system_template: |
     You are a helpful assistant that can interact with a computer shell to solve programming tasks.
 
-    You have exactly two tools:
+    You have the following tools:
     - `bash`: run a shell command. Its one argument `command` is the command to run.
-      Use it to explore the repository (ls, grep, find), to run scripts and tests,
-      and to submit your work.
+      Use it to explore the repository (ls, grep, find) and to run scripts and tests{% if not submit_tool %},
+      and to submit your work{% endif %}.
+    {% if edit_tool -%}
     - `str_replace_based_edit_tool`: view and edit files. `view` shows a file with
       line numbers (use `view_range` for a section), `str_replace` replaces an exact
       `old_str` with `new_str`, `insert` adds lines after `insert_line`, `create`
       writes a new file.
-
+    {% endif -%}
+    {% if submit_tool -%}
+    - `submit`: call it with no arguments once your fix is complete and verified. It
+      records `git diff` against the base commit as your patch and ends the task.
+    {% endif %}
+    {% if edit_tool -%}
     Read and edit source files with `str_replace_based_edit_tool`, NOT with cat,
     sed -i, echo >, heredocs or python one-liners: it matches exactly, refuses
-    ambiguous edits instead of guessing, and shows you the edited region. Every
-    action MUST be a call to one of these two tool names — never invent other tool
-    names (do not use "find", "grep", "cat" as the tool name; put those in the
-    `command` argument of a `bash` call instead).
+    ambiguous edits instead of guessing, and shows you the edited region.
+    {% endif -%}
+    The environment is fully set up: do not install packages, fetch anything from the
+    network, or start servers — such commands are refused. Every action MUST be a call
+    to one of the tool names above — never invent other tool names (do not use "find",
+    "grep", "cat" as the tool name; put those in the `command` argument of a `bash`
+    call instead).
 
   instance_template: |
     <pr_description>
@@ -50,7 +65,7 @@ agent:
     For each response:
 
     1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish
-    2. Provide one or more bash tool calls to execute
+    2. Provide one or more tool calls to execute
 
     ## Important Boundaries
 
@@ -59,9 +74,15 @@ agent:
 
     ## Recommended Workflow
 
+    {% if edit_tool -%}
     1. Analyze the codebase: locate the relevant files with `bash` (grep, find), then read them with `str_replace_based_edit_tool` `view`
     2. Create a script that reproduces the issue (`create`) and run it with `bash` to confirm the failure
     3. Edit the source code with `str_replace` to resolve the issue
+    {%- else -%}
+    1. Analyze the codebase by finding and reading relevant files
+    2. Create a script to reproduce the issue
+    3. Edit the source code to resolve the issue
+    {%- endif %}
     4. Verify your fix works by running your script again
     5. Run the existing tests that cover the code you changed (e.g. `pytest path/to/test_file.py -x -q`) and fix any regression
     6. Test edge cases to ensure your fix is robust
@@ -78,16 +99,21 @@ agent:
     Each response should include:
 
     1. **Reasoning text** where you explain your analysis and plan
-    2. At least one tool call (`bash` or `str_replace_based_edit_tool`)
+    2. At least one tool call {% if edit_tool %}(`bash` or `str_replace_based_edit_tool`){% else %}with your command{% endif %}
 
     **CRITICAL REQUIREMENTS:**
 
     - Your response SHOULD include reasoning text explaining what you're doing
+    {% if edit_tool -%}
     - Your response MUST include AT LEAST ONE tool call. You can make MULTIPLE tool calls in a single response when they are independent (e.g., searching multiple files, viewing different parts of the codebase).
     - Edit files ONLY with `str_replace_based_edit_tool`. `old_str` must be copied exactly from a `view` (same indentation and whitespace) and must be unique in the file; if the tool reports no match or several matches, `view` the region and try again with more context. Never edit with sed -i, echo/printf redirection, heredocs or python scripts.
+    {%- else -%}
+    - Your response MUST include AT LEAST ONE bash tool call. You can make MULTIPLE tool calls in a single response when the commands are independent (e.g., searching multiple files, reading different parts of the codebase).
+    {%- endif %}
     - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
 
+    {% if edit_tool -%}
     Example of a CORRECT exploration response:
     <example_response>
     I need to understand the Builder-related code. Let me find relevant files and check the project structure.
@@ -101,18 +127,40 @@ agent:
 
     [Makes one tool call: str_replace_based_edit_tool {"command": "str_replace", "path": "/testbed/src/builder.py", "old_str": "        if limit > self.max:\n            raise ValueError(limit)", "new_str": "        limit = int(limit)\n        if limit > self.max:\n            raise ValueError(limit)"}]
     </example_response>
+    {%- else -%}
+    Example of a CORRECT response:
+    <example_response>
+    I need to understand the Builder-related code. Let me find relevant files and check the project structure.
+
+    [Makes multiple bash tool calls: {"command": "ls -la"}, {"command": "find src -name '*.java' | grep -i builder"}, {"command": "cat README.md | head -50"}]
+    </example_response>
+    {%- endif %}
 
     ## Environment Details
 
     - You have a full Linux shell environment
     - Always use non-interactive flags (-y, -f) for commands
     - Avoid interactive tools like vi, nano, or any that require user input
-    - You can use bash commands or invoke any tool that is available in the environment
-    - You can also create new tools or scripts to help you with the task
-    - If a tool isn't available, you can also install it
+    - Everything the repository needs is already installed. There is no network access:
+      do not try to install packages, download anything or start servers; such commands are refused
+    - You can create scripts to help you with the task (a reproduction script, for example)
+    - Long command output is cut to fit; the observation says how many lines were omitted.
+      Narrow the command (head, grep -m, view_range) instead of re-running it unchanged
 
     ## Submission
+    {% if submit_tool %}
+    When you've completed your work, call the `submit` tool (no arguments). It records
+    `git diff` of the repository against the task's base commit as your patch and ends
+    the task; you cannot read, edit or test anything after it.
 
+    Before you call `submit`:
+    - The patch must only change source files. If you edited any test file, revert it
+      first (`git checkout -- path/to/test_file.py`).
+    - Untracked files you created (reproduction scripts, notes) are NOT part of the
+      patch, so they need no cleanup — but the fix must not depend on them.
+    - Do NOT commit your changes.
+    - If `submit` reports an empty diff, no tracked file has been changed yet.
+    {% else %}
     When you've completed your work, you MUST submit your changes as a git patch.
     Follow these steps IN ORDER, with SEPARATE commands:
 
@@ -147,6 +195,7 @@ agent:
     - If you modify patch.txt after verifying, you SHOULD verify again before submitting.
     - You CANNOT continue working (reading, editing, testing) in any way on this task after submitting.
     </CRITICAL>
+    {% endif %}
     </instructions>
 
 environment:
@@ -197,34 +246,19 @@ environment:
 model:
   # agent_loop._load_agent_templates() reads observation_template and
   # format_error_template from this block; model_kwargs is informational.
+  # Output size is handled BEFORE rendering: agent_loop._format_observation cuts
+  # at rollout.multi_turn.max_tool_response_length (2000 chars) on a line
+  # boundary, keeping the head of a search and the tail of a test run, and the
+  # marker states how many lines were omitted. The old 10000-char head/tail
+  # branch here could therefore never fire and was removed.
   observation_template: |
     {% if output.exception_info -%}
     <exception>{{output.exception_info}}</exception>
     {% endif -%}
     <returncode>{{output.returncode}}</returncode>
-    {% if output.output | length < 10000 -%}
     <output>
     {{ output.output -}}
     </output>
-    {%- else -%}
-    <warning>
-    The output of your last command was too long.
-    Please try a different command that produces less output.
-    If you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.
-    If you're using grep or find and it produced too much output, you can use a more selective search pattern.
-    If you really need to see something from the full command's output, you can redirect output to a file and then search in that file.
-    </warning>
-    {%- set elided_chars = output.output | length - 10000 -%}
-    <output_head>
-    {{ output.output[:5000] }}
-    </output_head>
-    <elided_chars>
-    {{ elided_chars }} characters elided
-    </elided_chars>
-    <output_tail>
-    {{ output.output[-5000:] }}
-    </output_tail>
-    {%- endif -%}
   format_error_template: |
     {% if finish_reason is defined and finish_reason in ["length", "tool_calls"] -%}
     Your previous response reached the output token limit (finish_reason={{ finish_reason }}) before you produced a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call. If you need to think more, do so briefly.
@@ -242,12 +276,17 @@ model:
     Run a shell command:
     - Tool: bash
     - Arguments: {"command": "your_command_here"}
-
+    {% if edit_tool %}
     View or edit a file:
     - Tool: str_replace_based_edit_tool
     - Arguments: {"command": "view", "path": "/testbed/path/to/file.py"}
     - Arguments: {"command": "str_replace", "path": "/testbed/path/to/file.py", "old_str": "exact existing text", "new_str": "replacement text"}
-
+    {% endif %}
+    {%- if submit_tool %}
+    Finish the task once the fix is in place:
+    - Tool: submit
+    - Arguments: {}
+    {% endif %}
     If you have completed your assignment, please consult the first message about how to
     submit your solution (you will not be able to continue working on this task after that).
     {%- endif %}
