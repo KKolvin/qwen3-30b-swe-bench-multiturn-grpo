@@ -25,23 +25,41 @@ sed calls this replaces) and keeps the submit-marker sniffing in
 from __future__ import annotations
 
 import base64
+import difflib
 import posixpath
 import re
 import shlex
 from typing import Any
 
+from agentic_grpo.config import int_env
+
 EDIT_TOOL_NAME = "str_replace_based_edit_tool"
 DEFAULT_CWD = "/testbed"
 
-# A whole-file ``view`` past this many lines is cut here with a pointer to
-# ``view_range``. The harness truncates observations at
-# ``max_tool_response_length`` (2000 tokens on grpo_swebench.yaml) by removing
-# the *middle*, which turns a long file into two disconnected fragments; a
-# coherent head plus an explicit "N more lines" is the more useful thing to
-# show. ~150 numbered source lines is about that token budget.
-MAX_VIEW_LINES = 150
+# The editor sizes its own observations and marks them ``bounded`` so the loop
+# does not cut them again. The loop's cap (``max_tool_response_length``, 2000
+# CHARS on grpo_swebench.yaml, ~500 tokens) is sized for a bash observation; a
+# blind middle cut on a ``view`` turned a 150-line read into 12 head + 12 tail
+# lines with no idea what was between (measured 2026-09-05). Reading code is
+# the point of this tool, so it gets its own, larger budget: ~6000 chars is
+# ~1500 tokens, about 75-100 numbered source lines, and a whole-file ``view``
+# or a too-wide ``view_range`` is cut at a line boundary with the remaining
+# line count and a pointer to ``view_range``. ``AGENTIC_EDIT_VIEW_CHARS``
+# overrides it; watch tokens/mean_obs and traj/truncation_rate if raising it.
+MAX_VIEW_CHARS = int_env("AGENTIC_EDIT_VIEW_CHARS", 6000)
 # Lines of context returned around a successful edit.
 SNIPPET_CONTEXT = 4
+# Most lines quoted back in a failure message: a bounded coherent excerpt the
+# model can copy old_str from, kept well inside MAX_VIEW_CHARS.
+MAX_ERROR_CONTEXT_LINES = 40
+# Occurrences shown with context when old_str is ambiguous, and the context each gets.
+MAX_SHOWN_MATCHES = 3
+AMBIGUOUS_CONTEXT = 2
+# Minimum difflib ratio for a fuzzy single-line anchor when no line matches exactly.
+FUZZY_ANCHOR_RATIO = 0.6
+# ``view`` output prefix: right-aligned number then a tab. Stripped from old_str
+# when every line carries it (see strip_line_numbers).
+_LINE_NUMBER_PREFIX = re.compile(r"^[ \t]*\d+\t")
 # Line numbers listed when old_str is ambiguous. A one-word old_str in a real
 # file matched 155 times; the model needs to know it is far off, not every line.
 MAX_LISTED_MATCHES = 5
@@ -61,7 +79,9 @@ EDIT_TOOL_SCHEMA: dict = {
             "or list a directory.\n"
             "* `str_replace`: replace `old_str` with `new_str`. `old_str` must match the file text "
             "EXACTLY (including indentation and whitespace) and must occur exactly once; include "
-            "enough surrounding lines to make it unique. The tool shows the edited region afterwards.\n"
+            "enough surrounding lines to make it unique; do NOT include the line-number prefixes that "
+            "`view` shows. The tool shows the edited region afterwards, and on a failed match it "
+            "quotes the file's actual text at the likely spot so you can retry without another view.\n"
             "* `insert`: insert `new_str` after line number `insert_line` (0 = top of file).\n"
             "* `create`: create a new file with `file_text`; fails if the file exists."
         ),
@@ -116,17 +136,46 @@ def _numbered(lines: list[str], start: int) -> str:
     return "\n".join(f"{i:6d}\t{line}" for i, line in enumerate(lines, start))
 
 
-def view_text(text: str, view_range: list[int] | None, *, max_lines: int = MAX_VIEW_LINES) -> str:
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]  # trailing newline is not an extra line
+def _numbered_within(lines: list[str], start: int, max_chars: int, max_lines: int | None) -> tuple[str, int]:
+    """Number ``lines`` from ``start``, keeping whole lines while under both caps.
+
+    Returns ``(text, shown)``. At least one line is always shown so a single
+    very long line still produces output rather than an empty view.
+    """
+    limit = len(lines) if max_lines is None else min(len(lines), max_lines)
+    shown, used = 0, 0
+    while shown < limit:
+        cost = len(lines[shown]) + 8  # 6-wide number + tab + newline
+        if shown and used + cost > max_chars:
+            break
+        used += cost
+        shown += 1
+    return _numbered(lines[:shown], start), shown
+
+
+def view_text(
+    text: str,
+    view_range: list[int] | None,
+    *,
+    max_chars: int | None = None,
+    max_lines: int | None = None,
+) -> str:
+    """Numbered lines of ``text``, whole-file or ``view_range``, within the view budget.
+
+    A cut always falls on a line boundary and ends with how many lines remain
+    and how to see them, so the model pages instead of re-reading. The default
+    budget is :data:`MAX_VIEW_CHARS`; ``max_lines`` is an extra line cap for
+    callers that want one.
+    """
+    max_chars = MAX_VIEW_CHARS if max_chars is None else max_chars
+    lines = _file_lines(text)
     n = len(lines)
     if view_range is None:
-        if n <= max_lines:
-            return _numbered(lines, 1)
+        out, shown = _numbered_within(lines, 1, max_chars, max_lines)
+        if shown >= n:
+            return out
         return (
-            _numbered(lines[:max_lines], 1)
-            + f"\n... ({n - max_lines} more lines; file has {n} lines. "
+            out + f"\n... ({n - shown} more lines; file has {n} lines. "
             f"Use view_range [start, end] to see a specific part.)"
         )
     if not (isinstance(view_range, list) and len(view_range) == 2 and all(isinstance(x, int) for x in view_range)):
@@ -139,12 +188,27 @@ def view_text(text: str, view_range: list[int] | None, *, max_lines: int = MAX_V
     if end < start:
         raise EditError(f"view_range end {end} is before start {start}.")
     end = min(end, n)
-    return _numbered(lines[start - 1 : end], start)
+    out, shown = _numbered_within(lines[start - 1 : end], start, max_chars, max_lines)
+    if shown >= end - start + 1:
+        return out
+    last = start + shown - 1
+    return (
+        out + f"\n... ({end - last} more lines of the requested range not shown; showing {start}-{last} "
+        f"of {start}-{end}. Ask for a smaller view_range, e.g. [{last + 1}, {min(end, last + shown)}].)"
+    )
+
+
+def _file_lines(text: str) -> list[str]:
+    """Lines of ``text``; a trailing newline does not count as an extra empty line."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    return lines
 
 
 def _snippet(text: str, center_start_line: int, center_end_line: int) -> str:
     """``SNIPPET_CONTEXT`` lines either side of the touched region, numbered."""
-    lines = text.split("\n")
+    lines = _file_lines(text)
     lo = max(1, center_start_line - SNIPPET_CONTEXT)
     hi = min(len(lines), center_end_line + SNIPPET_CONTEXT)
     return _numbered(lines[lo - 1 : hi], lo)
@@ -154,53 +218,201 @@ def _whitespace_key(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _near_miss_hint(text: str, old_str: str) -> str:
-    """Point at a whitespace-only mismatch, the way these edits usually fail.
+def _window(text: str, first: int, last: int, *, context: int = SNIPPET_CONTEXT) -> str:
+    """Numbered lines ``first..last`` (1-indexed, inclusive) plus ``context`` either side, capped.
 
-    Compares each candidate window of the file against ``old_str`` with all runs
-    of whitespace collapsed. A hit means the model has the right lines but the
-    wrong indentation/tabs; telling it so beats a bare "not found".
+    Failure messages embed this so the model can fix ``old_str`` in the same
+    turn instead of spending a ``view`` call on it. Capped at
+    ``MAX_ERROR_CONTEXT_LINES`` because the harness truncates long observations
+    by cutting out the *middle*, which would leave the shown text incoherent.
     """
-    want = _whitespace_key(old_str)
-    if not want:
-        return ""
-    k = old_str.count("\n") + 1
+    lines = _file_lines(text)
+    lo = max(1, first - context)
+    hi = min(len(lines), last + context)
+    shown = lines[lo - 1 : hi]
+    tail = ""
+    if len(shown) > MAX_ERROR_CONTEXT_LINES:
+        shown = shown[:MAX_ERROR_CONTEXT_LINES]
+        tail = f"\n... ({hi - lo + 1 - MAX_ERROR_CONTEXT_LINES} more lines not shown)"
+    return _numbered(shown, lo) + tail
+
+
+def strip_line_numbers(s: str) -> str | None:
+    """Remove ``view``-style ``NNN<TAB>`` prefixes when *every* non-blank line has one, else ``None``.
+
+    The prefix exists only in ``view`` output, but a model that copies from
+    there pastes it into ``old_str``, and the whitespace hint cannot catch that
+    (digits survive whitespace collapsing). Requiring the prefix on every line
+    keeps a real ``"1\tfoo"`` in source from being mangled; a partly numbered
+    ``old_str`` is treated as literal text.
+    """
+    lines = s.split("\n")
+    content = [ln for ln in lines if ln.strip()]
+    if not content or not all(_LINE_NUMBER_PREFIX.match(ln) for ln in content):
+        return None
+    return "\n".join(_LINE_NUMBER_PREFIX.sub("", ln, count=1) if ln.strip() else ln for ln in lines)
+
+
+def _match_lines(text: str, old_str: str) -> list[int]:
+    """1-indexed first line of every occurrence of ``old_str`` in ``text``."""
+    return [text.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(old_str), text)]
+
+
+def _closest_region(text: str, old_str: str) -> tuple[int, int] | None:
+    """Best guess at the lines the model meant, as ``(first, last)`` 1-indexed, or ``None``.
+
+    Anchors on the longest non-blank line of ``old_str``: an exact
+    whitespace-stripped hit in the file if there is one, else the most similar
+    line above a 0.6 ratio. Among several hits, the one whose surrounding window
+    best resembles the whole ``old_str`` wins. Single-line comparisons keep this
+    linear in the file length; a window-by-window diff of a 5k-line file is not.
+    """
+    want = old_str.split("\n")
+    if want and want[-1] == "":
+        want = want[:-1]
+    k = len(want)
+    anchors = sorted(((ln.strip(), j) for j, ln in enumerate(want) if ln.strip()), key=lambda t: -len(t[0]))
+    if not anchors:
+        return None
     lines = text.split("\n")
-    for i in range(0, max(0, len(lines) - k + 1)):
-        if _whitespace_key("\n".join(lines[i : i + k])) == want:
-            return (
-                f" A match differing only in whitespace/indentation exists at line {i + 1}: "
-                "copy old_str exactly as shown by `view`, including leading spaces and tabs."
-            )
-    return ""
+    stripped = [ln.strip() for ln in lines]
+
+    hits: list[tuple[int, int]] = []  # (file line index, offset of anchor inside old_str)
+    for anchor, j in anchors[:3]:
+        hits = [(i, j) for i, s in enumerate(stripped) if s == anchor]
+        if hits:
+            break
+    if not hits:
+        anchor, j = anchors[0]
+        sm = difflib.SequenceMatcher(None, "", anchor, autojunk=False)
+        best, best_ratio = -1, FUZZY_ANCHOR_RATIO
+        for i, s in enumerate(stripped):
+            if not s:
+                continue
+            sm.set_seq1(s)
+            if sm.real_quick_ratio() < best_ratio or sm.quick_ratio() < best_ratio:
+                continue
+            r = sm.ratio()
+            if r > best_ratio:
+                best, best_ratio = i, r
+        if best < 0:
+            return None
+        hits = [(best, j)]
+
+    def region(hit: tuple[int, int]) -> tuple[int, int]:
+        first = max(0, hit[0] - hit[1])
+        last = min(len(lines) - 1, first + k - 1)
+        return first, last
+
+    if len(hits) > 1:
+        want_key = _whitespace_key(old_str)
+        hits.sort(
+            key=lambda h: -difflib.SequenceMatcher(
+                None, _whitespace_key("\n".join(lines[region(h)[0] : region(h)[1] + 1])), want_key, autojunk=False
+            ).ratio()
+        )
+    first, last = region(hits[0])
+    return first + 1, last + 1
 
 
-def str_replace_text(text: str, old_str: str, new_str: str) -> tuple[str, str]:
-    """Return ``(new_text, snippet)`` or raise :class:`EditError`.
+def _not_found_detail(text: str, old_str: str, *, had_line_numbers: bool) -> str:
+    """Why ``old_str`` missed, with the file's actual text at the likely spot.
 
-    Refuses zero matches (with a whitespace hint when one applies) and multiple
-    matches (with their line numbers), so an ambiguous edit never lands on the
-    wrong occurrence.
+    Three cases, most specific first: a whitespace-only mismatch (the common
+    one: tabs/indentation copied wrong), a region that resembles ``old_str``,
+    or nothing similar at all. In every case the model gets what it needs to
+    retry without a ``view`` round trip.
+    """
+    parts = []
+    if had_line_numbers:
+        parts.append(
+            "old_str contained `view` line-number prefixes (\"NNN<TAB>\"); those are not part of the file "
+            "and were stripped before matching, but the text still did not match."
+        )
+    want = _whitespace_key(old_str)
+    k = old_str.count("\n") + 1
+    if want:
+        lines = text.split("\n")
+        for i in range(0, max(0, len(lines) - k + 1)):
+            if _whitespace_key("\n".join(lines[i : i + k])) == want:
+                parts.append(
+                    f"Lines {i + 1}-{i + k} differ from old_str only in whitespace/indentation. They read:\n"
+                    f"{_window(text, i + 1, i + k)}\n"
+                    "Copy old_str exactly from this (without the line-number prefixes), including leading spaces and tabs."
+                )
+                return " ".join(parts)
+    region = _closest_region(text, old_str)
+    if region is not None:
+        first, last = region
+        parts.append(
+            f"The closest text in the file is at lines {first}-{last}:\n{_window(text, first, last)}\n"
+            "Copy old_str exactly from this (without the line-number prefixes) if it is the region you meant."
+        )
+    else:
+        parts.append("Nothing resembling old_str is in the file; use `view` to check its current content.")
+    return " ".join(parts)
+
+
+def _ambiguous_detail(text: str, old_str: str, at: list[int]) -> str:
+    """Each of the first occurrences with its surrounding lines, so ``old_str`` can be extended in one go."""
+    k = old_str.count("\n") + 1
+    blocks = [
+        f"occurrence at line {ln}:\n{_window(text, ln, ln + k - 1, context=AMBIGUOUS_CONTEXT)}"
+        for ln in at[:MAX_SHOWN_MATCHES]
+    ]
+    return "\n".join(blocks)
+
+
+def str_replace_text(text: str, old_str: str, new_str: str) -> tuple[str, str, str]:
+    """Return ``(new_text, snippet, note)`` or raise :class:`EditError`.
+
+    Refuses zero matches and multiple matches, in both cases quoting the file's
+    actual text at the relevant place so the retry needs no ``view``. ``note`` is
+    non-empty only when ``view`` line-number prefixes had to be stripped from
+    the arguments to make the edit match.
     """
     if not old_str:
         raise EditError("old_str is empty; give the exact existing text to replace.")
+    note = ""
     count = text.count(old_str)
     if count == 0:
-        raise EditError("old_str was not found in the file, so nothing was changed." + _near_miss_hint(text, old_str))
+        bare = strip_line_numbers(old_str)
+        if bare is not None and bare.strip():
+            if text.count(bare) == 0:
+                raise EditError(
+                    "old_str was not found in the file, so nothing was changed. "
+                    + _not_found_detail(text, bare, had_line_numbers=True)
+                )
+            old_str, count = bare, text.count(bare)
+            bare_new = strip_line_numbers(new_str)
+            if bare_new is not None:
+                new_str = bare_new
+            note = (
+                "Note: `view` line-number prefixes were stripped from old_str"
+                + ("/new_str" if bare_new is not None else "")
+                + " before applying; they are not part of the file. Do not include them."
+            )
+        else:
+            raise EditError(
+                "old_str was not found in the file, so nothing was changed. "
+                + _not_found_detail(text, old_str, had_line_numbers=False)
+            )
     if count > 1:
-        at = [text.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(old_str), text)]
+        at = _match_lines(text, old_str)
         shown = ", ".join(map(str, at[:MAX_LISTED_MATCHES]))
         if len(at) > MAX_LISTED_MATCHES:
             shown += f", ... and {len(at) - MAX_LISTED_MATCHES} more"
         raise EditError(
             f"old_str occurs {count} times (at lines {shown}); "
-            "nothing was changed. Include more surrounding lines so it matches exactly once."
+            "nothing was changed. Include more surrounding lines so it matches exactly once. "
+            f"The first {min(len(at), MAX_SHOWN_MATCHES)} occurrences with their context:\n"
+            + _ambiguous_detail(text, old_str, at)
         )
     idx = text.index(old_str)
     new_text = text[:idx] + new_str + text[idx + len(old_str) :]
     first = text.count("\n", 0, idx) + 1
     last = first + new_str.count("\n")
-    return new_text, _snippet(new_text, first, last)
+    return new_text, _snippet(new_text, first, last), note
 
 
 def insert_text(text: str, insert_line: int, new_str: str) -> tuple[str, str]:
@@ -318,13 +530,39 @@ def normalize_args(args: Any) -> dict | None:
     return args if isinstance(args, dict) and "command" in args else None
 
 
+def _bound(text: str) -> str:
+    """Last-resort cap so no editor observation exceeds the view budget.
+
+    Everything the tool emits is already sized (``view`` by
+    :func:`_numbered_within`, failure windows by ``MAX_ERROR_CONTEXT_LINES``),
+    so this only triggers on pathological input such as a directory listing
+    of very long paths; it cuts on a line boundary and says so.
+    """
+    if len(text) <= MAX_VIEW_CHARS:
+        return text
+    head = text[:MAX_VIEW_CHARS]
+    nl = head.rfind("\n")
+    if nl > 0:
+        head = head[:nl]
+    return head + f"\n... ({text[len(head):].count(chr(10))} more lines not shown)"
+
+
 def run_edit_tool(env: Any, args: dict, *, cwd: str = DEFAULT_CWD) -> dict:
-    """Execute one call; return a bash-shaped observation ``{"returncode", "output", "edit"}``.
+    """Execute one call; return a bash-shaped observation ``{"returncode", "output", "edit", "bounded"}``.
 
     ``returncode`` is 0 on success and 1 on a refused/failed call, so the same
     observation template renders both. ``edit`` names the sub-command when the
-    file was actually changed, for metrics; it is absent otherwise.
+    file was actually changed, for metrics; it is absent otherwise. ``bounded``
+    tells the loop the output is already within this tool's budget, so it must
+    not apply the (smaller, middle-cutting) bash observation cap on top.
     """
+    obs = _run_edit_tool(env, args, cwd=cwd)
+    obs["output"] = _bound(obs.get("output", "") or "")
+    obs["bounded"] = True
+    return obs
+
+
+def _run_edit_tool(env: Any, args: dict, *, cwd: str) -> dict:
     if not isinstance(args, dict):
         return {"returncode": 1, "output": "Arguments must be an object with `command` and `path`."}
     cmd = args.get("command")
@@ -363,9 +601,10 @@ def run_edit_tool(env: Any, args: dict, *, cwd: str = DEFAULT_CWD) -> dict:
                 raise EditError("str_replace requires `old_str`.")
             if not isinstance(new_str, str):
                 new_str = ""  # deleting text is a legitimate replacement
-            new_text, snippet = str_replace_text(text, old_str, new_str)
+            new_text, snippet, note = str_replace_text(text, old_str, new_str)
             write_text(env, path, new_text)
-            return {"returncode": 0, "output": f"Edited {path}. The region now reads:\n{snippet}", "edit": cmd}
+            head = f"Edited {path}. The region now reads:\n{snippet}"
+            return {"returncode": 0, "output": head + (f"\n{note}" if note else ""), "edit": cmd}
 
         # insert
         new_str = args.get("new_str")
