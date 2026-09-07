@@ -172,12 +172,24 @@ below disappear rather than reporting zeros.
 | `timeline/server_timing_rate` | Fraction of the batch that got server timestamps. **Should be 1.0.** Below that, the two flags above are the first thing to check — a partial value means some replica is not reporting. | `timing_source == "server"` |
 | `timeline/rollout_span_s` | Real elapsed wall time of the rollout phase: `max(t_end) - min(t_start)` across the batch. Unlike `latency/mean_trajectory_s` this is not distorted by the thousands of concurrent episodes. | `t_start` / `t_end` |
 | `timeline/tail_s` | How long the last episode ran past the *median* episode's finish. Large here with a healthy mean is the signature of a straggler tail (which is what docker-slot starvation produces), and it is the number the step barrier actually pays. | `max(t_end) - median(t_end)` |
+| `slots/zero_wait_count` | How many episodes got a live-container permit with no queueing — i.e. the **observed** slot count, which must equal `AGENTIC_MAX_LIVE_CONTAINERS x rollout.agent.num_workers` (264 on run 20260906-013757, every step). A silent drop to `8 x workers` means the env var never reached the workers through Ray's `runtime_env`; nothing else in this table would notice. | `admission_wait_s < 1.0` |
+| `slots/utilization` | Mean fraction of those slots that were actually running an episode, over `timeline/rollout_span_s`. 0.81–0.86 on that run; the missing share is the drain tail, not the middle. This and `timeline/tail_s` are the pair that says whether the rollout is slot-starved. | `sum(total_trajectory_time) / (span x slots)` |
 | `latency/mean_time_to_first_decode_s` | `t_first_decode - t_start`: everything between "episode began" and "the model emitted its first token" — container start, prompt build, queueing, prefill. A large value here is **docker, not inference**. | [`summarize_turns`](src/agentic_grpo/metrics.py#L186) |
 | `latency/max_time_to_first_decode_s` | Same, worst episode. | `max(...)` |
 | `latency/mean_server_queue_s` | Per episode, summed over turns: admission -> first token (queue **plus** prefill). Averaged over trajectories that have server timing, not over the batch — otherwise adding a client-only rollout would look like decoding got faster. | `prefill_finished_ts - request_received_ts` |
 | `latency/mean_server_prefill_s` | Same but from scheduler hand-off, so prefill proper with queueing excluded. The gap to `mean_server_queue_s` **is** the queue wait. | `prefill_finished_ts - request_sent_to_scheduler_ts` |
 | `latency/mean_server_decode_s` | Per episode, summed over turns: first token -> last token. The only number here that is pure generation. | `decode_finished_ts - prefill_finished_ts` |
 | `latency/mean_score_s` | Mean SWE-bench harness grading time. Timed separately from the episode on purpose: it runs its own docker container and folding it into `t_end` would make the generation timeline unreadable. | `t_score_start` / `t_score_end` |
+
+Deliberately **not** logged: mean/max `admission_wait_s` (the queue for a live
+container). It is arithmetic, not a measurement — with `N` episodes over `S`
+slots each slot runs `N/S` of them back to back, so the mean wait is
+`(N/S - 1)/2 x latency/mean_trajectory_s`, which predicted the measured
+855/899/916s of run 20260906-013757 to within 8%. Folding it into any latency
+denominator only dilutes the thing being measured (tool time is 3.1% of an
+episode but 0.7% once the queue is included). The two `slots/*` metrics above
+carry what the queue cannot: whether the slots exist, and whether they stay busy.
+The per-episode value is still on the timeline as an `admission_wait` span.
 
 Trajectory-level instants (all UNIX wall clock, so they are comparable across the
 agent-loop worker and the rollout-server actor; `0.0` means "never reached"):

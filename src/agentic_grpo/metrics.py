@@ -356,8 +356,6 @@ class TrajectoryMetrics:
             "latency/mean_trajectory_s": mean("total_trajectory_time"),
             "latency/max_trajectory_s": max(m.total_trajectory_time for m in batch),
             "latency/mean_tool_s": mean("total_tool_call_time"),
-            "latency/mean_admission_wait_s": mean("admission_wait_s"),
-            "latency/max_admission_wait_s": max(m.admission_wait_s for m in batch),
             "latency/mean_generation_s": sum(m.generation_time() for m in batch) / n,
             **_timeline_aggregate(batch),
         }
@@ -453,11 +451,40 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
 
     starts = [m.t_start for m in batch if m.t_start > 0.0]
     ends = [m.t_end for m in batch if m.t_end > 0.0]
+    span = 0.0
     if starts and ends:
-        out["timeline/rollout_span_s"] = max(max(ends) - min(starts), 0.0)
+        span = max(max(ends) - min(starts), 0.0)
+        out["timeline/rollout_span_s"] = span
         ordered = sorted(ends)
         median_end = ordered[len(ordered) // 2]
         out["timeline/tail_s"] = max(ordered[-1] - median_end, 0.0)
+
+    # Live-container slots. These replace mean/max ``admission_wait_s``, which
+    # carried no information: the queue is arithmetic, not a property of the
+    # batch. With N episodes over S slots each slot runs N/S episodes back to
+    # back, so the mean wait is just ``(N/S - 1)/2 * mean_trajectory_s`` -- on
+    # run 20260906-013757 that formula predicted the measured 855/899/916s to
+    # within 8%. What is *not* derivable is whether the slots exist and stay
+    # busy, which is what these two say.
+    #
+    # ``zero_wait_count`` is the observed slot count: exactly the first wave
+    # acquires the semaphore uncontended, so it must equal
+    # ``AGENTIC_MAX_LIVE_CONTAINERS * rollout.agent.num_workers`` (264 on that
+    # run, and it was 264 every step). If it silently drops to the default
+    # 8*workers the env var never reached the workers through Ray's
+    # ``runtime_env`` -- a failure that otherwise only shows up as "this step
+    # got 4x slower" with every other metric unchanged.
+    #
+    # ``utilization`` is how full those slots were over the rollout span. Idle
+    # slots mean workers ran out of episodes to admit while others were still
+    # draining (0.81/0.86/0.84 on that run -- the missing 15% is the tail, not
+    # the middle). It is the actionable dual of the admission queue: the queue
+    # length follows from the batch, but starvation does not.
+    slots = sum(1 for m in batch if m.admission_wait_s < 1.0)
+    out["slots/zero_wait_count"] = float(slots)
+    if slots and span > 0.0:
+        busy = sum(m.total_trajectory_time for m in batch)
+        out["slots/utilization"] = busy / (span * slots)
     return out
 
 
