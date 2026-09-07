@@ -720,7 +720,8 @@ def _patch_verl_data_metrics() -> None:
     # tool_calls.salvage) and count the rest as ``format_errors`` with the
     # timeline's ``attempted`` flag. The log line therefore reports a handled
     # condition, and at ERROR it swamps the run log and reads like a fault.
-    # Silence it and trust traj/mean_salvaged_calls + traj/mean_format_errors.
+    # Silence it and trust traj/any_format_error_rate plus the format_error
+    # events on the timeline (which carry the `attempted` flag).
     try:
         from verl.experimental.agent_loop import tool_parser as _verl_tool_parser
         _verl_tool_parser.logger.setLevel(logging.CRITICAL)

@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterator
@@ -169,6 +169,7 @@ class TrajectoryMetrics:
     server_prefill_time: float = 0.0  # scheduled -> decode start, summed
     server_decode_time: float = 0.0   # decode start -> decode finish, summed
 
+
     # --- Action / Event Counts ---
     tool_call_count: int = 0
     edit_count: int = 0       # str_replace_based_edit_tool calls that changed a file
@@ -265,6 +266,8 @@ class TrajectoryMetrics:
             return sum(getattr(m, key) for m in batch) / n
 
         flat_obs = [t for m in batch for t in m.tool_obs_tokens]
+        durations = [d for d in (_episode_duration(m) for m in batch) if d > 0.0]
+        p50, p99 = _pct(durations, 0.50), _pct(durations, 0.99)
 
         def rate(passed: str, total: str) -> float:
             tot = sum(getattr(m, total) for m in batch)
@@ -275,6 +278,36 @@ class TrajectoryMetrics:
         # turns" (TurnLimit) from "gave up" (NoToolCall), "couldn't emit valid
         # calls" (FormatErrorLimit) and infra failure (Crashed:*).
         exits = Counter(m.exit_status or "Unknown" for m in batch)
+
+        # How much of the batch produced no gradient at all. GRPO normalizes
+        # reward WITHIN each group of ``rollout.n`` samples of one prompt, so a
+        # group whose samples all scored the same contributes exactly zero
+        # advantage: those episodes ran containers, decoded tokens and were
+        # graded, and taught the policy nothing. Nothing else logged says this --
+        # ``critic/advantages/{max,min}`` only reach 0 when EVERY group is
+        # uniform, and they read +-2.47 on a run where 68% of groups were flat
+        # (20260906-013757: 175/256 uniform at step 1, of which 38 were already
+        # solved). It is the number that argues for filtering the dataset,
+        # changing ``rollout.n``, or shaping a denser reward, which is why it
+        # earns two passes over the batch.
+        #
+        # Groups of one (validation, ``rollout.n=1``) are uniform by definition
+        # and would read 1.0, so the rows are omitted rather than reported wrong.
+        groups: dict[str, list[float]] = defaultdict(list)
+        for m in batch:
+            if m.instance_id:
+                groups[m.instance_id].append(m.reward)
+        grouped = [v for v in groups.values() if len(v) > 1]
+        group_rates: dict[str, float] = {}
+        if grouped:
+            g = len(grouped)
+            group_rates = {
+                "reward/zero_advantage_group_rate": sum(1 for v in grouped if max(v) == min(v)) / g,
+                # The half of those that are uniform because the policy already
+                # solves the instance: wasted rollout rather than a hard task,
+                # and the one the dataset can be filtered on.
+                "reward/solved_group_rate": sum(1 for v in grouped if min(v) >= 1.0) / g,
+            }
 
         # Naming rules for this dict (see METRICS.md "Reading the metric names"):
         #   * ``reward/*`` is what the SWE-bench harness produced -- it exists only
@@ -290,11 +323,10 @@ class TrajectoryMetrics:
             **{f"traj/exit/{status}": count / n for status, count in exits.items()},
             # --- reward/: verdicts from the grading harness --------------------
             "reward/resolve_rate": sum(1 for m in batch if m.resolved) / n,
-            "reward/mean": mean("reward"),
             # If eval_error_rate is not ~0 the reward signal is not measuring the
             # agent at all -- treat any nonzero value as a broken run, not a hard task.
             "reward/eval_error_rate": sum(1 for m in batch if m.eval_error) / n,
-            "reward/patch_applied_rate": sum(1 for m in batch if m.patch_applied) / n,
+            **group_rates,
             "reward/f2p_pass_rate": rate("f2p_passed", "f2p_total"),
             "reward/p2p_pass_rate": rate("p2p_passed", "p2p_total"),
             # Fraction of graded patches served from cache instead of a fresh
@@ -323,15 +355,11 @@ class TrajectoryMetrics:
             "traj/mean_turns": mean("num_turns"),
             "traj/mean_tool_calls": mean("tool_call_count"),
             "traj/mean_edits": mean("edit_count"),
-            # Edit-tool adoption and reliability. edit_error_rate is the one bare
-            # _rate under traj/ with a per-EVENT denominator (edit attempts): a
-            # high value means the model is not copying old_str exactly
-            # (whitespace) or is editing without viewing first.
-            "traj/mean_edit_errors": mean("edit_errors"),
+            # The one bare _rate under traj/ with a per-EVENT denominator (edit
+            # attempts): a high value means the model is not copying old_str
+            # exactly (whitespace) or is editing without viewing first. Adoption
+            # (any_edit_tool_rate) was 0.98 and is no longer a question.
             "traj/edit_error_rate": rate("edit_errors", "_edit_attempts"),
-            "traj/mean_views": mean("view_count"),
-            "traj/any_edit_tool_rate": sum(1 for m in batch if m.edit_count or m.view_count or m.edit_errors) / n,
-            "traj/mean_unknown_tool_calls": mean("unknown_tool_calls"),
             # Whether the freed turn budget goes into verification. 0.57% of bash
             # calls / ~2% of episodes ran any test on run 20260903-002235.
             "traj/mean_test_runs": mean("test_runs"),
@@ -340,30 +368,84 @@ class TrajectoryMetrics:
             # them (7.0% + 3.6% + 1.1% of tool time on run 20260903-002235), and
             # the timeouts that survive the policy layer.
             "traj/mean_policy_denials": mean("policy_denials"),
-            "traj/any_policy_denial_rate": sum(1 for m in batch if m.policy_denials) / n,
             "traj/mean_tool_timeouts": mean("tool_timeouts"),
-            "traj/any_tool_timeout_rate": sum(1 for m in batch if m.tool_timeouts) / n,
             # Looping: identical calls with an unchanged result, collapsed by
             # episode.Repeats. Pair with traj/exit/RepetitionLimit.
             "traj/mean_repeated_calls": mean("repeated_calls"),
             "traj/any_repeat_rate": sum(1 for m in batch if m.repeated_calls) / n,
-            "traj/missing_logprobs_rate": sum(1 for m in batch if m.missing_logprobs) / n,
-            "traj/truncation_rate": sum(1 for m in batch if m.truncated) / n,
-            # Tool-call health: unparseable calls used to end the episode outright,
-            # so these two decide how much of the batch carries real signal.
-            "traj/mean_format_errors": mean("format_errors"),
+            # How much of the batch carries a usable action at all. The per-turn
+            # count and the salvage count were both measured and dropped (0.22
+            # and 0.098 a step); the two exit statuses say what a format error
+            # actually cost.
             "traj/any_format_error_rate": sum(1 for m in batch if m.format_errors) / n,
-            "traj/mean_salvaged_calls": mean("salvaged_tool_calls"),
-            "tokens/mean_prompt": mean("prompt_tokens"),
+            # Generated tokens only -- verl's response_length/* counts the tool
+            # observations too, and the ratio of the two (3.3k of 12.7k on run
+            # 20260906-013757) is how much of the trained sequence is the agent's
+            # own output.
             "tokens/mean_completion": mean("completion_tokens"),
-            "tokens/mean_cached_prompt": mean("cached_prompt_tokens"),
-            "tokens/mean_total": mean("total_trajectory_tokens"),
-            "tokens/mean_response": mean("response_tokens"),
             "tokens/mean_observation": (sum(flat_obs) / len(flat_obs)) if flat_obs else 0.0,
-            "latency/mean_trajectory_s": mean("total_trajectory_time"),
-            "latency/mean_tool_s": mean("total_tool_call_time"),
+            # An assertion, not a measurement: its correct value is the constant
+            # 0.0. guard_infra_failures checks it and strips it, so it never
+            # reaches W&B as a flat line (see METRICS.md 13).
+            "_check/missing_logprobs_rate": sum(1 for m in batch if m.missing_logprobs) / n,
+            # Episode wall time. The MEAN is inflated by the tail -- 272s against
+            # a 200s median on run 20260906-013757 -- so the median is what
+            # "a typical episode costs" and the mean is what throughput
+            # arithmetic wants (work = n x mean).
+            "latency/mean_trajectory_s": (sum(durations) / len(durations)) if durations else 0.0,
+            "latency/median_trajectory_s": p50,
+            "latency/p99_trajectory_s": p99,
+            # p99/median is the straggler ratio (4.8-5.1x on that run, against a
+            # null of 1.0) -- one division away, so it is not its own row.
+            # Tool and grading time are NOT here: we hand both to verl in
+            # AgentLoopMetrics, which logs them as
+            # timing_s/agent_loop/{tool_calls,compute_score}/{min,max,mean}.
             **_timeline_aggregate(batch),
         }
+
+
+def _check_instrumentation(agg: dict[str, float], step: int | None = None) -> None:
+    """Assert the ``_check/*`` tripwires, then remove them from the metric dict.
+
+    Each one has a single correct value, and each one fails silently: nothing
+    else in the metric dict notices, and the failure looks like a property of
+    the workload rather than of the measurement.
+    """
+    where = f"step {step}" if step is not None else "this step"
+
+    coverage = agg.pop("_check/server_timing_coverage", None)
+    if coverage is not None and coverage < 0.99:
+        logger.warning(
+            "only %.1f%% of the batch carried SGLang per-request timestamps at %s: "
+            "latency/mean_server_* now describe a subset, and the prefill/decode split "
+            "degrades to client-side call boundaries. Check engine_kwargs.sglang."
+            "enable_metrics and AGENTIC_SGLANG_REQUEST_TIMING (see METRICS.md 5a).",
+            coverage * 100.0, where,
+        )
+
+    # Divisibility, not equality: the worker count lives in verl's config and is
+    # not visible here, but the observed slots must be ``cap x workers``. A batch
+    # smaller than one worker's cap (validation, 20 instances against a cap of
+    # 33) never fills the slots, so it can say nothing and is skipped.
+    slots = agg.pop("_check/slots_observed", None)
+    cap = os.environ.get("AGENTIC_MAX_LIVE_CONTAINERS", "")
+    if slots and cap.isdigit() and int(cap) > 0 and slots >= int(cap) and float(slots) % int(cap):
+        logger.warning(
+            "slots/observed=%d at %s is not a multiple of AGENTIC_MAX_LIVE_CONTAINERS=%s: "
+            "the env var probably never reached the AgentLoopWorkers through Ray's "
+            "runtime_env and they fell back to the default. Every other metric looks "
+            "normal; the rollout is just several times slower.",
+            int(slots), where, cap,
+        )
+
+    missing = agg.pop("_check/missing_logprobs_rate", None)
+    if missing:
+        logger.warning(
+            "%.1f%% of episodes at %s returned no usable rollout logprobs, so their "
+            "rollout_log_probs are zeros and the importance correction is being fed "
+            "padding for them (rollout.calculate_log_probs is on).",
+            missing * 100.0, where,
+        )
 
 
 def guard_infra_failures(agg: dict[str, float], step: int | None = None) -> None:
@@ -389,10 +471,20 @@ def guard_infra_failures(agg: dict[str, float], step: int | None = None) -> None
     verl's fit() has no other way to say "stop, this data is worthless", and the
     alternative (a warning in a log nobody is tailing) is what already failed.
 
+    It also owns the three *instrumentation* tripwires, which used to be logged
+    rows: whether the run is measuring what it thinks it is measuring. Their
+    correct value is a constant -- 1.0 coverage, the configured slot count, zero
+    episodes with missing logprobs -- so charting them produces a flat line
+    nobody reads, and a flat line is the wrong container for an assertion. They
+    arrive under ``_check/*`` and are stripped here so they never reach W&B.
+    These warn rather than raise: unlike a crashed batch they degrade the
+    *analysis*, not the training data.
+
     Env:
       ``AGENTIC_MAX_CRASH_RATE`` abort above this crashed fraction (default 0.25)
       ``AGENTIC_CRASH_GUARD=0``  disable the abort entirely (still warns)
     """
+    _check_instrumentation(agg, step)
     crashed = sum(v for k, v in agg.items() if k.startswith("traj/exit/Crashed"))
     eval_err = agg.get("reward/eval_error_rate", 0.0)
     worst = max(crashed, eval_err)
@@ -421,6 +513,152 @@ def guard_infra_failures(agg: dict[str, float], step: int | None = None) -> None
     )
 
 
+def _tail_bubble(batch: list["TrajectoryMetrics"], t0: float, t1: float) -> dict[str, float]:
+    """What the ragged end of a rollout costs the step barrier.
+
+    The barrier waits for the last episode, so the rollout runs longer than the
+    work requires by exactly the slot-seconds that went idle while it waited:
+    ``span - sum(durations) / slots`` is that in wall clock -- the seconds a
+    perfect packing of the same episodes into the same container slots would
+    have saved. No threshold to choose and no server timing to depend on, only
+    ``t_start`` and ``t_end``, which every episode has.
+
+    That this is the *tail* rather than general jitter is measured, not assumed:
+    on run 20260906-013757 all of it lies after the last instant every slot was
+    full. Taking the drain window from that instant accounts for 244/263/258s of
+    idle slot time on the three steps -- the total imbalance, to the second. No
+    packing loss can accrue while the admission queue is still full, so the whole
+    of it is the drain.
+
+    Scale on that run: 244-263s a step, 10-11% of the 2355s rollout but only ~5%
+    of the 4933s step -- an order of magnitude under the ~2340s the engine spends
+    parked while the trainer runs (``timing_s/step - timing_s/gen``). Worth
+    knowing before reading too much into it.
+
+    What the tail is *made of* is :func:`_tail_profile`; this function only
+    prices it. The two are separate on purpose: the cost is a scheduling
+    quantity, the composition is a statement about the policy's behaviour, and
+    on this workload they have different answers.
+    """
+    live = [(m.t_start, m.t_end) for m in batch if m.t_start > 0.0 and m.t_end > m.t_start]
+    span = t1 - t0
+    if not live or span <= 0.0:
+        return {}
+
+    # Slot count from the concurrency curve itself: the peak number of episodes
+    # alive at once IS the semaphore, observed rather than read off a config that
+    # may never have reached the workers (264 on that run, matching
+    # ``slots/observed``).
+    running = slots = 0
+    for _, delta in sorted([(s, 1) for s, _ in live] + [(e, -1) for _, e in live]):
+        running += delta
+        slots = max(slots, running)
+    if slots <= 0:
+        return {}
+
+    busy = sum(end - start for start, end in live)
+    waste = max(span - busy / slots, 0.0)
+    # After the last admission nothing can be added to the live set; it only
+    # decays. Whatever is still running at that instant is the final wave.
+    last_admission = max(start for start, _ in live)
+    last_end = max(end for _, end in live)
+    out = {"bubble/tail_waste_s": waste}
+    out.update(_tail_profile(batch, last_admission))
+
+    # Grading outlives the rollout it graded. Each episode's harness container
+    # starts when its own container is released, so the verdicts for the last
+    # finishers run *after* the last episode ends -- 233/80/120s on run
+    # 20260906-013757, comparable to tail_waste_s itself. Nothing is generating
+    # and nothing is training in that window: it belongs to neither of the other
+    # two bubbles, and it is the one a decoupled (or overlapped) grader removes.
+    scored = [m.t_score_end for m in batch if m.t_score_end > 0.0]
+    if scored:
+        out["bubble/grading_tail_s"] = max(max(scored) - last_end, 0.0)
+    return out
+
+
+def _tail_profile(batch: list["TrajectoryMetrics"], last_admission: float) -> dict[str, float]:
+    """What the episodes the barrier waits for are made of.
+
+    The cohort is every episode still running at the last admission -- the final
+    wave, after which the live set can only decay. It needs no percentile and no
+    threshold, and it is the same cohort whose over-run creates
+    ``bubble/tail_waste_s``.
+
+    Everything here is a *contrast* with the batch, because the absolute values
+    are uninformative alone: a tail episode taking 368s means nothing until you
+    know the typical one takes 272s.
+
+    What run 20260906-013757 says, and why this is one row. The
+    cohort (136 episodes against a batch of 2048, step 1) ran 368s to the batch's
+    272s, and the whole of that excess is generation: it produced 6945 response
+    tokens to the batch's 3334 over 32.2 turns to 21.3, while tool time stayed at
+    3.2% of wall clock against the batch's 3.1%. So the barrier is not waiting on
+    docker or on the harness -- it is waiting for episodes that generate two to
+    four times as many tokens. ``submitted_rate`` names them: 51/38/53% across
+    the three steps against a batch that is 72/72/73% ``Submitted``, the shortfall
+    being ``ContextLimit`` and ``RepetitionLimit``. Narrowed offline to the last
+    1% to finish it is starker -- 48% ContextLimit, 33% RepetitionLimit, 10%
+    TurnLimit, 12648 response tokens -- so the tail is the policy looping or
+    rambling until it runs out of context, and it should move with
+    ``traj/mean_repeated_calls`` and ``traj/exit/ContextLimit``.
+
+    Everything else about the cohort was measured and dropped: turn counts and
+    tool share never move (1.5x and flat, by construction of a decode-bound
+    workload), the exit-status mix is five rows saying what ``submitted_rate``
+    said in one, and ``submitted_rate``/``excess_duration_s``/``episodes``
+    themselves are the finding above -- already established, and stable across
+    every step that has been measured. The per-cohort detail is in the timeline
+    and the trajectory dump when a step actually looks different.
+    """
+    cohort = [
+        m for m in batch
+        if m.t_start > 0.0 and m.t_end > m.t_start and m.t_start <= last_admission < m.t_end
+    ]
+    if not cohort:
+        return {}
+    k, n = len(cohort), len(batch)
+
+    def ratio(field: str) -> float:
+        """Cohort mean over batch mean; 0.0 when the batch has none of it."""
+        base = sum(getattr(m, field) for m in batch) / n
+        return (sum(getattr(m, field) for m in cohort) / k / base) if base > 0 else 0.0
+
+    # One row. Why the cohort runs long: decode is ~95% of every episode's wall
+    # clock, so a cohort generating twice the tokens takes twice as long, and
+    # nothing else about it differs (tool time was 3.2% in the tail against 3.1%
+    # in the batch). The cohort size, its excess duration and its submit rate
+    # were all measured and dropped -- see METRICS.md 5d.
+    return {"tail/response_tokens_ratio": ratio("response_tokens")}
+
+
+def _episode_duration(m: "TrajectoryMetrics") -> float:
+    """Episode wall time, preferring the timestamps.
+
+    ``t_end - t_start`` and ``total_trajectory_time`` are the same quantity --
+    verified equal to 1e-6s over all 6143 episodes of run 20260906-013757, mean
+    269.4s against the 269.0-272.1s that run logged. The timestamps win so this
+    and ``timeline/rollout_span_s`` are always read off one clock; the field is
+    the fallback for records that carry no timeline.
+    """
+    if m.t_start > 0.0 and m.t_end > 0.0:
+        return max(m.t_end - m.t_start, 0.0)
+    return m.total_trajectory_time
+
+
+def _pct(values: list[float], q: float) -> float:
+    """Nearest-rank percentile. 0.0 for an empty list.
+
+    Deliberately not a max: a max over ~2048 episodes tracks whichever single
+    container hung (which is why ``latency/max_trajectory_s`` was dropped), while
+    p99 is the 20th-slowest and moves only when the tail really moves.
+    """
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(int(len(ordered) * q), len(ordered) - 1)]
+
+
 def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
     """Scalar timeline metrics for a batch of trajectories.
 
@@ -428,23 +666,32 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
     rollout phase: the sum of per-trajectory times overcounts massively because
     thousands of episodes run concurrently, and the mean hides stragglers.
 
-    ``timeline/straggler_s`` (how long after the median episode finished the last
-    one was still running) is the absolute cost the step barrier pays;
-    ``timeline/straggler_ratio`` is that as a fraction of the span, which is what
-    compares across steps -- 290s of straggler is fatal on a 600s span and noise
-    on a 3000s one. The ratio is the client-side analogue of ``srv/drain_ratio``:
-    same construction (tail window / busy window), measured from episode end
-    times instead of the server's running batch. Both name the shape docker-slot
-    starvation produces.
+    The span is mostly THROUGHPUT, not straggling: on run 20260906-013757, 2048
+    episodes x 269s of work over ~264 slots is a ~2110s floor against a ~2350s
+    span, so ~89% of it is just the time to push the batch through the slots. The
+    ~10% that is not is ``bubble/tail_waste_s``. Do not try to read a straggler
+    signal out of episode *end* times: they are spread by admission scheduling,
+    which is what made the first ``timeline/straggler_ratio`` sit at 0.5 on every
+    step (see METRICS.md). The straggler signal lives in the duration spread --
+    ``p99_trajectory_s / median_trajectory_s``, 4.8-5.1x against a null of 1.0,
+    which is why neither of those two rows is a ratio.
     """
     n = len(batch)
     out: dict[str, float] = {}
 
     served = [m for m in batch if m.timing_source == "server"]
-    out["timeline/server_timing_coverage"] = len(served) / n
+    # An assertion (correct value 1.0), checked and stripped by
+    # guard_infra_failures rather than charted -- see METRICS.md 13.
+    out["_check/server_timing_coverage"] = len(served) / n
     if served:
         k = len(served)
-        out["latency/mean_server_queue_s"] = sum(m.server_queue_time for m in served) / k
+        # Prefill and decode, both per episode summed over turns and averaged
+        # over the trajectories that HAVE server timing (not the batch --
+        # otherwise adding a client-only rollout would look like decoding got
+        # faster). The queue span (admission -> scheduled) is not a row: it
+        # measured 9ms against 4.0s of prefill and 258s of decode, i.e. the
+        # rollout never waits for the scheduler. It is still on every ``generate``
+        # timeline event if that ever changes.
         out["latency/mean_server_prefill_s"] = sum(m.server_prefill_time for m in served) / k
         out["latency/mean_server_decode_s"] = sum(m.server_decode_time for m in served) / k
 
@@ -455,22 +702,12 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
     if ttfd:
         out["latency/mean_time_to_first_decode_s"] = sum(ttfd) / len(ttfd)
 
-    scores = [m.t_score_end - m.t_score_start for m in batch if m.t_score_start > 0.0 and m.t_score_end > 0.0]
-    if scores:
-        out["latency/mean_score_s"] = sum(scores) / len(scores)
-
     starts = [m.t_start for m in batch if m.t_start > 0.0]
     ends = [m.t_end for m in batch if m.t_end > 0.0]
     span = 0.0
     if starts and ends:
         span = max(max(ends) - min(starts), 0.0)
         out["timeline/rollout_span_s"] = span
-        ordered = sorted(ends)
-        median_end = ordered[len(ordered) // 2]
-        straggler = max(ordered[-1] - median_end, 0.0)
-        out["timeline/straggler_s"] = straggler
-        out["timeline/straggler_ratio"] = (straggler / span) if span > 0.0 else 0.0
-
         # Decode tokens per second over the rollout, cluster-wide. Server-reported
         # and exact -- no FLOPs model, no device roofline. Its value is that it is
         # directly comparable to the ~3.6k tok/s SGLang plateaus at when saturated
@@ -480,6 +717,11 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
         if span > 0.0 and decode_tokens:
             out["perf/rollout_decode_tok_s"] = decode_tokens / span
 
+        # What the ragged end of the rollout costs, and what the barrier spent it
+        # waiting for. The gap BETWEEN rollouts is deliberately not here: it is
+        # timing_s/step - timing_s/gen, which verl already logs.
+        out.update(_tail_bubble(batch, min(starts), max(ends)))
+
     # Live-container slots. These replace mean/max ``admission_wait_s``, which
     # carried no information: the queue is arithmetic, not a property of the
     # batch. With N episodes over S slots each slot runs N/S episodes back to
@@ -488,24 +730,22 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
     # within 8%. What is *not* derivable is whether the slots exist and stay
     # busy, which is what these two say.
     #
-    # ``slots/observed`` is the observed slot count: exactly the first wave
-    # acquires the semaphore uncontended, so it must equal
-    # ``AGENTIC_MAX_LIVE_CONTAINERS * rollout.agent.num_workers`` (264 on that
-    # run, and it was 264 every step). If it silently drops to the default
-    # 8*workers the env var never reached the workers through Ray's
-    # ``runtime_env`` -- a failure that otherwise only shows up as "this step
-    # got 4x slower" with every other metric unchanged.
+    # Exactly the first wave acquires the semaphore uncontended, so this is the
+    # observed slot count and it must be ``AGENTIC_MAX_LIVE_CONTAINERS *
+    # rollout.agent.num_workers`` (264 on that run, every step). If it silently
+    # drops to the default 8*workers the env var never reached the workers
+    # through Ray's ``runtime_env`` -- a failure that otherwise only shows up as
+    # "this step got 4x slower" with every other metric unchanged. That is an
+    # assertion about the launch, not a per-step measurement, so
+    # guard_infra_failures checks it and strips it.
     #
-    # ``utilization`` is how full those slots were over the rollout span. Idle
-    # slots mean workers ran out of episodes to admit while others were still
-    # draining (0.81/0.86/0.84 on that run -- the missing 15% is the tail, not
-    # the middle). It is the actionable dual of the admission queue: the queue
-    # length follows from the batch, but starvation does not.
-    slots = sum(1 for m in batch if m.admission_wait_s < 1.0)
-    out["slots/observed"] = float(slots)
-    if slots and span > 0.0:
-        busy = sum(m.total_trajectory_time for m in batch)
-        out["slots/utilization"] = busy / (span * slots)
+    # Slot UTILIZATION is deliberately not a row: it is
+    # ``1 - bubble/tail_waste_s / timeline/rollout_span_s`` by construction, and
+    # on run 20260906-013757 the identity held to the second on all three steps
+    # (244/263/258s of waste against 0.896/0.888/0.889 utilization over a
+    # 2355/2349/2326s span). Seconds are the useful unit: they compare directly
+    # against timing_s/step.
+    out["_check/slots_observed"] = float(sum(1 for m in batch if m.admission_wait_s < 1.0))
     return out
 
 

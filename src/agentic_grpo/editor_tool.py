@@ -45,7 +45,7 @@ DEFAULT_CWD = "/testbed"
 # ~1500 tokens, about 75-100 numbered source lines, and a whole-file ``view``
 # or a too-wide ``view_range`` is cut at a line boundary with the remaining
 # line count and a pointer to ``view_range``. ``AGENTIC_EDIT_VIEW_CHARS``
-# overrides it; watch tokens/mean_observation and traj/truncation_rate if raising it.
+# overrides it; watch tokens/mean_observation and traj/exit/ContextLimit if raising it.
 MAX_VIEW_CHARS = int_env("AGENTIC_EDIT_VIEW_CHARS", 6000)
 # Lines of context returned around a successful edit.
 SNIPPET_CONTEXT = 4

@@ -110,8 +110,8 @@ actor_rollout_ref:
       # configs/agent.yaml is written for ~10000 chars, so that logic was dead.
       # 2000 chars (~500 tokens) is what the context budget affords: at ~46 turns
       # x (125 assistant + ~500 obs) tokens we stay inside max_response_length,
-      # where tokens/mean_total was only 10514 of 32768. Watch
-      # traj/truncation_rate (was 0.044) if raising this further.
+      # where prompt_length/mean + response_length/mean was only 10514 of
+      # 32768. Watch traj/exit/ContextLimit (was 0.044) if raising this further.
       max_tool_response_length: 2000
     n: 8                        # GRPO group size (>1 required)
     # Sized for the full node. To run on fewer cards (e.g. when another user
