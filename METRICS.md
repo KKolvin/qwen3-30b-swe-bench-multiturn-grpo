@@ -339,6 +339,19 @@ whose rollout window contains it: workers are never told a step number, and a st
 rollout cannot overlap the next one's, so the `gen`/`validate` spans bracket them exactly.
 Unattributable episodes are left unstamped rather than assigned to the nearest step.
 
+`scripts/profile_rollout.py` reads the same shards and prints the run's **baseline shape**:
+per step, how much wall clock and how many tokens were produced at each in-flight request
+concurrency, plus the episode duration distribution, the request/episode time split and the
+wave depth and the throughput summary. It runs from the same exit trap, after `build_metrics_csv.py`, and lands in
+`analysis/<experiment>/profile.txt` (also appended to `run.log`). Run 20260906-013757: **81–86%
+of the wall clock and 85–91% of the tokens at 201+ in-flight**, at 81–85 ms/token/request and
+~3.0k tok/s cluster-wide, against **9–16 ms/token but only 63–437 tok/s at 1–8 in-flight** —
+the batching trade-off, and the reason the drain is thin (the batch is 7.8 episodes deep per
+container slot). Throughput on the same run, one TP=8 replica over 8 GPUs: **2.8–2.9k decoded
+tok/s**, 18.6 requests/s, 52 episodes/min, ~150 output tokens per request, and ~11k tok/s of
+*real* prefill — 0.52 G prompt tokens are re-sent per step and 95.1% of them are prefix-cache
+hits, which is what makes a 42-turn scaffold affordable.
+
 Volume ~20 KiB per episode (~85 events), i.e. **~45 MiB per 2048-episode step** — on
 `/data0` for the same reason as §5b. `AGENTIC_TIMELINE=0` turns it off; with
 `AGENTIC_TIMELINE_DIR` unset every entry point in `timeline.py` is a no-op.
@@ -348,8 +361,8 @@ Volume ~20 KiB per episode (~85 events), i.e. **~45 MiB per 2048-episode step** 
 ## 5d. Our metrics — the rollout tail (`bubble/*`, `tail/*`)
 
 The step barrier waits for the **last** episode, so a rollout runs longer than its work
-requires by exactly the container-slot seconds that went idle while it waited. Three rows:
-two for what that costs, one for what the barrier was waiting for. All of them come out of
+requires by exactly the container-slot seconds that went idle while it waited. Two rows:
+one for what that costs, one for what the barrier was waiting for. Both come out of
 `t_start`/`t_end` and fields every episode already carries — no server timing, so unlike §5a
 they can never degrade to absent.
 ([`_tail_bubble`](src/agentic_grpo/metrics.py) / `_tail_profile`.)
@@ -357,18 +370,40 @@ they can never degrade to absent.
 | Metric | Meaning | step 1 / 2 / 3 of run 20260906-013757 |
 |---|---|---|
 | `bubble/tail_waste_s` | `span − Σdurations / slots`: the wall-clock seconds a perfect packing of the same episodes into the same slots would have saved. No threshold to pick; `slots` is the observed concurrency peak, so a step that never fills its slots under-reports rather than inventing waste. | 244 / 263 / 258 (10–11% of the rollout, ~5% of the step) |
-| `bubble/grading_tail_s` | `max(t_score_end) − max(t_end)`: the window after the last episode ends in which the harness is still grading the last finishers. Nothing generates and nothing trains in it — inside the `gen` phase but outside `rollout_span_s`. | 233 / 80 / 120 |
-| `tail/response_tokens_ratio` | Response tokens of the cohort still running at the **last admission** (the final wave, after which the live set can only decay), over the batch mean. Decode is ~95% of every episode's wall clock, so this is *why* the barrier waits. | 2.08 / 2.44 / 1.86 |
+| `tail/response_tokens_ratio` | What the wasted seconds were spent running. Every episode is weighted by the seconds it occupies the window `[T_ideal, end]` that `tail_waste_s` prices, over the same weighted mean on an equal-length window centred mid-rollout. No percentile: the window comes from the cost metric, and the shared selection rule makes the **null exactly 1.0**. | 1.36 / 1.56 / 1.20 |
 
-**The tail is degenerate generation, not slow infrastructure.** The cohort generates two to
-two-and-a-half times the tokens over 1.5x the turns, while its tool time stays at 3.2% of wall
-clock against the batch's 3.1% — docker and the harness are not what the barrier waits for.
-Its submit rate named it: 20–34 points below the batch, the shortfall being `ContextLimit`
-and `RepetitionLimit`. Narrowed offline (from `timeline.json`) to the last 1% to finish it is
-starker — 48% ContextLimit, 33% RepetitionLimit, 10% TurnLimit, 12,648 response tokens
-against the batch's 3,334. **The barrier waits for episodes that loop or ramble until they run
-out of context**, so the tail is a property of the policy and should move with
-`traj/mean_repeated_calls`, `traj/exit/ContextLimit` and the repetition guard.
+**Why a window and not a percentile.** "The slowest 1%" is a number somebody picked. The
+window is not: `T_ideal = rollout_start + Σdurations/slots` is the instant a perfect packing
+would have finished, so `[T_ideal, end]` is exactly the stretch `tail_waste_s` charges for,
+and the episodes occupying it are exactly the ones being charged for. Weighting by seconds
+held means an episode running through the whole window counts for all of it and one ending a
+second into it counts for a second — no cohort boundary to argue about.
+
+**Why the control window.** Any tail cohort picked by "still running" oversamples long
+episodes, and long episodes generate more tokens, so a raw contrast against the batch mean is
+above 1 before anything about the tail is special. Measured by applying the same rule
+mid-rollout on run 20260906-013757:
+
+| cohort | tokens vs batch mean |
+|---|---|
+| alive mid-rollout — **the length-bias floor** | 1.6–1.8 |
+| alive at the last admission | 1.9–2.4 |
+| last 1% to finish | 3.0–3.8 |
+| whole batch | 1.0 |
+
+An earlier version of this row shipped the middle cohort and sat on top of that floor: it was
+measuring the selection rule. Dividing by an equally-long, equally-selected control window
+removes it and puts the null at 1.0 exactly.
+
+**What it says today: 1.36 / 1.56 / 1.20.** The wasted seconds run episodes generating 20–56%
+more than the middle of the rollout does — real, and far smaller than the tip alone suggests.
+The last 21 episodes to finish do score 3.0–3.8x (10–29% `Submitted`, 33–62% `ContextLimit`
+against a batch at 11–12%), but they only hold the barrier for the final 77–104s of the
+244–263s. **So most of the waste is ordinary episodes finishing at their ordinary length, and
+only its thinnest part is the policy looping until it runs out of context.** Reading 1.0 would
+mean the tail is pure scheduling and only throughput can shorten it; the further above, the
+more the barrier is held by degenerate generation — which should move with
+`traj/mean_repeated_calls` and `traj/exit/ContextLimit`.
 
 Scale, so it is not over-read: 244–263s a step against the ~2340s the engine spends parked
 while the trainer runs. That gap is **not** logged here — it is `timing_s/step − timing_s/gen`
@@ -377,12 +412,21 @@ while the trainer runs. That gap is **not** logged here — it is `timing_s/step
 tail the engine is not stopped at all; it is still decoding, at ~30 concurrent requests
 instead of ~226.
 
+The `gen` phase runs 87–240s longer than `rollout_span_s`, and that difference is the
+**grading tail**: an episode's harness container starts only when its own rollout container is
+released, so the verdicts for the last finishers land after the last episode ends. At 80–233s
+it is 4–11x a single grading (`timing_s/agent_loop/compute_score` ≈ 20s), i.e. the last wave's
+verdicts queue rather than running as one. It had a row of its own for a day; it is
+`timing_s/gen − timeline/rollout_span_s` to within 6–15s (pre-admission plus batch assembly),
+so it is a subtraction, not a metric.
+
 **Dropped after measuring, so they are not rebuilt:** `tail_waste_ratio` and `tail_overhang_s`
 (one division and one more dispersion number on top of two that already exist);
 `tail/turns_ratio` and `tail/tool_share` (1.5x and flat every step — a decode-bound workload
 has no other shape); `tail/exit/*` (five rows saying what `submitted_rate` says in one);
 `bubble/inter_rollout_s` and `rollout_duty_ratio` (derivable from `timing_s/step` and
 `timing_s/gen`, which verl logs anyway, and they agreed with those to within 7s);
+`bubble/grading_tail_s` (`timing_s/gen − rollout_span_s`, as above);
 `deadline_p95/p99_saving_s` (a price list for truncating episodes, which strict on-policy
 training will not do). Then, on the same day, `tail/episodes` (136/87/99 — a cohort size
 that follows from the slot count and the admission pattern, not from the policy),
@@ -501,7 +545,7 @@ Produced by verl's `AgentLoopManager` from the `AgentLoopMetrics` **we** return 
 |---|---|
 | `timing_s/agent_loop/generate_sequences/{min,max,mean}` | Time an episode spent inside `server_manager.generate(...)`, summed over its turns — docker and container setup excluded, unlike the whole-episode `latency/mean_trajectory_s`. |
 | `timing_s/agent_loop/tool_calls/{min,max,mean}` | Time inside `env.execute` per episode — **the** tool-time row. We measure it and hand it to verl in `AgentLoopMetrics`; the `latency/mean_tool_s` duplicate was removed on 2026-09-07. 8.5s an episode, i.e. 3.1% of it. |
-| `timing_s/agent_loop/compute_score/{min,max,mean}` | Time in the SWE-bench grading harness per episode (its own docker container, run after the agent's is released): 20.6s. Same story as the row above — `latency/mean_score_s` was its duplicate. What the *last* verdicts cost the step is `bubble/grading_tail_s` (§5d). |
+| `timing_s/agent_loop/compute_score/{min,max,mean}` | Time in the SWE-bench grading harness per episode (its own docker container, run after the agent's is released): 20.6s. Same story as the row above — `latency/mean_score_s` was its duplicate. What the *last* verdicts cost the step is `timing_s/gen − timeline/rollout_span_s` (§5d). |
 | `timing_s/agent_loop/num_preempted/{min,max,mean}` | How many times the server preempted a request (KV-cache pressure) for that episode. Persistently nonzero means the rollout engine is over-subscribed. |
 | `timing_s/agent_loop/slowest/{generate_sequences,tool_calls,compute_score,num_preempted,prompt_length,response_length}` | The same fields for the single slowest trajectory (argmax of gen + tool + score). The step barrier waits for exactly this episode, so these six numbers explain rollout wall time far better than the means. `slowest/response_length` equal to `max_response_length` means the straggler ran out of context rather than finishing. |
 

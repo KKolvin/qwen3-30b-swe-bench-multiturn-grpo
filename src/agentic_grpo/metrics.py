@@ -558,78 +558,69 @@ def _tail_bubble(batch: list["TrajectoryMetrics"], t0: float, t1: float) -> dict
 
     busy = sum(end - start for start, end in live)
     waste = max(span - busy / slots, 0.0)
-    # After the last admission nothing can be added to the live set; it only
-    # decays. Whatever is still running at that instant is the final wave.
-    last_admission = max(start for start, _ in live)
-    last_end = max(end for _, end in live)
     out = {"bubble/tail_waste_s": waste}
-    out.update(_tail_profile(batch, last_admission))
-
-    # Grading outlives the rollout it graded. Each episode's harness container
-    # starts when its own container is released, so the verdicts for the last
-    # finishers run *after* the last episode ends -- 233/80/120s on run
-    # 20260906-013757, comparable to tail_waste_s itself. Nothing is generating
-    # and nothing is training in that window: it belongs to neither of the other
-    # two bubbles, and it is the one a decoupled (or overlapped) grader removes.
-    scored = [m.t_score_end for m in batch if m.t_score_end > 0.0]
-    if scored:
-        out["bubble/grading_tail_s"] = max(max(scored) - last_end, 0.0)
+    # The wasted window is the span past the instant a perfect packing would have
+    # finished. Passing it, rather than a percentile of end times, is what keeps
+    # the profile tied to the cost it explains.
+    out.update(_tail_profile(batch, t1 - waste, t0, t1))
     return out
 
 
-def _tail_profile(batch: list["TrajectoryMetrics"], last_admission: float) -> dict[str, float]:
-    """What the episodes the barrier waits for are made of.
+def _tail_profile(
+    batch: list["TrajectoryMetrics"], waste_start: float, t0: float, t1: float
+) -> dict[str, float]:
+    """What the wasted seconds were spent running.
 
-    The cohort is every episode still running at the last admission -- the final
-    wave, after which the live set can only decay. It needs no percentile and no
-    threshold, and it is the same cohort whose over-run creates
-    ``bubble/tail_waste_s``.
+    ``bubble/tail_waste_s`` prices the window ``[waste_start, t1]``, where
+    ``waste_start`` is the instant a perfect packing would have finished. This
+    says what was *in* it: every episode is weighted by the seconds it occupies
+    that window, so an episode running through all of it counts for all of it and
+    one ending a second in counts for a second. No cohort boundary and no
+    percentile -- the window comes from the cost metric.
 
-    Everything here is a *contrast* with the batch, because the absolute values
-    are uninformative alone: a tail episode taking 368s means nothing until you
-    know the typical one takes 272s.
+    The control is a window of the **same length** centred mid-rollout, weighted
+    the same way, so the ratio's null is exactly 1.0. That matters more than it
+    sounds: any tail cohort selected by "still running" oversamples long
+    episodes, and long episodes generate more tokens, so a raw contrast against
+    the batch starts around 1.7 before anything about the tail is special (§5d
+    has the measurement). Dividing by a window that shares the selection rule
+    removes it.
 
-    What run 20260906-013757 says, and why this is one row. The
-    cohort (136 episodes against a batch of 2048, step 1) ran 368s to the batch's
-    272s, and the whole of that excess is generation: it produced 6945 response
-    tokens to the batch's 3334 over 32.2 turns to 21.3, while tool time stayed at
-    3.2% of wall clock against the batch's 3.1%. So the barrier is not waiting on
-    docker or on the harness -- it is waiting for episodes that generate two to
-    four times as many tokens. ``submitted_rate`` names them: 51/38/53% across
-    the three steps against a batch that is 72/72/73% ``Submitted``, the shortfall
-    being ``ContextLimit`` and ``RepetitionLimit``. Narrowed offline to the last
-    1% to finish it is starker -- 48% ContextLimit, 33% RepetitionLimit, 10%
-    TurnLimit, 12648 response tokens -- so the tail is the policy looping or
-    rambling until it runs out of context, and it should move with
-    ``traj/mean_repeated_calls`` and ``traj/exit/ContextLimit``.
+    Measured on run 20260906-013757: **1.36 / 1.56 / 1.20**. The wasted seconds
+    are spent on episodes that generated 20-56% more than a normal window's
+    occupants -- real, and much smaller than the tip suggests. The last 21
+    episodes to finish score 3.0-3.8x against a 1.7 null, but they only hold the
+    barrier for the final 77-104s of the 244-263s: most of the waste is ordinary
+    episodes finishing at their ordinary length, and only its thinnest part is
+    the policy looping until it runs out of context.
 
-    Everything else about the cohort was measured and dropped: turn counts and
-    tool share never move (1.5x and flat, by construction of a decode-bound
-    workload), the exit-status mix is five rows saying what ``submitted_rate``
-    said in one, and ``submitted_rate``/``excess_duration_s``/``episodes``
-    themselves are the finding above -- already established, and stable across
-    every step that has been measured. The per-cohort detail is in the timeline
-    and the trajectory dump when a step actually looks different.
+    Reading: **1.0 means the tail is pure scheduling** -- the wasted window was
+    running the same kind of episode as the middle of the rollout, and the only
+    fix is throughput. The further above 1.0, the more the barrier is being held
+    by degenerate generation, which should move with ``traj/mean_repeated_calls``
+    and ``traj/exit/ContextLimit``.
     """
-    cohort = [
-        m for m in batch
-        if m.t_start > 0.0 and m.t_end > m.t_start and m.t_start <= last_admission < m.t_end
-    ]
-    if not cohort:
+    window = t1 - waste_start
+    if window <= 0.0 or t1 <= t0:
         return {}
-    k, n = len(cohort), len(batch)
+    mid = (t0 + t1) / 2.0
 
-    def ratio(field: str) -> float:
-        """Cohort mean over batch mean; 0.0 when the batch has none of it."""
-        base = sum(getattr(m, field) for m in batch) / n
-        return (sum(getattr(m, field) for m in cohort) / k / base) if base > 0 else 0.0
+    def weighted_tokens(a: float, b: float) -> float:
+        """Mean response tokens of the episodes occupying ``[a, b]``, by seconds held."""
+        num = den = 0.0
+        for m in batch:
+            if m.t_start <= 0.0 or m.t_end <= m.t_start:
+                continue
+            held = min(m.t_end, b) - max(m.t_start, a)
+            if held > 0.0:
+                num += m.response_tokens * held
+                den += held
+        return (num / den) if den > 0.0 else 0.0
 
-    # One row. Why the cohort runs long: decode is ~95% of every episode's wall
-    # clock, so a cohort generating twice the tokens takes twice as long, and
-    # nothing else about it differs (tool time was 3.2% in the tail against 3.1%
-    # in the batch). The cohort size, its excess duration and its submit rate
-    # were all measured and dropped -- see METRICS.md 5d.
-    return {"tail/response_tokens_ratio": ratio("response_tokens")}
+    control = weighted_tokens(mid - window / 2.0, mid + window / 2.0)
+    if control <= 0.0:
+        return {}
+    return {"tail/response_tokens_ratio": weighted_tokens(waste_start, t1) / control}
 
 
 def _episode_duration(m: "TrajectoryMetrics") -> float:

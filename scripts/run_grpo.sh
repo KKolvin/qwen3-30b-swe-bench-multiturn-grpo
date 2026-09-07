@@ -307,9 +307,17 @@ if [ "${AGENTIC_TIMELINE:-1}" != "0" ]; then
   TIMELINE_OVERRIDES=(
     +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TIMELINE_DIR=\"${AGENTIC_TIMELINE_DIR}\"
   )
+  # Order matters twice: profile_rollout reads the raw shards, so it must run
+  # while they are still there, and it appends to LOG_FILE, so it runs *after*
+  # build_metrics_csv has parsed the log (its "=== step N" heading cannot be
+  # mistaken for a "step:N - key:value" metrics line, but there is no reason to
+  # find out the hard way).
   trap 'python3 "${REPO_ROOT}/scripts/build_timeline.py" --dir "${AGENTIC_TIMELINE_DIR}" \
         --experiment "${EXPERIMENT_NAME}" 2>&1 | tee -a "${LOG_FILE}" || true
-        python3 "${REPO_ROOT}/scripts/build_metrics_csv.py" --log "${LOG_FILE}" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
+        python3 "${REPO_ROOT}/scripts/build_metrics_csv.py" --log "${LOG_FILE}" 2>&1 | tee -a "${LOG_FILE}" || true
+        python3 "${REPO_ROOT}/scripts/profile_rollout.py" --dir "${AGENTIC_TIMELINE_DIR}" \
+        > "${RUN_DIR}/profile.txt" 2>&1 || true
+        tee -a "${LOG_FILE}" < "${RUN_DIR}/profile.txt" || true' EXIT
 else
   # No timeline trap to piggyback on -- still want metrics.csv from every run.
   trap 'python3 "${REPO_ROOT}/scripts/build_metrics_csv.py" --log "${LOG_FILE}" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
