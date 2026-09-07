@@ -213,11 +213,13 @@ class TrajectoryMetrics:
     instance_id: str = ""
     exit_status: str = ""
 
-    def generation_time(self) -> float:
-        """Per-trajectory generation wall time, derived (traj - tool).
+    def non_tool_time(self) -> float:
+        """Per-trajectory time outside the tools, derived (traj - tool).
 
-        The server owns the authoritative prefill/decode split; this coarse
-        client-side figure just complements it per trajectory.
+        Mostly generation, but it also absorbs container setup and orchestration,
+        so it is an upper bound on generation rather than a measurement of it --
+        hence "non_tool", not "generation". The server owns the authoritative
+        prefill/decode split; this coarse client-side figure complements it.
         """
         return max(self.total_trajectory_time - self.total_tool_call_time, 0.0)
 
@@ -284,79 +286,98 @@ class TrajectoryMetrics:
         # calls" (FormatErrorLimit) and infra failure (Crashed:*).
         exits = Counter(m.exit_status or "Unknown" for m in batch)
 
+        # Naming rules for this dict (see METRICS.md "Reading the metric names"):
+        #   * ``reward/*`` is what the SWE-bench harness produced -- it exists only
+        #     because tests were run. ``traj/*`` is what is readable off the episode
+        #     itself. So ``resolve_rate`` is a harness verdict and lives under
+        #     reward/, while ``empty_patch_rate`` needs no grading and does not.
+        #   * ``any_<x>_rate`` is the share of EPISODES with at least one x. A bare
+        #     ``<x>_rate`` is per event (per edit attempt, per test) or per episode
+        #     for something boolean per episode anyway. The pair that used to read
+        #     as parallel and is not: traj/edit_error_rate (per attempt) vs
+        #     traj/any_format_error_rate (per episode).
         return {
             **{f"traj/exit/{status}": count / n for status, count in exits.items()},
+            # --- reward/: verdicts from the grading harness --------------------
+            "reward/resolve_rate": sum(1 for m in batch if m.resolved) / n,
+            "reward/mean": mean("reward"),
             # If eval_error_rate is not ~0 the reward signal is not measuring the
             # agent at all -- treat any nonzero value as a broken run, not a hard task.
             "reward/eval_error_rate": sum(1 for m in batch if m.eval_error) / n,
-            "reward/empty_patch_rate": sum(1 for m in batch if m.empty_patch) / n,
+            "reward/patch_applied_rate": sum(1 for m in batch if m.patch_applied) / n,
+            "reward/f2p_pass_rate": rate("f2p_passed", "f2p_total"),
+            "reward/p2p_pass_rate": rate("p2p_passed", "p2p_total"),
             # Fraction of graded patches served from cache instead of a fresh
             # container. Legitimately nonzero (GRPO groups do emit duplicate
             # patches), but a rate near 1.0 means the cache key has stopped
             # discriminating -- the exact failure that made 3870 submitted
-            # patches share 23 harness reports in run 20260820-023256.
-            "reward/cache_hit_rate": (
+            # patches share 23 harness reports in run 20260820-023256. Named for
+            # the EVAL cache: srv/prefix_cache_hit_rate* is SGLang's KV cache and
+            # is an unrelated number.
+            "reward/eval_cache_hit_rate": (
                 sum(1 for m in batch if m.eval_cached)
                 / max(1, sum(1 for m in batch if not m.empty_patch))
             ),
-            # Episodes the git-diff fallback rescued, and how they graded. A
-            # recovered patch is a real submission the submit marker missed, so
-            # a resolve rate near zero here would mean the fallback is only
-            # adding noise and should go back off.
-            "reward/patch_recovered_rate": sum(1 for m in batch if m.patch_recovered) / n,
+            # How the git-diff-rescued episodes graded -- denominator is those
+            # episodes, not the batch. Near zero would mean the fallback is only
+            # feeding the harness noise and should go back off.
             "reward/recovered_resolve_rate": (
                 sum(1 for m in batch if m.patch_recovered and m.resolved)
                 / max(1, sum(1 for m in batch if m.patch_recovered))
             ),
-            "traj/resolve_rate": sum(1 for m in batch if m.resolved) / n,
-            "traj/mean_reward": mean("reward"),
-            "reward/patch_applied_rate": sum(1 for m in batch if m.patch_applied) / n,
-            "reward/f2p_pass_rate": rate("f2p_passed", "f2p_total"),
-            "reward/p2p_pass_rate": rate("p2p_passed", "p2p_total"),
+            # --- traj/: readable off the episode, no grading needed ------------
+            "traj/empty_patch_rate": sum(1 for m in batch if m.empty_patch) / n,
+            # Episodes the git-diff fallback rescued: the agent did the work and
+            # never submitted. Pair with reward/recovered_resolve_rate.
+            "traj/patch_recovered_rate": sum(1 for m in batch if m.patch_recovered) / n,
             "traj/mean_turns": mean("num_turns"),
             "traj/mean_tool_calls": mean("tool_call_count"),
             "traj/mean_edits": mean("edit_count"),
-            # Edit-tool adoption and reliability. edit_error_rate is per *edit
-            # attempt*: a high value means the model is not copying old_str
-            # exactly (whitespace) or is editing without viewing first.
+            # Edit-tool adoption and reliability. edit_error_rate is the one bare
+            # _rate under traj/ with a per-EVENT denominator (edit attempts): a
+            # high value means the model is not copying old_str exactly
+            # (whitespace) or is editing without viewing first.
             "traj/mean_edit_errors": mean("edit_errors"),
             "traj/edit_error_rate": rate("edit_errors", "_edit_attempts"),
             "traj/mean_views": mean("view_count"),
-            "traj/edit_tool_use_rate": sum(1 for m in batch if m.edit_count or m.view_count or m.edit_errors) / n,
+            "traj/any_edit_tool_rate": sum(1 for m in batch if m.edit_count or m.view_count or m.edit_errors) / n,
             "traj/mean_unknown_tool_calls": mean("unknown_tool_calls"),
             # Whether the freed turn budget goes into verification. 0.57% of bash
             # calls / ~2% of episodes ran any test on run 20260903-002235.
             "traj/mean_test_runs": mean("test_runs"),
-            "traj/test_run_rate": sum(1 for m in batch if m.test_runs) / n,
+            "traj/any_test_run_rate": sum(1 for m in batch if m.test_runs) / n,
             # Structurally useless commands the harness refused before running
             # them (7.0% + 3.6% + 1.1% of tool time on run 20260903-002235), and
             # the timeouts that survive the policy layer.
             "traj/mean_policy_denials": mean("policy_denials"),
-            "traj/policy_denial_rate": sum(1 for m in batch if m.policy_denials) / n,
+            "traj/any_policy_denial_rate": sum(1 for m in batch if m.policy_denials) / n,
             "traj/mean_tool_timeouts": mean("tool_timeouts"),
-            "traj/timeout_rate": sum(1 for m in batch if m.tool_timeouts) / n,
+            "traj/any_tool_timeout_rate": sum(1 for m in batch if m.tool_timeouts) / n,
             # Looping: identical calls with an unchanged result, collapsed by
             # episode.Repeats. Pair with traj/exit/RepetitionLimit.
             "traj/mean_repeated_calls": mean("repeated_calls"),
-            "traj/repeat_rate": sum(1 for m in batch if m.repeated_calls) / n,
+            "traj/any_repeat_rate": sum(1 for m in batch if m.repeated_calls) / n,
             "traj/missing_logprobs_rate": sum(1 for m in batch if m.missing_logprobs) / n,
             "traj/truncation_rate": sum(1 for m in batch if m.truncated) / n,
             # Tool-call health: unparseable calls used to end the episode outright,
             # so these two decide how much of the batch carries real signal.
             "traj/mean_format_errors": mean("format_errors"),
-            "traj/format_error_rate": sum(1 for m in batch if m.format_errors) / n,
+            "traj/any_format_error_rate": sum(1 for m in batch if m.format_errors) / n,
             "traj/mean_salvaged_calls": mean("salvaged_tool_calls"),
             "tokens/mean_prompt": mean("prompt_tokens"),
             "tokens/mean_completion": mean("completion_tokens"),
             "tokens/mean_cached_prompt": mean("cached_prompt_tokens"),
             "tokens/mean_total": mean("total_trajectory_tokens"),
             "tokens/mean_response": mean("response_tokens"),
-            "tokens/mean_obs": (sum(flat_obs) / len(flat_obs)) if flat_obs else 0.0,
-            "tokens/max_obs": max(flat_obs) if flat_obs else 0.0,
+            "tokens/mean_observation": (sum(flat_obs) / len(flat_obs)) if flat_obs else 0.0,
+            "tokens/max_observation": max(flat_obs) if flat_obs else 0.0,
             "latency/mean_trajectory_s": mean("total_trajectory_time"),
             "latency/max_trajectory_s": max(m.total_trajectory_time for m in batch),
             "latency/mean_tool_s": mean("total_tool_call_time"),
-            "latency/mean_generation_s": sum(m.generation_time() for m in batch) / n,
+            # A residual, not a measurement: trajectory - tool. Named for what it
+            # is rather than "generation", which it only bounds from above -- it
+            # also carries container setup and orchestration. srv/* has the split.
+            "latency/mean_non_tool_s": sum(m.non_tool_time() for m in batch) / n,
             **_timeline_aggregate(batch),
         }
 
@@ -421,16 +442,22 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
 
     The wall-clock span (``timeline/rollout_span_s``) is the *real* cost of the
     rollout phase: the sum of per-trajectory times overcounts massively because
-    thousands of episodes run concurrently, and the mean hides stragglers. The
-    span plus ``timeline/tail_s`` (how long after the median episode finished the
-    last one was still running) is what says whether a step is bound by a long
-    tail — which is the shape docker-slot starvation produces.
+    thousands of episodes run concurrently, and the mean hides stragglers.
+
+    ``timeline/straggler_s`` (how long after the median episode finished the last
+    one was still running) is the absolute cost the step barrier pays;
+    ``timeline/straggler_ratio`` is that as a fraction of the span, which is what
+    compares across steps -- 290s of straggler is fatal on a 600s span and noise
+    on a 3000s one. The ratio is the client-side analogue of ``srv/drain_ratio``:
+    same construction (tail window / busy window), measured from episode end
+    times instead of the server's running batch. Both name the shape docker-slot
+    starvation produces.
     """
     n = len(batch)
     out: dict[str, float] = {}
 
     served = [m for m in batch if m.timing_source == "server"]
-    out["timeline/server_timing_rate"] = len(served) / n
+    out["timeline/server_timing_coverage"] = len(served) / n
     if served:
         k = len(served)
         out["latency/mean_server_queue_s"] = sum(m.server_queue_time for m in served) / k
@@ -457,7 +484,9 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
         out["timeline/rollout_span_s"] = span
         ordered = sorted(ends)
         median_end = ordered[len(ordered) // 2]
-        out["timeline/tail_s"] = max(ordered[-1] - median_end, 0.0)
+        straggler = max(ordered[-1] - median_end, 0.0)
+        out["timeline/straggler_s"] = straggler
+        out["timeline/straggler_ratio"] = (straggler / span) if span > 0.0 else 0.0
 
     # Live-container slots. These replace mean/max ``admission_wait_s``, which
     # carried no information: the queue is arithmetic, not a property of the
@@ -467,7 +496,7 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
     # within 8%. What is *not* derivable is whether the slots exist and stay
     # busy, which is what these two say.
     #
-    # ``zero_wait_count`` is the observed slot count: exactly the first wave
+    # ``slots/observed`` is the observed slot count: exactly the first wave
     # acquires the semaphore uncontended, so it must equal
     # ``AGENTIC_MAX_LIVE_CONTAINERS * rollout.agent.num_workers`` (264 on that
     # run, and it was 264 every step). If it silently drops to the default
@@ -481,7 +510,7 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
     # the middle). It is the actionable dual of the admission queue: the queue
     # length follows from the batch, but starvation does not.
     slots = sum(1 for m in batch if m.admission_wait_s < 1.0)
-    out["slots/zero_wait_count"] = float(slots)
+    out["slots/observed"] = float(slots)
     if slots and span > 0.0:
         busy = sum(m.total_trajectory_time for m in batch)
         out["slots/utilization"] = busy / (span * slots)

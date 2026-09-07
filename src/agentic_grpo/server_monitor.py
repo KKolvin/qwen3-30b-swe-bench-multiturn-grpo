@@ -200,7 +200,7 @@ class SGLangServerMonitor:
             "srv/running_peak": max(s.running for s in samples),
             "srv/capacity": float(cap),
             "srv/token_usage_peak": max((s.token_usage for s in samples), default=0.0),
-            "srv/samples": float(len(samples)),
+            "srv/sample_count": float(len(samples)),
         }
 
     def _latency_breakdown(self, samples: list[ServerSample]) -> dict[str, float]:
@@ -242,10 +242,16 @@ class SGLangServerMonitor:
             "srv/prompt_tokens": prompt,
             "srv/generation_tokens": delta("generation_tokens_total"),
             "srv/cached_tokens": cached,
-            "srv/prefix_cache_hit_frac": (cached / prompt) if prompt > 0 else 0.0,
+            # Two measurements of the SAME quantity, deliberately kept side by
+            # side: this one from the token counters (authoritative), the _gauge
+            # one below from SGLang's own cache_hit_rate gauge averaged over the
+            # busy samples. They should track; a gap means the poll interval is
+            # missing bursts. Neither has anything to do with
+            # reward/eval_cache_hit_rate, which is the SWE-bench result cache.
+            "srv/prefix_cache_hit_rate": (cached / prompt) if prompt > 0 else 0.0,
             "srv/num_requests": delta("num_requests_total"),
             "srv/gen_throughput_mean": (sum(tputs) / len(tputs)) if tputs else 0.0,
-            "srv/cache_hit_rate_mean": (sum(hit_rates) / len(hit_rates)) if hit_rates else 0.0,
+            "srv/prefix_cache_hit_rate_gauge": (sum(hit_rates) / len(hit_rates)) if hit_rates else 0.0,
         }
 
     def drain_summary(

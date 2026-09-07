@@ -67,7 +67,7 @@ class RewardResult:
     p2p_passed: int = 0
     p2p_total: int = 0
     # True when this verdict came from our patch-keyed cache rather than a fresh
-    # container run. Watch ``reward/cache_hit_rate``: a rate near 1.0 with a
+    # container run. Watch ``reward/eval_cache_hit_rate``: a rate near 1.0 with a
     # diverse batch is the signature of the bug this module used to have.
     eval_cached: bool = False
 

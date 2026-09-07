@@ -104,7 +104,7 @@ actor_rollout_ref:
       format: hermes
       # verl's default of 256 is applied by our loop as a CHARACTER cap on every
       # tool observation, middle-truncated — so `cat file.py` returned only its
-      # first 128 and last 128 chars. Measured effect: tokens/mean_obs was 67, and
+      # first 128 and last 128 chars. Measured effect: tokens/mean_observation was 67, and
       # TurnLimit episodes looped (80 actions, 7 distinct commands) because the
       # agent could not read code or test output. The observation_template in
       # configs/agent.yaml is written for ~10000 chars, so that logic was dead.

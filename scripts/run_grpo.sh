@@ -145,7 +145,7 @@ export AGENTIC_MAX_LIVE_CONTAINERS="${AGENTIC_MAX_LIVE_CONTAINERS:-33}"
 #   EVAL_TIMEOUT         - per-instance test-suite timeout (was hardcoded 1800).
 #   REWARD_CACHE_DIR     - our patch-keyed cache. Keyed on sha256(patch), so a
 #     hit means an identical diff, which really does deserve the same verdict.
-#     Watch reward/cache_hit_rate: ~1.0 on a diverse batch means it broke again.
+#     Watch reward/eval_cache_hit_rate: ~1.0 on a diverse batch means it broke again.
 export AGENTIC_MAX_EVAL_CONTAINERS="${AGENTIC_MAX_EVAL_CONTAINERS:-4}"
 export AGENTIC_EVAL_TIMEOUT="${AGENTIC_EVAL_TIMEOUT:-900}"
 export AGENTIC_REWARD_CACHE_DIR="${AGENTIC_REWARD_CACHE_DIR:-/data0/shared/kewen.liu/agentic-reward-cache}"
