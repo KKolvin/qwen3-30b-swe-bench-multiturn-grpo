@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -97,6 +98,45 @@ def _filter_gradable(rows: list[dict]) -> tuple[list[dict], list[str]]:
     return good, dropped
 
 
+def _stratified_split(rows: list[dict], val_size: int, seed: int) -> tuple[list[dict], list[dict]]:
+    """Split off a validation set whose repo mix MIRRORS the training set.
+
+    The old split was ``good[:val_size]``. SWE-bench Verified's parquet is
+    ordered by repo, so that took the first 20 astropy instances and nothing
+    else: val was 100% astropy while train was 48% django and held 2 astropy
+    instances. Validation reward and validation latency were therefore measuring
+    a different workload than the one being trained on, and neither number was
+    comparable to the training batch.
+
+    Proportional (largest-remainder) allocation over repos, so a repo with 46% of
+    the data gets ~46% of the val slots and repos too small to earn one get none
+    -- which is the right behaviour here: val should look like train, not like a
+    uniform tour of the repos. Seeded, so the split is reproducible.
+    """
+    by_repo: dict[str, list[dict]] = {}
+    for r in rows:
+        by_repo.setdefault(r.get("repo") or "?", []).append(r)
+
+    # Hamilton apportionment: floor the exact quota, then hand out the leftover
+    # seats to the largest remainders.
+    total = len(rows)
+    exact = {k: len(v) * val_size / total for k, v in by_repo.items()}
+    quota = {k: int(v) for k, v in exact.items()}
+    left = val_size - sum(quota.values())
+    for k in sorted(by_repo, key=lambda k: (-(exact[k] - quota[k]), k))[:left]:
+        quota[k] += 1
+
+    rng = random.Random(seed)
+    val, train = [], []
+    for repo in sorted(by_repo):
+        pool = sorted(by_repo[repo], key=lambda r: r.get("instance_id") or "")
+        picked = set(rng.sample(range(len(pool)), quota[repo])) if quota[repo] else set()
+        for i, row in enumerate(pool):
+            (val if i in picked else train).append(row)
+    rng.shuffle(train)
+    return val, train
+
+
 def _to_row(example: dict) -> dict:
     return {
         "data_source": "swebench",
@@ -113,6 +153,8 @@ def main() -> None:
     ap.add_argument("--split", default="test")
     ap.add_argument("--out-dir", default="data/swebench_verified")
     ap.add_argument("--val-size", type=int, default=20)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Seed for the stratified train/val split (see _stratified_split).")
     ap.add_argument("--proxy", default=DEFAULT_PROXY, help=f"Egress HTTP proxy (default {DEFAULT_PROXY}).")
     ap.add_argument("--keep-ungradable", action="store_true",
                     help="Do not drop instances the harness can't grade (NOT recommended).")
@@ -143,7 +185,7 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     val_size = min(args.val_size, len(good))
-    val, train = good[:val_size], good[val_size:]
+    val, train = _stratified_split(good, val_size, args.seed)
 
     import pyarrow as pa
     import pyarrow.parquet as pq

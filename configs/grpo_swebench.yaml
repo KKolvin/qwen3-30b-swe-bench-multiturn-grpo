@@ -46,11 +46,23 @@ data:
   val_files: data/swebench_verified/val.parquet
   train_batch_size: 256
   max_prompt_length: 4096
-  # 80 turns of bash need far more than the old 12288: at 40 turns / 12288, 54% of
-  # episodes hit the turn cap mid-edit and 7% already hit the context cap, so
-  # raising turns alone would just convert TurnLimit into ContextLimit.
-  # 4096 + 28672 = 32768 = max_model_len (Qwen3-30B-A3B natively supports 262144).
-  max_response_length: 28672
+  # Raised 28672 -> 61440 on 2026-09-08 from the uncensored ablation (control run
+  # 20260908-031915 vs baseline 20260906-013757: SAME 256 instances, same base
+  # weights, caps relaxed). At 28672 the cap was censoring 11.4% of episodes, and
+  # replaying the rule on the uncensored trajectories showed those episodes were
+  # cut at a median of turn 39 and would have run 19 more turns, with 63% of them
+  # going on to submit -- the context cap was cutting off productive work, not
+  # loops (that is what AGENTIC_MAX_REPEATED_CALLS is for, and it stays at 6).
+  # Paired, instance-clustered bootstrap over the relaxation: +1.81pp resolve,
+  # 95% CI [+0.15, +3.56]; pass@8 46.5% -> 52.3%.
+  # 61440 leaves ContextLimit at 0.8% (replay with the repeat guard still on).
+  # 4096 + 61440 = 65536 = max_model_len (Qwen3-30B-A3B natively supports 262144),
+  # and 65536 is also actor.ppo_max_token_len_per_gpu, which must be >= the padded
+  # attention width -- do not raise this without raising that too.
+  # Cost, measured: gen +40.8% (2594s -> 3652s), old_log_prob +33.8%, ref +28.7%.
+  # That control had the repeat guard OFF as well, so the cost of THIS config
+  # alone is lower; watch timing_s/gen on the first step.
+  max_response_length: 61440
   return_raw_chat: true
 
 actor_rollout_ref:
@@ -78,8 +90,13 @@ actor_rollout_ref:
     # not per token, which is what pinned perf/mfu/actor at 1.5% (~34 of 2250
     # TFLOPS/GPU). Cascades to rollout+ref log_prob_use_dynamic_bsz.
     use_dynamic_bsz: true
-    # Must be >= the padded attention_mask width (32768) or rearrange_micro_batches
-    # asserts. 65536 gives ~56 micro-steps per step instead of 256.
+    # Must be >= the padded attention_mask width or rearrange_micro_batches asserts.
+    # Since max_model_len went to 65536 on 2026-09-08 this is now EXACTLY equal to
+    # that width, i.e. a single max-length sequence fills a whole micro-batch --
+    # it can no longer be lowered without also lowering max_model_len.
+    # Validated at these settings in run 20260908-031915: old_log_prob (412s) and
+    # ref (443s) both completed, and update_actor ran 1515s of the baseline's 1623s
+    # with no OOM before the run was stopped by hand.
     # Do NOT raise further without use_fused_kernels: the lm_head output is
     # tokens x 151936 vocab, so 65536 tokens already materializes ~20GB of logits in
     # bf16 (~40GB once log_softmax goes fp32) on top of the 72-100GB peak measured in
@@ -111,7 +128,20 @@ actor_rollout_ref:
       # 40 was binding: 54% of episodes were cut off mid-edit and only 2/28 ever
       # reached the submit step. The bash-only scaffold makes editing expensive
       # (the model burns turns on awk/perl one-liners), so it needs more room.
-      max_assistant_turns: 80
+      #
+      # 80 -> 100 on 2026-09-08, matched to the new max_response_length. NOTE the
+      # measurement first: with the repeat guard still at 6 and the context at
+      # 61440, the turn cap is very nearly INERT -- replaying that rule on the
+      # uncensored trajectories leaves TurnLimit at 0.6% and puts the end-of-
+      # episode turn distribution at p50 18 / p90 51 / p99 78. Raising the cap
+      # therefore changes almost nothing on its own; it is here so the two caps
+      # are co-located rather than having the turn cap bind arbitrarily first.
+      # 100 is derived, not picked: episodes burn 547 tokens/turn at p50 and 693
+      # at p75, so a 61440-token budget affords 112 turns at the median rate and
+      # 89 at p75 -- 100 sits between, so neither cap systematically dominates.
+      # Do not read this as "more turns help": raising 40 -> 80 previously made
+      # submissions go DOWN, because the episodes that reach the cap are looping.
+      max_assistant_turns: 100
       format: hermes
       # verl's default of 256 is applied by our loop as a CHARACTER cap on every
       # tool observation, middle-truncated — so `cat file.py` returned only its
@@ -119,10 +149,11 @@ actor_rollout_ref:
       # TurnLimit episodes looped (80 actions, 7 distinct commands) because the
       # agent could not read code or test output. The observation_template in
       # configs/agent.yaml is written for ~10000 chars, so that logic was dead.
-      # 2000 chars (~500 tokens) is what the context budget affords: at ~46 turns
-      # x (125 assistant + ~500 obs) tokens we stay inside max_response_length,
-      # where prompt_length/mean + response_length/mean was only 10514 of
-      # 32768. Watch traj/exit/ContextLimit (was 0.044) if raising this further.
+      # 2000 chars (~500 tokens) was sized against the old 32768 budget. Re-measured
+      # on run 20260908-031915: an episode burns 547 response tokens/turn at p50
+      # and 693 at p75, so the 61440 budget now affords ~112 turns at the median
+      # rate -- this is no longer the binding constraint it was.
+      # Watch traj/exit/ContextLimit (0.8% under the new caps) if raising it.
       max_tool_response_length: 2000
     n: 8                        # GRPO group size (>1 required)
     # Sized for the full node. To run on fewer cards (e.g. when another user
@@ -130,13 +161,26 @@ actor_rollout_ref:
     # derives a matching TP + gpu_memory_utilization. TP must divide
     # n_gpus_per_node.
     tensor_model_parallel_size: 8
-    max_model_len: 32768        # enforced context_length (= prompt + response)
+    max_model_len: 65536        # enforced context_length (= prompt + response)
     # Headroom for the bf16 gradients that appear during the actor update; the
     # pool is sized once at init, before grads/optimizer exist. 0.85 left too
     # little and OOMed at the first weight sync (see optimizer_offload above).
     gpu_memory_utilization: 0.75
     temperature: 1.0
     top_p: 1.0
+    # Validation must sample the way training samples. verl's defaults here are
+    # temperature 0 / do_sample false / n 1 -- a greedy single sample, which is a
+    # DIFFERENT estimator from the training batch's pass-rate-over-8 and cannot be
+    # compared to it. It is also unusable at this size: 20 instances x n=1 gives a
+    # resolve rate quantised to 5%, which is why "val reward 0.05" only ever meant
+    # "1 of 20". n=8 matches rollout.n, so val reward and training reward are the
+    # same quantity measured on different instances, and the resolution is 1/160.
+    # Cost is 160 episodes per validation, against test_freq=9.
+    val_kwargs:
+      temperature: 1.0
+      top_p: 1.0
+      do_sample: true
+      n: 8
     max_num_seqs: 256           # server running-batch capacity (C) -> SGLang --max-running-requests
     # Ask SGLang for the logprob of every sampled token (``return_logprob``);
     # the agent loop carries them as response_logprobs -> rollout_log_probs for
@@ -145,34 +189,46 @@ actor_rollout_ref:
     calculate_log_probs: true
     # Inert under dynamic bsz; the budget cascades from actor.ppo_max_token_len_per_gpu.
     log_prob_micro_batch_size_per_gpu: 1
-    # --- srv/* drain metrics: OFF (2026-08-05) ---------------------------------
-    # Turned off because collection is not free: prometheus.enable installs
-    # add_prometheus_middleware on the rollout server's request path, and it
-    # forces disable_log_stats=false, which runs SGLang's per-batch stats loop
-    # for the whole run. The measurement they were bought for is already in --
-    # drain_ratio 1.0 / running_peak 64 vs capacity 256 (run 20260801-072502),
-    # i.e. the server is never the constraint. Not worth paying every step to
-    # keep re-confirming it.
+    # --- srv/* drain metrics: ON (2026-09-08) ----------------------------------
+    # These were off from 2026-08-05 on the grounds that the question was settled:
+    # drain_ratio 1.0, running_peak 64 against capacity 256 (run 20260801-072502),
+    # "inference is never the constraint, docker slots are". That measurement is
+    # STALE and its conclusion can no longer be assumed:
+    #   * it was taken at AGENTIC_MAX_LIVE_CONTAINERS=8, i.e. 8 x 8 workers = ~64
+    #     concurrent episodes -- exactly the running_peak it observed. The cap is
+    #     now 33 (~264 concurrent), 4x higher and just ABOVE max_num_seqs (256).
+    #   * decode throughput is known to plateau at batch 200-240 and lose ~15% at
+    #     248-256, so the current operating point sits past the knee rather than
+    #     at 25% of capacity.
+    # A peak of 64/256 and a peak of 264/256 are different regimes, and only the
+    # srv/* gauges can say which one the run is in. Re-enabled to re-measure;
+    # turn them back off once running_peak/drain_ratio have been read at the
+    # current cap and the answer is recorded here.
     #
-    # To re-enable (all three lines together, plus AGENTIC_SGLANG_METRICS=1 in
-    # scripts/run_grpo.sh) -- e.g. to re-measure at the full batch of 256:
+    # Cost, which is real: prometheus.enable installs add_prometheus_middleware on
+    # the rollout server's request path, and forces disable_log_stats=false, which
+    # runs SGLang's per-batch stats loop for the whole run. Watch timing_s/gen
+    # against the 3652s/2594s numbers in analysis/ when judging whether to keep it.
+    #
+    # All three switches must agree (plus AGENTIC_SGLANG_METRICS=1 in run_grpo.sh):
     #   * /metrics is gated on rollout.prometheus.enable, NOT on the
     #     engine_kwargs flag below: verl only sets server_args.enable_metrics
     #     (and so only calls add_prometheus_middleware) inside
     #     `if self.config.prometheus.enable:` -- see async_sglang_server.py.
     #     With it false the server answers 404 on /metrics.
-    #   * disable_log_stats MUST then be false: the guard in
+    #   * disable_log_stats MUST be false: the guard in
     #     verl/workers/rollout/llm_server.py raises
     #       ValueError: PROMETHEUS needs disable_log_stats==False, ...
     #     and that stats loop is what populates the sglang:* gauges anyway.
     prometheus:
-      enable: false
-    disable_log_stats: true
+      enable: true
+    disable_log_stats: false
     engine_kwargs:
       sglang:
-        # ON, but NOT for /metrics -- see prometheus.enable above, which is the
-        # switch that actually installs the endpoint and its middleware, and which
-        # stays off. This flag is what makes SGLang's tokenizer manager attach its
+        # A SEPARATE switch from /metrics -- that one is prometheus.enable above,
+        # which installs the endpoint and its request-path middleware. This flag
+        # stays on regardless of whether srv/* is being collected, because it is
+        # cheap and feeds the per-turn timeline. It makes SGLang's tokenizer manager attach its
         # per-request timestamps (request_received_ts, prefill_finished_ts,
         # decode_finished_ts, queue_time) to each response's meta_info; without it
         # that block is skipped and the per-turn timeline in

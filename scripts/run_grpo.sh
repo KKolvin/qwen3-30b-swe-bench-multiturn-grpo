@@ -82,16 +82,21 @@ print(f'{max(0.30, (util * 100 // 1) / 100):.2f}')") ;;
 fi
 
 # --- Server-side rollout drain profiling (SGLang /metrics) ---
-# OFF by default (2026-08-05). The poller itself is ~1 req/s and negligible, but
-# it is useless without the server-side flags that feed it, and THOSE cost every
-# step: rollout.prometheus.enable adds middleware to the request path and forces
-# disable_log_stats=false (SGLang's per-batch stats loop). Both are now off in
-# configs/grpo_swebench.yaml, so /metrics 404s and leaving the poller on would
-# only scrape a dead endpoint once a second. The question they answered is
-# settled: drain_ratio 1.0, running_peak 64 against capacity 256 (run
-# 20260801-072502) -- inference is never the constraint, docker slots are.
+# ON by default (2026-09-08), together with the three rollout flags in
+# configs/grpo_swebench.yaml -- all four must agree or this poller scrapes a
+# dead endpoint once a second. The poller itself is ~1 req/s and negligible; the
+# cost is server-side (request-path middleware + SGLang's per-batch stats loop).
 #
-# To re-enable, set AGENTIC_SGLANG_METRICS=1 here AND flip the three rollout
+# It was off from 2026-08-05 because the question looked settled: drain_ratio
+# 1.0, running_peak 64 against capacity 256 (run 20260801-072502), "inference is
+# never the constraint, docker slots are". But that was measured at
+# AGENTIC_MAX_LIVE_CONTAINERS=8 (~64 concurrent episodes -- the peak it saw IS
+# the cap it ran at). The cap is now 33, i.e. ~264 concurrent against
+# max_num_seqs=256, and decode is known to plateau at batch 200-240. Whether the
+# server is the constraint is an OPEN question again at that operating point,
+# and srv/* is the only thing that can answer it.
+#
+# To turn back off, set AGENTIC_SGLANG_METRICS=0 here AND flip the rollout
 # flags in configs/grpo_swebench.yaml (see the comment block there). verl runs
 # its SGLang replicas on EPHEMERAL per-replica ports, so there is no static URL
 # to configure -- which is why every run before 2026-08-01 silently recorded
@@ -104,7 +109,7 @@ fi
 #   AGENTIC_SGLANG_METRICS=0   - disable the monitor entirely
 # Capacity C mirrors rollout.max_num_seqs and sets the saturation threshold used
 # to locate the drain start; it is read only when the monitor is enabled.
-export AGENTIC_SGLANG_METRICS="${AGENTIC_SGLANG_METRICS:-0}"
+export AGENTIC_SGLANG_METRICS="${AGENTIC_SGLANG_METRICS:-1}"
 export AGENTIC_MAX_RUNNING_REQUESTS="${AGENTIC_MAX_RUNNING_REQUESTS:-256}"
 export AGENTIC_METRICS_POLL_INTERVAL="${AGENTIC_METRICS_POLL_INTERVAL:-1.0}"
 
@@ -146,6 +151,23 @@ export AGENTIC_MAX_LIVE_CONTAINERS="${AGENTIC_MAX_LIVE_CONTAINERS:-33}"
 #   REWARD_CACHE_DIR     - our patch-keyed cache. Keyed on sha256(patch), so a
 #     hit means an identical diff, which really does deserve the same verdict.
 #     Watch reward/eval_cache_hit_rate: ~1.0 on a diverse batch means it broke again.
+# --- Repetition guard (AGENTIC_MAX_REPEATED_CALLS, default 6) ---
+# Stays at 6, and that is now a measured decision rather than a guess. The
+# uncensored ablation (control 20260908-031915 vs baseline 20260906-013757, same
+# 256 instances, same base weights) separated what the two stopping rules were
+# actually cutting:
+#
+#                       cut at turn   ran on for   ended Submitted   reward>0
+#   ContextLimit (273)      p50 39      +19 turns        63.0%         7.33%
+#   RepetitionLimit (268)   p50 35      +28 turns        50.4%         5.60%
+#
+# The repeat guard is cutting genuine loops: released, 46.6% of that cohort just
+# runs to the turn cap, and it accounts for 59% of the extra work for less of the
+# gain. So the context cap was raised (28672 -> 61440 in the yaml) and THIS was
+# left alone. Set to 0 to disable the stop while keeping the collapse and the
+# timeout refusal -- that is the ablation arm, not a training setting.
+export AGENTIC_MAX_REPEATED_CALLS="${AGENTIC_MAX_REPEATED_CALLS:-6}"
+
 export AGENTIC_MAX_EVAL_CONTAINERS="${AGENTIC_MAX_EVAL_CONTAINERS:-4}"
 export AGENTIC_EVAL_TIMEOUT="${AGENTIC_EVAL_TIMEOUT:-900}"
 export AGENTIC_REWARD_CACHE_DIR="${AGENTIC_REWARD_CACHE_DIR:-/data0/shared/kewen.liu/agentic-reward-cache}"
@@ -382,7 +404,13 @@ if [ -n "${AGENTIC_TRACE:-}" ]; then
 fi
 
 # Compute total_steps for 3 epochs from the prepared dataset.
-TRAIN_FILE="${REPO_ROOT}/data/swebench_verified/train.parquet"
+# AGENTIC_TRAIN_FILE swaps the train split for a run without touching the data
+# directory -- needed for paired ablations, where the control arm must draw the
+# EXACT instance set a previous run drew (data.seed is null, so two runs of the
+# same file sample different batches). It cannot be an extra `data.train_files=`
+# override on the command line: hydra rejects a key given twice, the same reason
+# AGENTIC_TOTAL_STEPS is applied here rather than appended.
+TRAIN_FILE="${AGENTIC_TRAIN_FILE:-${REPO_ROOT}/data/swebench_verified/train.parquet}"
 if [ ! -f "$TRAIN_FILE" ]; then
   echo "Run 'python scripts/prepare_swebench_hf.py' first." >&2
   exit 1
@@ -425,7 +453,7 @@ python3 "${REPO_ROOT}/scripts/verl_entry.py" \
   +ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_ALLOC_CONF=\"${PYTORCH_ALLOC_CONF}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_SGLANG_REQUEST_TIMING=\"${AGENTIC_SGLANG_REQUEST_TIMING}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TEST_TIMEOUT=\"${AGENTIC_TEST_TIMEOUT:-300}\" \
-  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_REPEATED_CALLS=\"${AGENTIC_MAX_REPEATED_CALLS:-6}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_REPEATED_CALLS=\"${AGENTIC_MAX_REPEATED_CALLS}\" \
   +ray_kwargs.ray_init._temp_dir="${RAY_TMP_ROOT}" \
   ${GPU_OVERRIDES[@]+"${GPU_OVERRIDES[@]}"} \
   ${TRACE_OVERRIDES[@]+"${TRACE_OVERRIDES[@]}"} \
