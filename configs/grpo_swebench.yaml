@@ -82,6 +82,16 @@ actor_rollout_ref:
       # on a 183GB card, so `resume_memory_occupation` OOMed after rollout had run
       # fine. Keeping the optimizer state on CPU removes that cliff.
       optimizer_offload: true
+    checkpoint:
+      # Dropped 'optimizer' (default: ['model', 'optimizer', 'extra']). The
+      # 30.5B-param fp32 AdamW state (exp_avg + exp_avg_sq) is ~244GB per
+      # checkpoint on top of the ~122GB bf16 model shards -- that's what turned
+      # a "~60GB+" checkpoint into the 196GB write that hit ENOSPC on
+      # 2026-09-06 (run 20260906-013757, /data0 at 169GB free). load_contents
+      # defaults to ${.save_contents}, so a resume now starts the optimizer
+      # fresh (no momentum/variance carried over) instead of restoring it --
+      # acceptable given save_freq=3 means at most 3 steps of warmup lost.
+      save_contents: ['model', 'extra']
   rollout:
     name: sglang
     mode: async
@@ -181,13 +191,16 @@ trainer:
   n_gpus_per_node: 8
   nnodes: 1
   total_training_steps: 27   # overridden by run_grpo.sh (ceil(N/256)*3)
-  # Checkpoint every 2 steps so a stop loses at most 2 steps of work (~5h at the
-  # measured ~2.5h/step). verl also always saves on the last step, so a 6-step run
-  # writes global_step_2, _4 and _6. Resume with AGENTIC_RESUME=<exp-name> in
-  # run_grpo.sh. NOTE: a 30B FSDP checkpoint is ~60GB+ and max_actor_ckpt_to_keep
-  # is unset (keep ALL), so N/2 checkpoints accumulate on /data0 — 3 x ~60GB =
-  # ~180GB for a 6-step run against ~467GB free. Set max_actor_ckpt_to_keep if
-  # total_training_steps grows.
+  # Checkpoint every 3 steps so a stop loses at most 3 steps of work (~7.5h at
+  # the measured ~2.5h/step). verl also always saves on the last step. Resume
+  # with AGENTIC_RESUME=<exp-name> in run_grpo.sh.
   save_freq: 3
   test_freq: 9
+  # Keep only the newest actor checkpoint (each is ~122GB now that 'optimizer'
+  # is dropped from checkpoint.save_contents above; it was 196GB+ and growing
+  # unbounded with all three contents, which is what filled /data0 to ENOSPC
+  # mid-save on 2026-09-06, run 20260906-013757). verl deletes the old one only
+  # AFTER the new one finishes writing, so peak usage during a save is briefly
+  # ~2x one checkpoint, not a running total across the whole run.
+  max_actor_ckpt_to_keep: 1
   logger: ["console", "wandb"]

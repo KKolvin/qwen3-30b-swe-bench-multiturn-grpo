@@ -308,7 +308,11 @@ if [ "${AGENTIC_TIMELINE:-1}" != "0" ]; then
     +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TIMELINE_DIR=\"${AGENTIC_TIMELINE_DIR}\"
   )
   trap 'python3 "${REPO_ROOT}/scripts/build_timeline.py" --dir "${AGENTIC_TIMELINE_DIR}" \
-        --experiment "${EXPERIMENT_NAME}" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
+        --experiment "${EXPERIMENT_NAME}" 2>&1 | tee -a "${LOG_FILE}" || true
+        python3 "${REPO_ROOT}/scripts/build_metrics_csv.py" --log "${LOG_FILE}" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
+else
+  # No timeline trap to piggyback on -- still want metrics.csv from every run.
+  trap 'python3 "${REPO_ROOT}/scripts/build_metrics_csv.py" --log "${LOG_FILE}" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
 fi
 
 # Per-request SGLang timestamps (prefill finish / decode finish / queue time) on
