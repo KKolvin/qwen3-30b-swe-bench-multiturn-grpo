@@ -405,11 +405,17 @@ fi
 
 # Compute total_steps for 3 epochs from the prepared dataset.
 # AGENTIC_TRAIN_FILE swaps the train split for a run without touching the data
-# directory -- needed for paired ablations, where the control arm must draw the
-# EXACT instance set a previous run drew (data.seed is null, so two runs of the
-# same file sample different batches). It cannot be an extra `data.train_files=`
-# override on the command line: hydra rejects a key given twice, the same reason
-# AGENTIC_TOTAL_STEPS is applied here rather than appended.
+# directory. Two runs of the same file already draw the same batches (data.seed is
+# pinned to 42; even unpinned, torch.Generator() has a fixed default seed), so a
+# plain A/B needs nothing here. This is for pinning an EXPLICIT instance set:
+# reproducing what a specific earlier run did, or aiming an arm at a subset --
+# useful because the mapping from step to instances is not obvious offline
+# (global_step N draws permutation N+1; see the data.seed comment in the yaml).
+# The 2026-09-08 cap ablation used it, rebuilding the baseline's step-1 set from
+# that run's timeline instance_ids so both arms were paired by construction.
+# It cannot be an extra `data.train_files=` override on the command line: hydra
+# rejects a key given twice, the same reason AGENTIC_TOTAL_STEPS is applied here
+# rather than appended.
 TRAIN_FILE="${AGENTIC_TRAIN_FILE:-${REPO_ROOT}/data/swebench_verified/train.parquet}"
 if [ ! -f "$TRAIN_FILE" ]; then
   echo "Run 'python scripts/prepare_swebench_hf.py' first." >&2

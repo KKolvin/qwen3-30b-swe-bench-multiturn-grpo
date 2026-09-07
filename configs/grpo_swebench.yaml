@@ -45,6 +45,24 @@ data:
   train_files: data/swebench_verified/train.parquet
   val_files: data/swebench_verified/val.parquet
   train_batch_size: 256
+  # verl leaves this null, which does NOT mean "unseeded". create_rl_sampler then
+  # skips manual_seed and torch.Generator() falls back to its OWN fixed default
+  # (67280421310721 -- verified identical across processes), so runs were already
+  # drawing the same batches. That reproducibility was accidental, resting on a
+  # torch internal rather than on anything this config says; pinned so it is
+  # explicit and survives a torch version bump.
+  #
+  # Reproducing a given step's batch OFFLINE is still not obvious, and getting it
+  # wrong is silent: ONE full permutation is consumed before the first training
+  # batch, so global_step N draws permutation N+1. Verified against run
+  # 20260906-013757 -- its step-1 instance set matches the SECOND permutation
+  # exactly (256/256) while the first matches only 144/256. To recover which
+  # instances a step ran, read them off that run's own timeline (episode events
+  # carry instance_id); do not re-derive them from the seed.
+  #
+  # Changing this value changes the batch draw, so runs before and after 2026-09-08
+  # are not batch-comparable (neither are they across the val-split change).
+  seed: 42
   max_prompt_length: 4096
   # Raised 28672 -> 61440 on 2026-09-08 from the uncensored ablation (control run
   # 20260908-031915 vs baseline 20260906-013757: SAME 256 instances, same base
