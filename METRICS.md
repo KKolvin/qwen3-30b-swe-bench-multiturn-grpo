@@ -138,7 +138,6 @@ Counted on the exact token ids the loop assembled (no re-tokenization), at
 | `tokens/mean_cached_prompt` | Prefix-cache hits **summed over all of an episode's turns**. Was a **dead metric (always 0.0)** until the per-request `meta_info` plumbing of 5a — the server owns cache accounting, so there was no client-side source. Still 0.0 whenever `timeline/server_timing_coverage` is 0. **Do not compare it to `tokens/mean_prompt`**: this is a per-episode sum over ~42 turns while that is a single-turn value, so the ratio is meaningless (it reads 22000% on run 20260806-040804). For a real hit rate use `TurnTiming.cache_hit_rate()` per turn in the dump — measured at **~0.93** (10527 cached of 11300 context), i.e. prefix caching is working and each turn re-prefills only its own new tokens. | `meta_info["cached_tokens"]` per turn, summed in [`summarize_turns`](src/agentic_grpo/metrics.py#L186) |
 | `tokens/mean_total` | Mean `len(prompt_ids) + len(response_ids)` after right-clipping to `max_response_length`. Compare against `rollout.max_model_len` (32768) to see how much context budget is really used. | [`Episode.finalize`](src/agentic_grpo/episode.py) |
 | `tokens/mean_observation` | Mean size of a **single** tool observation, pooled over every observation in the batch (not per episode). Directly reflects `multi_turn.max_tool_response_length`. | `tool_obs_tokens` lists, flattened across the batch |
-| `tokens/max_observation` | Largest single observation in the batch. | `max(flat_obs)` |
 
 ---
 
@@ -151,9 +150,7 @@ standalone path).
 | Metric | Meaning | How collected |
 |---|---|---|
 | `latency/mean_trajectory_s` | Mean wall time of a whole episode: container start -> terminal exit, excluding grading. | `perf_counter` bracket from [`Episode.admitted`](src/agentic_grpo/episode.py) to `Episode.close` |
-| `latency/max_trajectory_s` | Slowest single episode. The step barrier waits on this, so it — not the mean — sets rollout wall time. | `max(...)` over the batch |
 | `latency/mean_tool_s` | Mean time inside `env.execute(...)`, i.e. docker command execution, summed over an episode. | `perf_counter` bracket around `tools.run` in [`_execute`](src/agentic_grpo/agent_loop.py), summed by `Episode.tool_called` |
-| `latency/mean_non_tool_s` | **Derived, not measured**: `max(trajectory - tool, 0)`. Includes queueing, generation, tokenization and container setup, so it is an upper bound on generation. The authoritative split is the per-request timestamps in 5a and `timing_s/agent_loop/*`. | [`non_tool_time()`](src/agentic_grpo/metrics.py#L178) |
 
 ---
 
@@ -192,7 +189,6 @@ below disappear rather than reporting zeros.
 | `slots/observed` | How many episodes got a live-container permit with no queueing — i.e. the **observed** slot count, which must equal `AGENTIC_MAX_LIVE_CONTAINERS x rollout.agent.num_workers` (264 on run 20260906-013757, every step). A silent drop to `8 x workers` means the env var never reached the workers through Ray's `runtime_env`; nothing else in this table would notice. | `admission_wait_s < 1.0` |
 | `slots/utilization` | Mean fraction of those slots that were actually running an episode, over `timeline/rollout_span_s`. 0.81–0.86 on that run; the missing share is the drain tail, not the middle. This and `timeline/straggler_ratio` are the pair that says whether the rollout is slot-starved. | `sum(total_trajectory_time) / (span x slots)` |
 | `latency/mean_time_to_first_decode_s` | `t_first_decode - t_start`: everything between "episode began" and "the model emitted its first token" — container start, prompt build, queueing, prefill. A large value here is **docker, not inference**. | [`summarize_turns`](src/agentic_grpo/metrics.py#L186) |
-| `latency/max_time_to_first_decode_s` | Same, worst episode. | `max(...)` |
 | `latency/mean_server_queue_s` | Per episode, summed over turns: admission -> first token (queue **plus** prefill). Averaged over trajectories that have server timing, not over the batch — otherwise adding a client-only rollout would look like decoding got faster. | `prefill_finished_ts - request_received_ts` |
 | `latency/mean_server_prefill_s` | Same but from scheduler hand-off, so prefill proper with queueing excluded. The gap to `mean_server_queue_s` **is** the queue wait. | `prefill_finished_ts - request_sent_to_scheduler_ts` |
 | `latency/mean_server_decode_s` | Per episode, summed over turns: first token -> last token. The only number here that is pure generation. | `decode_finished_ts - prefill_finished_ts` |
@@ -384,7 +380,7 @@ Produced by verl's `AgentLoopManager` from the `AgentLoopMetrics` **we** return 
 
 | Metric | Meaning |
 |---|---|
-| `timing_s/agent_loop/generate_sequences/{min,max,mean}` | Time an episode spent inside `server_manager.generate(...)`, summed over its turns. Unlike `latency/mean_non_tool_s` this excludes docker and container setup. |
+| `timing_s/agent_loop/generate_sequences/{min,max,mean}` | Time an episode spent inside `server_manager.generate(...)`, summed over its turns — docker and container setup excluded, unlike the whole-episode `latency/mean_trajectory_s`. |
 | `timing_s/agent_loop/tool_calls/{min,max,mean}` | Time inside `env.execute` per episode — the same quantity as `latency/mean_tool_s`, reduced by verl. |
 | `timing_s/agent_loop/compute_score/{min,max,mean}` | Time in the SWE-bench grading harness per episode (its own docker container, run after the agent's is released). |
 | `timing_s/agent_loop/num_preempted/{min,max,mean}` | How many times the server preempted a request (KV-cache pressure) for that episode. Persistently nonzero means the rollout engine is over-subscribed. |
@@ -402,6 +398,41 @@ Produced by verl's `AgentLoopManager` from the `AgentLoopMetrics` **we** return 
 
 Both MFU figures are low in this project (~2% actor / ~5% infer) because the step is bound by
 docker container slots and rollout wall time, not by compute — expected, not a regression.
+
+### Rollout throughput (`perf/rollout_decode_tok_s`, ours)
+
+| Metric | Meaning | How collected |
+|---|---|---|
+| `perf/rollout_decode_tok_s` | Decode tokens per second over the rollout, cluster-wide. Compare against the **~3.6k tok/s** SGLang plateaus at when saturated (run 20260906-013757): the gap is how far from saturation the rollout ran. | `sum(completion_tokens) / timeline/rollout_span_s` in [`_timeline_aggregate`](src/agentic_grpo/metrics.py) |
+
+### Why there is no rollout MFU
+
+Built on 2026-09-07 and removed the same day; don't rebuild it without reading this.
+
+A rollout MFU is straightforward to compute — forward FLOPs (`2ND` plus attention, prefill
+charged only for uncached tokens) over `rollout_span_s x n_gpus x device peak`. On a batch
+shaped like run 20260906-013757 it comes out at **0.15%**. The problem is that the number
+cannot be acted on:
+
+* **The roofline is wrong for the phase.** The denominator is the dense BF16 compute peak
+  (2250 TFLOP/s on a B200), but decode is memory-bandwidth-bound. No batch size brings decode
+  near that ceiling, so 0.15% does not mean "99.85% wasted" — and there is no way to say what
+  a good value would be. A metric with no attainable target is not a diagnostic.
+* **It is not independent.** MFU is a function of token counts and the rollout span, both
+  already logged, and tracks `perf/rollout_decode_tok_s` up to a slowly-varying constant.
+* **The question it would answer is already answered better.** Why the GPUs idle is covered by
+  `slots/utilization` (0.81–0.86), `timeline/straggler_ratio` and `srv/drain_ratio` — measured,
+  not estimated.
+* **It carries four ways to be quietly wrong**: the perfect-prefix-cache assumption for prefill,
+  the midpoint-context approximation for attention, MoE active-parameter counting, and a device
+  table that silently omits unknown GPUs.
+
+Worth knowing if it ever *is* rebuilt: attention is the larger term for this model, not a
+correction. Qwen3-30B-A3B activates ~3.35B parameters but keeps 48 layers x 32 heads x 128
+head_dim, so at a 12k context attention is ~9.4 GFLOP/token against ~6.7 dense — 58% of the
+work. A `2ND`-only estimate is less than half the truth. And verl's `FlopsCounter` is
+fwd+bwd (`6ND`), so a forward-only figure is exactly a third of what it reports for the same
+tokens.
 
 ## 11. verl — bookkeeping and validation
 
@@ -447,11 +478,9 @@ ephemeral. With more than one replica only one is scraped, so the counts are per
 | Metric | Meaning |
 |---|---|
 | `srv/gpu_busy_s` | Length of the busy window — first to last sample with a running batch. |
-| `srv/drain_start_offset_s` | Offset into that window of the last instant the server was still saturated (queue non-empty, or running batch >= capacity). After it, the batch can only shrink. |
 | `srv/drain_window_s` | Time from drain start to the end of the window: the tail where the GPU idles progressively because only stragglers remain. |
 | `srv/drain_ratio` | `drain_window / gpu_busy`. 1.0 means the server was never saturated in the window — the rollout is bound by something other than the GPU (for us: docker container slots). |
-| `srv/running_peak` | Largest observed running batch. |
-| `srv/capacity` | The capacity used as the saturation threshold: `AGENTIC_MAX_RUNNING_REQUESTS` if set (should match `rollout.max_num_seqs`), else the observed peak. |
+| `srv/running_peak` | Largest observed running batch. Read it against the saturation threshold, which is `AGENTIC_MAX_RUNNING_REQUESTS` (should match `rollout.max_num_seqs`) or, unset, the observed peak — a launch setting, so read it off the run config rather than a per-step row. |
 | `srv/token_usage_peak` | Peak KV-cache utilization (0-1). |
 | `srv/sample_count` | Number of scrapes in the window — a sanity check that the poller was alive. |
 
@@ -468,7 +497,6 @@ sample in the window (`delta(sum)/delta(count)` for histogram means):
 | `srv/prefix_cache_hit_rate` | `cached / prompt`. The real prefix-cache number — what `tokens/mean_cached_prompt` was supposed to be. |
 | `srv/num_requests` | Requests completed in the window (one per assistant turn, so ~ `traj/mean_turns` x 2048). |
 | `srv/gen_throughput_mean` | Mean decode tokens/s while busy. |
-| `srv/prefix_cache_hit_rate_gauge` | Mean of the server's own `cache_hit_rate` gauge while busy. |
 
 A histogram-derived value of exactly `0.0` (as `srv/ttft_mean_s` currently shows) means the
 counter did not advance between the window's first and last sample — not that latency was
@@ -482,7 +510,7 @@ Worth knowing before plotting anything:
 
 | Row | Status |
 |---|---|
-| `tokens/mean_cached_prompt` | Always 0.0 — never assigned. Use `srv/prefix_cache_hit_rate`. |
+| `tokens/mean_cached_prompt` | **Live, not dead** — this row previously said "never assigned", which was true only before the 5a `meta_info` plumbing. Verified 2026-09-07 against `analysis/`: 0.0 on every step of 20260731-025759 (pre-5a), then 138,072 at step 1 and 391,915 at step 2 of 20260806-040804, tracking `server_timing_coverage` 0.34 → 1.0. It is a **per-episode sum over ~42 turns**, so dividing it by the single-turn `tokens/mean_prompt` gives 23,000%, not a hit rate — see §4. For a hit rate use `srv/prefix_cache_hit_rate`. |
 | `tokens/mean_response` vs `tokens/mean_completion` | Always identical; both are `sum(response_mask)`. |
 | `reward/mean` vs `reward/resolve_rate` | Always identical (binary reward). |
 | `critic/rewards/*` vs `critic/score/*` | Identical while `use_kl_in_reward: false`. |
@@ -490,6 +518,30 @@ Worth knowing before plotting anything:
 | `timing_s/start_profile`, `timing_s/stop_profile` | No-op hooks unless profiling is enabled. |
 | `perf/time_per_step` vs `timing_s/step` | The same value under two names. |
 | `pytest_output_length` | Collected per trajectory but **not** aggregated, so it never reaches the CSV. |
+
+### Removed on 2026-09-07
+
+Dropped for being unactionable — not wrong, but nothing you would do differently if they
+moved. Present in `analysis/` runs before this date. The test applied was *what decision
+changes if this number changes?*, which is stricter than §13's "dead or duplicated" and is
+what §10's removed rollout MFU also failed.
+
+| Removed | Why |
+|---|---|
+| `latency/max_trajectory_s` | A max over ~2048 episodes: it tracks whichever single container hung, and the quantity it was standing in for — rollout wall time — is measured directly as `timeline/rollout_span_s`, with the tail as `timeline/straggler_s`. |
+| `latency/max_time_to_first_decode_s` | Same order-statistic problem; the mean is kept. |
+| `tokens/max_observation` | Pinned to a config ceiling. Observations are truncated before being counted ([agent_loop.py](src/agentic_grpo/agent_loop.py)), so this is the largest tool budget in play (the editor's `AGENTIC_EDIT_VIEW_CHARS`, since `view` sets `bounded` and escapes the loop's 2000-char cap), and something fills it every step. It measured the config. `tokens/mean_observation` is kept and is the one that carries signal. |
+| `latency/mean_non_tool_s` (was `latency/mean_generation_s`) | A residual, `trajectory - tool`. It moves for four unrelated reasons — decode, container start, orchestration, queueing — so a change in it points nowhere, and `timing_s/agent_loop/generate_sequences` and `latency/mean_server_decode_s` each measure a piece of it directly. |
+| `srv/drain_start_offset_s` | Exactly `srv/gpu_busy_s - srv/drain_window_s`. Three rows, two degrees of freedom. |
+| `srv/capacity` | `AGENTIC_MAX_RUNNING_REQUESTS` echoed back once a step, or — unset — the observed peak, which is already `srv/running_peak`. A launch setting, not a measurement. |
+| `srv/prefix_cache_hit_rate_gauge` | The same quantity as `srv/prefix_cache_hit_rate` read off SGLang's gauge instead of its token counters. A cross-check nobody would act on; the counter-derived row is authoritative. |
+
+Deliberately **not** removed: `slots/observed`, `timeline/server_timing_coverage` and
+`traj/missing_logprobs_rate` are also near-constant, but that is the point — they are
+tripwires (264, 1.0, ~0). Their problem is the mechanism, not the content: a flat line on a
+chart is the wrong container for an assertion. `reward/eval_error_rate` shows the shape that
+works, with [`guard_infra_failures`](src/agentic_grpo/metrics.py) behind it to halt the run.
+Giving the other three the same treatment is open.
 
 ### Renames of 2026-09-07
 
@@ -512,9 +564,7 @@ change will show two disjoint series. Nothing about what is measured changed exc
 | `traj/edit_tool_use_rate` | `traj/any_edit_tool_rate` | same |
 | `slots/zero_wait_count` | `slots/observed` | named the computation, not the quantity |
 | `reward/cache_hit_rate` | `reward/eval_cache_hit_rate` | collided with SGLang's KV cache |
-| `srv/prefix_cache_hit_frac` | `srv/prefix_cache_hit_rate` | same quantity as the row below, so same stem |
-| `srv/cache_hit_rate_mean` | `srv/prefix_cache_hit_rate_gauge` | ditto; suffix now says which source |
+| `srv/prefix_cache_hit_frac` | `srv/prefix_cache_hit_rate` | says which cache, and `_rate` matches its siblings |
+| `tokens/mean_obs` | `tokens/mean_observation` | only abbreviation in the namespace |
 | `timeline/server_timing_rate` | `timeline/server_timing_coverage` | instrumentation coverage, not an event rate |
-| `latency/mean_generation_s` | `latency/mean_non_tool_s` | a residual (`traj - tool`), not a measurement of generation |
-| `tokens/mean_obs`, `tokens/max_obs` | `tokens/mean_observation`, `tokens/max_observation` | only abbreviations in the namespace |
 | `srv/samples` | `srv/sample_count` | only bare count with no suffix |

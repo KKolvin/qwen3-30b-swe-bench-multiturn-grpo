@@ -15,7 +15,6 @@ agent:
   # Hard cap on model<->env turns comes from verl's multi_turn.max_assistant_turns,
   # falling back to config.agent.step_limit (40).
   cost_limit: 0.0          # self-hosted, disable $ budget
-  wall_time_limit_seconds: 1800
   max_consecutive_format_errors: 3
 
   system_template: |

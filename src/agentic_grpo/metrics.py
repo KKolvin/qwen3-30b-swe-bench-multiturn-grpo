@@ -213,16 +213,6 @@ class TrajectoryMetrics:
     instance_id: str = ""
     exit_status: str = ""
 
-    def non_tool_time(self) -> float:
-        """Per-trajectory time outside the tools, derived (traj - tool).
-
-        Mostly generation, but it also absorbs container setup and orchestration,
-        so it is an upper bound on generation rather than a measurement of it --
-        hence "non_tool", not "generation". The server owns the authoritative
-        prefill/decode split; this coarse client-side figure complements it.
-        """
-        return max(self.total_trajectory_time - self.total_tool_call_time, 0.0)
-
     def summarize_turns(self) -> None:
         """Fold ``turns`` into the scalar timeline fields. Idempotent.
 
@@ -370,14 +360,8 @@ class TrajectoryMetrics:
             "tokens/mean_total": mean("total_trajectory_tokens"),
             "tokens/mean_response": mean("response_tokens"),
             "tokens/mean_observation": (sum(flat_obs) / len(flat_obs)) if flat_obs else 0.0,
-            "tokens/max_observation": max(flat_obs) if flat_obs else 0.0,
             "latency/mean_trajectory_s": mean("total_trajectory_time"),
-            "latency/max_trajectory_s": max(m.total_trajectory_time for m in batch),
             "latency/mean_tool_s": mean("total_tool_call_time"),
-            # A residual, not a measurement: trajectory - tool. Named for what it
-            # is rather than "generation", which it only bounds from above -- it
-            # also carries container setup and orchestration. srv/* has the split.
-            "latency/mean_non_tool_s": sum(m.non_tool_time() for m in batch) / n,
             **_timeline_aggregate(batch),
         }
 
@@ -470,7 +454,6 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
     ttfd = [m.t_first_decode - m.t_start for m in batch if m.t_start > 0.0 and m.t_first_decode > 0.0]
     if ttfd:
         out["latency/mean_time_to_first_decode_s"] = sum(ttfd) / len(ttfd)
-        out["latency/max_time_to_first_decode_s"] = max(ttfd)
 
     scores = [m.t_score_end - m.t_score_start for m in batch if m.t_score_start > 0.0 and m.t_score_end > 0.0]
     if scores:
@@ -487,6 +470,15 @@ def _timeline_aggregate(batch: list["TrajectoryMetrics"]) -> dict[str, float]:
         straggler = max(ordered[-1] - median_end, 0.0)
         out["timeline/straggler_s"] = straggler
         out["timeline/straggler_ratio"] = (straggler / span) if span > 0.0 else 0.0
+
+        # Decode tokens per second over the rollout, cluster-wide. Server-reported
+        # and exact -- no FLOPs model, no device roofline. Its value is that it is
+        # directly comparable to the ~3.6k tok/s SGLang plateaus at when saturated
+        # (run 20260906-013757), so the gap says how far from saturation the
+        # rollout ran. See METRICS.md 10 for why the MFU form of this is not here.
+        decode_tokens = sum((m.completion_tokens or m.response_tokens) for m in batch)
+        if span > 0.0 and decode_tokens:
+            out["perf/rollout_decode_tok_s"] = decode_tokens / span
 
     # Live-container slots. These replace mean/max ``admission_wait_s``, which
     # carried no information: the queue is arithmetic, not a property of the
