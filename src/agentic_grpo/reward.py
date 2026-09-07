@@ -238,35 +238,44 @@ def _grade_with_harness(
     }
 
     client = docker.from_env()
-    # run_instance swallows every exception and returns completed=False, so its
-    # return value is the only in-band signal that grading did not happen.
-    outcome = run_instance(
-        test_spec=test_spec,
-        pred=prediction,
-        rm_image=False,        # reuse cached instance images across the run
-        force_rebuild=False,
-        client=client,
-        run_id=eval_id,
-        timeout=timeout,
-        rewrite_reports=False,
-    )
-    out = _read_harness_report(run_id=eval_id, model_name=eval_id, instance_id=instance_id)
-    if not out["report_found"]:
-        # No report.json means run_instance raised. Two very different causes land
-        # here and only the harness's own log separates them:
-        #   * the diff would not apply -- the agent wrote a bad patch. A genuine
-        #     reward 0, and cacheable; counting it as an eval error would put a
-        #     double-digit number into reward/eval_error_rate, the one metric that
-        #     is supposed to mean "stop the run, the grader is broken".
-        #   * anything else (docker, test timeout) -- a real eval error.
-        if _apply_failed(eval_id, instance_id):
-            out["patch_applied"] = False
-        else:
-            out["eval_error"] = (
-                f"harness produced no report (completed={bool(outcome and outcome.get('completed'))})"
-            )
-    _prune_eval_logs(eval_id, keep=bool(out["eval_error"]))
-    return out
+    # The prune has to be in a finally: anything raising between here and the
+    # report read (docker gone, a malformed report.json) would otherwise leave
+    # the tree behind forever, which is exactly how logs/run_evaluation grew to
+    # tens of MB of directories nobody reads. keep=True until proven otherwise,
+    # so a raise is the case AGENTIC_KEEP_FAILED_EVAL_LOGS=1 preserves.
+    keep = True
+    try:
+        # run_instance swallows every exception and returns completed=False, so its
+        # return value is the only in-band signal that grading did not happen.
+        outcome = run_instance(
+            test_spec=test_spec,
+            pred=prediction,
+            rm_image=False,        # reuse cached instance images across the run
+            force_rebuild=False,
+            client=client,
+            run_id=eval_id,
+            timeout=timeout,
+            rewrite_reports=False,
+        )
+        out = _read_harness_report(run_id=eval_id, model_name=eval_id, instance_id=instance_id)
+        if not out["report_found"]:
+            # No report.json means run_instance raised. Two very different causes land
+            # here and only the harness's own log separates them:
+            #   * the diff would not apply -- the agent wrote a bad patch. A genuine
+            #     reward 0, and cacheable; counting it as an eval error would put a
+            #     double-digit number into reward/eval_error_rate, the one metric that
+            #     is supposed to mean "stop the run, the grader is broken".
+            #   * anything else (docker, test timeout) -- a real eval error.
+            if _apply_failed(eval_id, instance_id):
+                out["patch_applied"] = False
+            else:
+                out["eval_error"] = (
+                    f"harness produced no report (completed={bool(outcome and outcome.get('completed'))})"
+                )
+        keep = bool(out["eval_error"])
+        return out
+    finally:
+        _prune_eval_logs(eval_id, keep=keep)
 
 
 def _apply_failed(eval_id: str, instance_id: str) -> bool:
@@ -339,9 +348,12 @@ def _prune_eval_logs(eval_id: str, keep: bool) -> None:
     A unique eval_id means a fresh directory per grading -- 2048 per step, each
     holding patch.diff, eval.sh, the full pytest output and run_instance.log. We
     have already extracted everything we need into RewardResult, so the tree is
-    dead weight; the only ones worth keeping are the failures.
+    dead weight. That went for the failures too: keeping them left 54MB of
+    logs/run_evaluation that no analysis ever opened, on the 99%-full repo disk.
+    Everything is pruned by default; set AGENTIC_KEEP_FAILED_EVAL_LOGS=1 to keep
+    the failing trees while actually debugging a grader problem.
     """
-    if keep and os.environ.get("AGENTIC_KEEP_FAILED_EVAL_LOGS", "1") != "0":
+    if keep and os.environ.get("AGENTIC_KEEP_FAILED_EVAL_LOGS", "0") != "0":
         return
     from swebench.harness.constants import RUN_EVALUATION_LOG_DIR  # type: ignore
 

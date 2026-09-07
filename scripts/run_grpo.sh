@@ -241,6 +241,8 @@ fi
 # EXPERIMENT_NAME and a resume must land in the ORIGINAL run's directory.
 # Note this is the repo disk (/ is ~99% full) -- logs are a few MB per run, but
 # checkpoints deliberately go to /data0 instead (see CKPT_ROOT above).
+# hydra.run.dir below is pointed here too, so the resolved config lands with the
+# run instead of in a parallel outputs/<date>/<time>/ tree at the repo root.
 RUN_DIR="${REPO_ROOT}/analysis/${EXPERIMENT_NAME}"
 mkdir -p "${RUN_DIR}"
 LOG_FILE="${RUN_DIR}/run${LOG_SUFFIX}.log"
@@ -409,12 +411,14 @@ python3 "${REPO_ROOT}/scripts/verl_entry.py" \
   trainer.total_training_steps="${TOTAL_STEPS}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.default_local_dir="${CKPT_ROOT}/${EXPERIMENT_NAME}" \
+  hydra.run.dir="${RUN_DIR}/hydra${LOG_SUFFIX}" \
   +ray_kwargs.ray_init.runtime_env.env_vars.PATH="${REPO_ROOT}/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_CONCURRENT_CONTAINERS=\"${AGENTIC_MAX_CONCURRENT_CONTAINERS}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_LIVE_CONTAINERS=\"${AGENTIC_MAX_LIVE_CONTAINERS}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_EVAL_CONTAINERS=\"${AGENTIC_MAX_EVAL_CONTAINERS}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_EVAL_TIMEOUT=\"${AGENTIC_EVAL_TIMEOUT}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_REWARD_CACHE_DIR=\"${AGENTIC_REWARD_CACHE_DIR}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_KEEP_FAILED_EVAL_LOGS=\"${AGENTIC_KEEP_FAILED_EVAL_LOGS:-0}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_CONTAINER_START_RETRIES=\"${AGENTIC_CONTAINER_START_RETRIES:-3}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.DOCKER_HOST=\"${DOCKER_HOST}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_CONTAINER_PROXY=\"${AGENTIC_CONTAINER_PROXY}\" \

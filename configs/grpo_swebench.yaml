@@ -4,9 +4,20 @@
 hydra:
   searchpath:
     - pkg://verl.trainer.config
+  # Hydra's default run dir is outputs/<date>/<time>/ under the CWD, i.e. the repo
+  # root. Nothing reads that tree: the resolved config is the only file in it with
+  # any value, and the <job>.log beside it is always 0 bytes because verl logs to
+  # stdout and Ray, not the root logger. run_grpo.sh points this at the run's own
+  # analysis/<experiment>/ directory so the config lands with the rest of the run;
+  # this default only keeps a bare `python3 scripts/verl_entry.py` from recreating
+  # outputs/ in the repo.
+  run:
+    dir: /tmp/hydra-verl/${now:%Y-%m-%d_%H-%M-%S}
 
 defaults:
   - ppo_trainer
+  # Console only -- drops the empty per-job file handler described above.
+  - override hydra/job_logging: stdout
   - _self_
 
 algorithm:
