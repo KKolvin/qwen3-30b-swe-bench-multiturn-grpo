@@ -1,0 +1,742 @@
+<title>Rollout Timeline</title>
+<style>
+  :root {
+    color-scheme: light;
+    --plane: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+    --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+    --crit: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --plane: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+      --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+      --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  }
+  body { background: var(--plane); color: var(--ink);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 20px 72px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0 0 2px; letter-spacing: -0.005em; }
+  .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 20px; }
+  .note { color: var(--ink-2); font-size: 12.5px; margin: 2px 0 14px; max-width: 74ch; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+          padding: 16px 18px 14px; margin: 0 0 16px; position: relative; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .row { grid-template-columns: 1fr; } }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 1px;
+           background: var(--border); border: 1px solid var(--border); border-radius: 10px;
+           overflow: hidden; margin: 0 0 16px; }
+  .tile { background: var(--surface); padding: 12px 14px; }
+  .tile .v { font-size: 21px; letter-spacing: -0.02em; }
+  .tile .k { font-size: 11.5px; color: var(--muted); text-transform: uppercase;
+             letter-spacing: 0.04em; margin-top: 2px; }
+  .tile .h { font-size: 11.5px; color: var(--ink-2); margin-top: 3px; }
+  .tabs { display: flex; gap: 6px; margin: 0 0 16px; flex-wrap: wrap; }
+  .tab { font: inherit; font-size: 13px; padding: 6px 13px; border-radius: 999px;
+         border: 1px solid var(--border); background: var(--surface); color: var(--ink-2);
+         cursor: pointer; }
+  .tab[aria-selected="true"] { background: var(--s1); border-color: var(--s1); color: #fff; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-2);
+            margin: 8px 0 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px;
+          font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--grid); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 11.5px; text-transform: uppercase;
+       letter-spacing: 0.04em; }
+  tr:last-child td { border-bottom: 0; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; font-size: 12.5px; color: var(--ink-2); }
+  .scroll { overflow-x: auto; }
+  .tip { position: absolute; pointer-events: none; opacity: 0; transition: opacity .08s;
+         background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+         padding: 7px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.14);
+         z-index: 5; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .tip b { font-weight: 600; }
+  svg text { font: 11.5px system-ui, -apple-system, sans-serif; }
+</style>
+
+<div class="wrap" id="app"></div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const SVG = "http://www.w3.org/2000/svg";
+const CAT = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"].map(v => `var(${v})`);
+
+/* ---------- formatting ---------- */
+const f1 = n => n.toLocaleString(undefined, {maximumFractionDigits: 1});
+const f0 = n => Math.round(n).toLocaleString();
+const pct = n => (n * 100).toFixed(n < 0.1 ? 1 : 0) + "%";
+function dur(s) {
+  if (s < 90) return f1(s) + "s";
+  const m = Math.floor(s / 60), r = Math.round(s % 60);
+  return m >= 60 ? `${Math.floor(m/60)}h ${m%60}m` : `${m}m ${r}s`;
+}
+function big(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(2) + "G";
+  if (n >= 1e6) return (n/1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n/1e3).toFixed(1) + "k";
+  return f0(n);
+}
+const h = (tag, attrs = {}, kids = []) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "html") e.innerHTML = v; else if (k === "text") e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const kid of [].concat(kids)) if (kid) e.appendChild(kid);
+  return e;
+};
+const s = (tag, attrs = {}) => {
+  const e = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+};
+function tip(host) {
+  const t = h("div", {class: "tip"});
+  host.appendChild(t);
+  return {
+    show(html, x, y) {
+      t.innerHTML = html; t.style.opacity = 1;
+      const w = t.offsetWidth, hh = t.offsetHeight, bw = host.clientWidth;
+      t.style.left = Math.max(4, Math.min(bw - w - 4, x - w / 2)) + "px";
+      t.style.top = Math.max(0, y - hh - 10) + "px";
+    },
+    hide() { t.style.opacity = 0; }
+  };
+}
+/* nice axis ticks */
+function ticks(max, n = 4) {
+  const raw = max / n, mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const step = [1, 2, 2.5, 5, 10].find(m => m * mag >= raw) * mag;
+  const out = [];
+  for (let v = 0; v <= max * 1.0001; v += step) out.push(v);
+  return out;
+}
+
+/* ---------- line chart: shared x, crosshair ---------- */
+function lineChart(host, cfg) {
+  const W = host.clientWidth, H = cfg.height || 190;
+  const M = {t: 10, r: 12, b: cfg.xAxis === false ? 8 : 26, l: 46};
+  const iw = Math.max(10, W - M.l - M.r), ih = H - M.t - M.b;
+  const xs = cfg.x, n = xs.length;
+  const xmax = xs[n - 1] || 1;
+  const ymax = cfg.ymax || Math.max(1, ...cfg.series.flatMap(se => se.v));
+  const X = v => M.l + (v / xmax) * iw, Y = v => M.t + ih - (v / ymax) * ih;
+  const yf = cfg.yFmt || big, xf = cfg.xFmt || dur;
+  const svg = s("svg", {width: W, height: H, role: "img", "aria-label": cfg.label || ""});
+
+  for (const t of ticks(ymax)) {
+    svg.appendChild(s("line", {x1: M.l, x2: M.l + iw, y1: Y(t), y2: Y(t),
+      stroke: "var(--grid)", "stroke-width": 1}));
+    const lab = s("text", {x: M.l - 8, y: Y(t) + 4, fill: "var(--muted)", "text-anchor": "end"});
+    lab.textContent = yf(t); svg.appendChild(lab);
+  }
+  if (cfg.xAxis !== false) {
+    for (const t of ticks(xmax)) {
+      const lab = s("text", {x: X(t), y: H - 8, fill: "var(--muted)", "text-anchor": "middle"});
+      lab.textContent = xf(t); svg.appendChild(lab);
+    }
+  }
+  for (const m of cfg.markers || []) {
+    if (m.x > xmax) continue;
+    svg.appendChild(s("line", {x1: X(m.x), x2: X(m.x), y1: M.t, y2: M.t + ih,
+      stroke: "var(--axis)", "stroke-width": 1.5, "stroke-dasharray": "4 4"}));
+    const lab = s("text", {x: X(m.x) + 5, y: M.t + 12, fill: "var(--ink-2)"});
+    lab.textContent = m.label; svg.appendChild(lab);
+  }
+  for (const se of cfg.series) {
+    let d = "";
+    for (let i = 0; i < n; i++) d += (i ? "L" : "M") + X(xs[i]).toFixed(1) + " " + Y(se.v[i]).toFixed(1);
+    if (se.fill) {
+      const a = s("path", {d: d + `L${X(xs[n-1])} ${Y(0)}L${X(xs[0])} ${Y(0)}Z`,
+        fill: se.color, opacity: 0.10});
+      svg.appendChild(a);
+    }
+    svg.appendChild(s("path", {d, fill: "none", stroke: se.color, "stroke-width": 2,
+      "stroke-linejoin": "round"}));
+  }
+  // crosshair
+  const cross = s("line", {y1: M.t, y2: M.t + ih, stroke: "var(--axis)", "stroke-width": 1, opacity: 0});
+  svg.appendChild(cross);
+  const dots = cfg.series.map(se => {
+    const c = s("circle", {r: 4.5, fill: se.color, stroke: "var(--surface)", "stroke-width": 2, opacity: 0});
+    svg.appendChild(c); return c;
+  });
+  const tp = tip(host);
+  svg.addEventListener("pointermove", ev => {
+    const r = svg.getBoundingClientRect();
+    const px = ev.clientX - r.left;
+    const i = Math.max(0, Math.min(n - 1, Math.round(((px - M.l) / iw) * xmax / (xs[1] - xs[0]))));
+    cross.setAttribute("x1", X(xs[i])); cross.setAttribute("x2", X(xs[i]));
+    cross.setAttribute("opacity", 1);
+    cfg.series.forEach((se, k) => {
+      dots[k].setAttribute("cx", X(xs[i])); dots[k].setAttribute("cy", Y(se.v[i]));
+      dots[k].setAttribute("opacity", 1);
+    });
+    tp.show(`<b>${xf(xs[i])}</b> ${cfg.xName || "into rollout"}<br>` + cfg.series.map(se =>
+      `<span class="swatch" style="background:${se.color}"></span> ${se.name} <b>${cfg.fmt ? cfg.fmt(se.v[i]) : f0(se.v[i])}</b>`
+    ).join("<br>"), px, ev.clientY - r.top);
+  });
+  svg.addEventListener("pointerleave", () => {
+    cross.setAttribute("opacity", 0); dots.forEach(d => d.setAttribute("opacity", 0)); tp.hide();
+  });
+  host.appendChild(svg);
+  if (cfg.series.length > 1) {
+    host.appendChild(h("div", {class: "legend"}, cfg.series.map(se =>
+      h("span", {html: `<span class="swatch" style="background:${se.color}"></span>${se.name}`}))));
+  }
+}
+
+/* ---------- vertical bars ---------- */
+function barChart(host, cfg) {
+  const W = host.clientWidth, H = cfg.height || 190;
+  const M = {t: 14, r: 10, b: 40, l: 46};
+  const iw = Math.max(10, W - M.l - M.r), ih = H - M.t - M.b;
+  const items = cfg.items, ymax = Math.max(1, ...items.map(d => d.value));
+  const bw = iw / items.length, pad = Math.min(10, bw * 0.22);
+  const Y = v => M.t + ih - (v / ymax) * ih;
+  const svg = s("svg", {width: W, height: H});
+  for (const t of ticks(ymax)) {
+    svg.appendChild(s("line", {x1: M.l, x2: M.l + iw, y1: Y(t), y2: Y(t), stroke: "var(--grid)"}));
+    const lab = s("text", {x: M.l - 8, y: Y(t) + 4, fill: "var(--muted)", "text-anchor": "end"});
+    lab.textContent = big(t); svg.appendChild(lab);
+  }
+  svg.appendChild(s("line", {x1: M.l, x2: M.l + iw, y1: Y(0), y2: Y(0), stroke: "var(--axis)"}));
+  const tp = tip(host);
+  items.forEach((d, i) => {
+    const x = M.l + i * bw + pad / 2, w = bw - pad;
+    const hh = Math.max(1.5, ih * (d.value / ymax));
+    const r = s("rect", {x, y: Y(d.value), width: w, height: hh, rx: Math.min(4, w / 2),
+      fill: d.color || cfg.color || CAT[0]});
+    r.addEventListener("pointerenter", ev => {
+      const b = svg.getBoundingClientRect();
+      tp.show(`<b>${d.label}</b><br>${cfg.valueName || ""} <b>${cfg.fmt ? cfg.fmt(d.value) : f0(d.value)}</b>` +
+        (d.sub ? `<br>${d.sub}` : ""), x + w / 2, ev.clientY - b.top);
+    });
+    r.addEventListener("pointerleave", () => tp.hide());
+    svg.appendChild(r);
+    const lab = s("text", {x: x + w / 2, y: H - 24, fill: "var(--muted)", "text-anchor": "middle"});
+    lab.textContent = d.label; svg.appendChild(lab);
+    if (d.foot) {
+      const f = s("text", {x: x + w / 2, y: H - 9, fill: "var(--muted)", "text-anchor": "middle"});
+      f.textContent = d.foot; svg.appendChild(f);
+    }
+  });
+  host.appendChild(svg);
+}
+
+/* ---------- horizontal stacked bar ---------- */
+function stackBar(host, cfg) {
+  const W = host.clientWidth, H = cfg.height || 30;
+  const total = cfg.segments.reduce((a, d) => a + d.value, 0) || 1;
+  const scale = cfg.total || total;
+  const svg = s("svg", {width: W, height: H});
+  const tp = tip(host);
+  let x = 0;
+  cfg.segments.forEach((d, i) => {
+    const w = Math.max(0, (d.value / scale) * W - 2);
+    const r = s("rect", {x, y: 0, width: w, height: H, rx: 3, fill: d.color || CAT[i]});
+    r.addEventListener("pointerenter", ev => {
+      const b = svg.getBoundingClientRect();
+      tp.show(`<span class="swatch" style="background:${d.color || CAT[i]}"></span> <b>${d.label}</b><br>` +
+        `${cfg.fmt ? cfg.fmt(d.value) : dur(d.value)} · ${pct(d.value / scale)}`, x + w / 2, ev.clientY - b.top);
+    });
+    r.addEventListener("pointerleave", () => tp.hide());
+    svg.appendChild(r);
+    x += (d.value / scale) * W;
+  });
+  host.appendChild(svg);
+  if (cfg.legend !== false) {
+    host.appendChild(h("div", {class: "legend"}, cfg.segments.map((d, i) =>
+      h("span", {html: `<span class="swatch" style="background:${d.color || CAT[i]}"></span>` +
+        `${d.label} <b>${pct(d.value / total)}</b> ` +
+        `<span style="color:var(--muted)">${cfg.fmt ? cfg.fmt(d.value) : dur(d.value)}</span>`}))));
+  }
+}
+
+/* ---------- trajectory trace: one row per episode, zoom + pan ---------- */
+const KIND_COLOR = ["", "--axis", "--s3", "--s1", "--s2", "--s7", "--muted", "--s4"];
+const KIND_LABEL = ["gap", "waiting for a slot", "container start", "generate", "tool call",
+                    "grading", "cleanup", "patch recovery"];
+
+function traceView(host, st) {
+  const css = getComputedStyle(document.documentElement);
+  const col = v => css.getPropertyValue(v).trim() || "#888";
+  const colors = KIND_COLOR.map(v => v ? col(v) : null);
+  const surface = col("--surface"), grid = col("--grid"), ink2 = col("--ink-2"), muted = col("--muted");
+
+  for (const r of st.trace) {
+    if (r.T === undefined) r.T = r.d.reduce((x, v, i) => i % 2 ? x + v : x, 0);
+  }
+  const rowsByStart = st.trace;
+  const rowsByDur = st.trace.slice().sort((a, b) => b.T - a.T);
+  let rows = rowsByStart, sortMode = "start";
+  // A row runs past its episode envelope: grading happens after the agent loop
+  // is done, and it is the last of those verdicts that the step barrier waits on.
+  const genEnd = (st.gen_dur - st.t_offset) * 1000;
+  const span = Math.max(st.span * 1000, genEnd, ...st.trace.map(r => r.s + r.T));
+  const H = 520;
+  let W = Math.max(320, host.clientWidth);
+  let vx0 = 0, vx1 = span;          // visible time window, ms
+  let rowTop = 0, rowH = H / rows.length;  // first visible row (fractional) and px per row
+
+  const bar = h("div", {style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 8px"});
+  const mk = (label, fn) => { const b = h("button", {class: "tab", text: label}); b.onclick = fn; return b; };
+  const sortBtn = mk("sort: admission order", () => {
+    sortMode = sortMode === "start" ? "dur" : "start";
+    rows = sortMode === "start" ? rowsByStart : rowsByDur;
+    sortBtn.textContent = "sort: " + (sortMode === "start" ? "admission order" : "longest first");
+    draw();
+  });
+  bar.appendChild(sortBtn);
+  bar.appendChild(mk("reset zoom", () => { vx0 = 0; vx1 = span; rowTop = 0; rowH = H / rows.length; draw(); }));
+  bar.appendChild(h("span", {style: "font-size:12px;color:var(--muted)",
+    text: "wheel = zoom time · shift+wheel = scroll rows · ctrl+wheel = zoom rows · drag = pan"}));
+  host.appendChild(bar);
+
+  const canvas = h("canvas", {style: `width:100%;height:${H}px;display:block;cursor:crosshair;` +
+    `border:1px solid var(--border);border-radius:8px;background:var(--surface)`});
+  host.appendChild(canvas);
+  host.appendChild(h("div", {class: "legend"}, [1, 2, 3, 4, 5, 6, 7].map(k =>
+    h("span", {html: `<span class="swatch" style="background:${colors[k]}"></span>${KIND_LABEL[k]}`}))));
+  const tp = tip(host);
+  const ctx = canvas.getContext("2d");
+
+  function gutter() { return rowH >= 9 ? Math.min(200, W * 0.22) : 0; }
+  const X = t => gutter() + ((t - vx0) / (vx1 - vx0)) * (W - gutter());
+  const T = x => vx0 + ((x - gutter()) / (W - gutter())) * (vx1 - vx0);
+
+  let pending = false;
+  function draw() {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; paint(); });
+  }
+  function paint() {
+    const dpr = window.devicePixelRatio || 1;
+    W = Math.max(320, host.clientWidth);
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const g = gutter(), plotW = W - g;
+    const scale = plotW / (vx1 - vx0);
+
+    // time grid
+    ctx.font = "11.5px system-ui, sans-serif"; ctx.textBaseline = "top";
+    ctx.strokeStyle = grid; ctx.fillStyle = muted; ctx.lineWidth = 1;
+    const tk = ticks((vx1 - vx0) / 1000, 6);
+    const tstep = ((tk[1] || 1) - (tk[0] || 0)) * 1000;
+    for (let v = Math.ceil(vx0 / tstep) * tstep; v <= vx1 && tstep > 0; v += tstep) {
+      const x = Math.round(X(v)) + 0.5;
+      if (x < g) continue;
+      ctx.beginPath(); ctx.moveTo(x, 16); ctx.lineTo(x, H); ctx.stroke();
+      ctx.fillText(dur(v / 1000), x + 4, 2);
+    }
+    // reference instants: a perfect packing, and the end of the trainer's gen phase
+    ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = ink2;
+    for (const m of [[st.ideal_s * 1000, "perfect packing"], [genEnd, "generate phase ends"]]) {
+      const xi = X(m[0]);
+      if (xi <= g || xi > W) continue;
+      ctx.beginPath(); ctx.moveTo(xi, 16); ctx.lineTo(xi, H); ctx.stroke();
+      ctx.fillStyle = ink2; ctx.fillText(m[1], Math.min(xi + 4, W - 100), 2);
+      ctx.fillStyle = muted;
+    }
+    ctx.restore();
+
+    // rows -- batched per kind so the fill style is set 7 times, not 180,000
+    const top = 18;
+    const first = Math.max(0, Math.floor(rowTop));
+    const last = Math.min(rows.length, Math.ceil(rowTop + (H - top) / rowH));
+    const buckets = colors.map(() => []);
+    // No minimum height: a sub-pixel row antialiases to its true share of the pixel,
+    // so 2,000 rows read as density instead of smearing over each other.
+    const rh = rowH > 3 ? rowH - 1 : rowH;  // 1px lane gap once rows are tall enough
+    const acc = new Float64Array(colors.length);
+
+    for (let i = first; i < last; i++) {
+      const r = rows[i], y = top + (i - rowTop) * rowH, d = r.d;
+      // Sub-pixel segments are not widened to a visible sliver -- that would paint
+      // 3% of the wall clock as half the row. Each pixel column instead shows the
+      // kind that owns the most of it, so a zoomed-out row is honest by area.
+      let t = r.s, col = -1, runK = 0, runX0 = 0, runX1 = 0;
+      // adjacent same-kind pixels become one rect: ~4x fewer fills per frame
+      const emit = (kind, x0, x1) => {
+        if (kind === runK && x0 - runX1 < 0.51) { runX1 = Math.max(runX1, x1); return; }
+        if (runK) buckets[runK].push(g + runX0, y, Math.max(0.7, runX1 - runX0), rh);
+        runK = kind; runX0 = x0; runX1 = x1;
+      };
+      const flush = () => {
+        if (col < 0) return;
+        let best = 0, bv = 0;
+        for (let k = 0; k < acc.length; k++) { if (acc[k] > bv) { bv = acc[k]; best = k; } acc[k] = 0; }
+        emit(best, col, col + 1);
+        col = -1;
+      };
+      for (let k = 0; k < d.length; k += 2) {
+        const kind = d[k], t1 = t + d[k + 1];
+        if (t > vx1) break;
+        if (t1 > vx0) {
+          // charge every pixel column for the share of it this segment covers, so
+          // the winner of a column is the kind that really owns most of that column
+          let x = Math.max(0, (t - vx0) * scale);
+          const x1 = Math.min(plotW, (t1 - vx0) * scale);
+          while (x < x1) {
+            const c = Math.floor(x), nx = Math.min(x1, c + 1);
+            if (c !== col) { flush(); col = c; }
+            acc[kind] += nx - x;
+            x = nx === x ? x + 1e-6 : nx;
+          }
+        }
+        t = t1;
+      }
+      flush();
+      emit(0, 0, 0);  // close the last run
+    }
+    for (let k = 1; k < buckets.length; k++) {
+      const b = buckets[k];
+      if (!b.length) continue;
+      ctx.fillStyle = colors[k];
+      for (let j = 0; j < b.length; j += 4) ctx.fillRect(b[j], b[j + 1], b[j + 2], b[j + 3]);
+    }
+    // row labels, once there is room for them
+    if (g) {
+      ctx.fillStyle = ink2; ctx.textBaseline = "middle";
+      ctx.save(); ctx.beginPath(); ctx.rect(0, top, g - 6, H - top); ctx.clip();
+      for (let i = first; i < last; i++) {
+        const y = top + (i - rowTop) * rowH + rowH / 2;
+        if (rowH >= 11) ctx.fillText(DATA.instances[rows[i].i], 6, y);
+      }
+      ctx.restore();
+      ctx.strokeStyle = grid; ctx.beginPath(); ctx.moveTo(g - 0.5, top); ctx.lineTo(g - 0.5, H); ctx.stroke();
+    }
+    ctx.fillStyle = muted; ctx.textBaseline = "top";
+    ctx.fillText(`${first + 1}–${Math.min(last, rows.length)} of ${rows.length} episodes`, g + 6, H - 16);
+  }
+
+  function rowAt(y) {
+    const i = Math.floor(rowTop + (y - 18) / rowH);
+    return i >= 0 && i < rows.length ? i : -1;
+  }
+  canvas.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const r = canvas.getBoundingClientRect();
+    const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    if (ev.ctrlKey || ev.metaKey) {                 // zoom rows around the pointer
+      const anchor = rowTop + (my - 18) / rowH;
+      rowH = Math.max(H / rows.length, Math.min(26, rowH * Math.pow(1.0022, -ev.deltaY)));
+      rowTop = Math.max(0, Math.min(rows.length - (H - 18) / rowH, anchor - (my - 18) / rowH));
+    } else if (ev.shiftKey) {                        // scroll rows
+      rowTop = Math.max(0, Math.min(Math.max(0, rows.length - (H - 18) / rowH),
+        rowTop + ev.deltaY / rowH * 0.5));
+    } else {                                         // zoom time around the pointer
+      const t = T(mx), f = Math.pow(1.0022, ev.deltaY);
+      let a = t - (t - vx0) * f, b = t + (vx1 - t) * f;
+      if (b - a < 200) { const c = (a + b) / 2; a = c - 100; b = c + 100; }
+      vx0 = Math.max(0, a); vx1 = Math.min(span, b);
+      if (vx1 <= vx0) { vx0 = 0; vx1 = span; }
+    }
+    draw();
+  }, {passive: false});
+
+  let drag = null;
+  canvas.addEventListener("pointerdown", ev => {
+    drag = {x: ev.clientX, y: ev.clientY, vx0, vx1, rowTop};
+    canvas.setPointerCapture(ev.pointerId); canvas.style.cursor = "grabbing";
+  });
+  canvas.addEventListener("pointerup", ev => {
+    drag = null; canvas.style.cursor = "crosshair";
+    canvas.releasePointerCapture(ev.pointerId);
+  });
+  canvas.addEventListener("dblclick", () => {
+    vx0 = 0; vx1 = span; rowTop = 0; rowH = H / rows.length; draw();
+  });
+  canvas.addEventListener("pointerleave", () => tp.hide());
+  canvas.addEventListener("pointermove", ev => {
+    const r = canvas.getBoundingClientRect();
+    const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    if (drag) {
+      const w = vx1 - vx0, dx = (ev.clientX - drag.x) / (W - gutter()) * w;
+      vx0 = Math.max(0, drag.vx0 - dx); vx1 = Math.min(span, drag.vx1 - dx);
+      if (vx1 - vx0 < w) { if (vx0 <= 0) vx1 = w; else vx0 = span - w; }
+      rowTop = Math.max(0, Math.min(Math.max(0, rows.length - (H - 18) / rowH),
+        drag.rowTop - (ev.clientY - drag.y) / rowH));
+      draw(); tp.hide(); return;
+    }
+    const i = rowAt(my);
+    if (i < 0) { tp.hide(); return; }
+    const row = rows[i], t = T(mx);
+    let acc = row.s, seg = null, turn = 0, tool = 0, ti = 0;
+    for (let k = 0; k < row.d.length; k += 2) {
+      if (row.d[k] === 3) turn++;
+      if (row.d[k] === 4) ti++;
+      if (t >= acc && t < acc + row.d[k + 1]) {
+        seg = {kind: row.d[k], ms: row.d[k + 1], turn, tool: ti - 1};
+        break;
+      }
+      acc += row.d[k + 1];
+    }
+    const total = row.T;
+    const toolName = seg && seg.kind === 4 && row.tt[seg.tool] !== undefined
+      ? " · " + DATA.tool_names[row.tt[seg.tool]] : "";
+    tp.show(
+      `<b>${DATA.instances[row.i]}</b><br>` +
+      `${row.x} · ${row.n} turns · reward ${row.r.toFixed(2)} · ${dur(total / 1000)}<br>` +
+      `starts ${dur(row.s / 1000)} into the rollout` +
+      (seg ? `<br><span class="swatch" style="background:${colors[seg.kind]}"></span> ` +
+        `${KIND_LABEL[seg.kind]}${toolName} <b>${dur(seg.ms / 1000)}</b>` +
+        (seg.kind === 3 || seg.kind === 4 ? ` · turn ${seg.turn}` : "") : ""),
+      mx, my);
+  });
+  draw();
+}
+
+function card(title, note) {
+  const c = h("div", {class: "card"});
+  if (title) c.appendChild(h("h2", {text: title}));
+  if (note) c.appendChild(h("p", {class: "note", html: note}));
+  const body = h("div");
+  c.appendChild(body);
+  return {card: c, body};
+}
+function tiles(rows) {
+  return h("div", {class: "tiles"}, rows.map(r =>
+    h("div", {class: "tile"}, [h("div", {class: "v", text: r.v}),
+      h("div", {class: "k", text: r.k}), r.h ? h("div", {class: "h", text: r.h}) : null])));
+}
+
+/* ---------- page ---------- */
+const PHASES = [
+  ["gen", "rollout", CAT[0]],
+  ["old_log_prob", "old log-prob", CAT[1]],
+  ["ref", "ref log-prob", CAT[2]],
+  ["adv", "advantage", CAT[3]],
+  ["update_actor", "actor update", CAT[4]],
+  ["update_weights", "weight sync", CAT[5]],
+];
+const app = document.getElementById("app");
+let current = DATA.steps.length > 1 ? 1 : 0;
+
+function runHeader() {
+  const trainSteps = DATA.steps.filter(st => st.phases.step);
+  const genShare = trainSteps.length
+    ? trainSteps.reduce((a, st) => a + st.phases.gen.dur / st.phases.step.dur, 0) / trainSteps.length : 0;
+  app.appendChild(h("h1", {text: `Rollout timeline · ${DATA.experiment}`}));
+  app.appendChild(h("p", {class: "sub", text:
+    `${dur(DATA.t_end - DATA.t_start)} of wall clock · ${DATA.steps.length} rollout phases · ` +
+    `${f0(DATA.steps.reduce((a, st) => a + st.episodes, 0))} episodes · ` +
+    `${big(DATA.steps.reduce((a, st) => a + st.out_tok, 0))} decoded tokens`}));
+
+  if (!trainSteps.length) return;
+  const c = card("Where a training step's wall clock goes",
+    `Rollout is <b>${pct(genShare)}</b> of the step; the rest is the training half — no episode is running ` +
+    `during it, and the inference server is idle. Bars share one scale, so step length is comparable.`);
+  for (const st of trainSteps) {
+    const segs = PHASES.filter(([k]) => st.phases[k]).map(([k, name, color]) =>
+      ({label: name, value: st.phases[k].dur, color}));
+    const acc = segs.reduce((a, d) => a + d.value, 0);
+    if (st.phases.step.dur - acc > 1) segs.push({label: "other", value: st.phases.step.dur - acc, color: "var(--axis)"});
+    const row = h("div", {style: "margin: 10px 0 0"});
+    row.appendChild(h("div", {style: "font-size:12.5px;color:var(--ink-2);margin-bottom:4px",
+      text: `step ${st.step} · ${dur(st.phases.step.dur)}`}));
+    const holder = h("div", {style: "position:relative"});
+    row.appendChild(holder);
+    c.body.appendChild(row);
+    queueMicrotask(() => stackBar(holder, {segments: segs, height: 26,
+      total: Math.max(...trainSteps.map(x => x.phases.step.dur)),
+      legend: st === trainSteps[trainSteps.length - 1]}));
+  }
+  app.appendChild(c.card);
+}
+
+function stepTabs() {
+  const bar = h("div", {class: "tabs", role: "tablist"});
+  DATA.steps.forEach((st, i) => {
+    const label = st.phase === "val" ? `validation (step ${st.step})` : `step ${st.step}`;
+    const b = h("button", {class: "tab", role: "tab", text: label});
+    b.setAttribute("aria-selected", i === current);
+    b.onclick = () => { current = i; render(); };
+    bar.appendChild(b);
+  });
+  app.appendChild(bar);
+}
+
+function stepView(st) {
+  const wrap = h("div");
+  const ideal = st.ideal_s, waste = st.tail_waste_s;
+  wrap.appendChild(tiles([
+    {v: dur(st.span), k: "rollout span", h: `${f0(st.episodes)} episodes`},
+    {v: f1(st.rates.ep_min), k: "episodes / min", h: `${st.slots} container slots`},
+    {v: big(st.rates.tok_s), k: "decode tok/s", h: `${big(st.out_tok)} tokens`},
+    {v: f0(st.rates.mean_inflight), k: "mean in-flight", h: `peak ${st.peak_inflight}`},
+    {v: dur(waste), k: "tail waste", h: `${pct(waste / st.span)} of the span`},
+    {v: dur(st.durations.p50), k: "median episode", h: `p99 ${dur(st.durations.p99)}`},
+    {v: pct(st.rates.resolved), k: "resolved", h: `mean reward ${st.rates.reward.toFixed(2)}`},
+    {v: f1(st.rates.turns), k: "turns / episode", h: `${f0(st.rates.tok_per_req)} tok / turn`},
+  ]));
+
+  // --- the trace itself: one row per trajectory
+  if (st.grade_share === undefined) {
+    let g = 0, t = 0;
+    for (const r of st.trace) for (let k = 0; k < r.d.length; k += 2) {
+      t += r.d[k + 1]; if (r.d[k] === 5) g += r.d[k + 1];
+    }
+    st.grade_share = g / t;
+  }
+  const tr = card("Trajectory trace",
+    `Every one of the ${f0(st.episodes)} episodes as its own row, admitted top to bottom, on the rollout's ` +
+    `own clock. Zoom in far enough and a row resolves into its turns: generate, tool call, generate. ` +
+    `A row runs past the end of its episode because grading happens after the agent loop stops: ` +
+    `<b>${pct(st.grade_share)}</b> of the traced time, and the step waits on the last verdict — which is ` +
+    `why the generate phase ends <b>${dur(st.gen_dur - st.t_offset - st.span)}</b> after the last episode.`);
+  const trHost = h("div", {style: "position:relative"});
+  tr.body.appendChild(trHost);
+  wrap.appendChild(tr.card);
+  queueMicrotask(() => traceView(trHost, st));
+
+  // --- occupancy + throughput, shared x
+  const xs = st.series.episodes.map((_, i) => i * st.dt);
+  const occ = card("Rollout occupancy over the span",
+    `Concurrent episodes and the requests actually in flight on the server, sampled every ${f1(st.dt)}s. ` +
+    `The dashed line is where a perfect packing of the same episode-seconds into ${st.slots} slots would ` +
+    `have finished — everything right of it is drain, <b>${dur(waste)}</b> of it.`);
+  const occHost = h("div", {style: "position:relative"});
+  occ.body.appendChild(occHost);
+  const thrHost = h("div", {style: "position:relative"});
+  occ.body.appendChild(h("div", {style: "font-size:12.5px;color:var(--ink-2);margin:14px 0 -4px",
+    text: "decode throughput, cluster-wide (tok/s)"}));
+  occ.body.appendChild(thrHost);
+  wrap.appendChild(occ.card);
+  queueMicrotask(() => {
+    lineChart(occHost, {x: xs, height: 200, xAxis: false,
+      markers: [{x: ideal, label: "perfect packing ends"}],
+      series: [{name: "episodes running", color: CAT[0], v: st.series.episodes, fill: true},
+               {name: "requests in flight", color: CAT[1], v: st.series.inflight}]});
+    lineChart(thrHost, {x: xs, height: 150,
+      markers: [{x: ideal, label: ""}], fmt: v => f0(v) + " tok/s",
+      series: [{name: "decode tok/s", color: CAT[0], v: st.series.tok_s, fill: true}]});
+  });
+
+  // --- throughput vs concurrency
+  const row = h("div", {class: "row"});
+  const thr = card("Cluster throughput by in-flight band",
+    "What the server delivers at each load regime. Batching is the whole story.");
+  const lat = card("Per-request decode latency by band",
+    "The same regimes, per request: 5× slower per token at the plateau, and that is the trade.");
+  const thrB = h("div", {style: "position:relative"}), latB = h("div", {style: "position:relative"});
+  thr.body.appendChild(thrB); lat.body.appendChild(latB);
+  row.appendChild(thr.card); row.appendChild(lat.card);
+  wrap.appendChild(row);
+  queueMicrotask(() => {
+    barChart(thrB, {height: 200, color: CAT[0], valueName: "decode", fmt: v => f0(v) + " tok/s",
+      items: st.bands.map(b => ({label: b.label, value: b.tok_s, foot: pct(b.pct_span) + " of span",
+        sub: `${pct(b.pct_tok)} of the step's tokens`}))});
+    barChart(latB, {height: 200, color: CAT[1], valueName: "latency", fmt: v => f1(v) + " ms/tok",
+      items: st.bands.map(b => ({label: b.label, value: b.ms_per_tok, foot: f0(b.requests) + " req",
+        sub: `${big(b.tokens)} tokens`}))});
+  });
+
+  // --- durations
+  const dcard = card("Episode duration, ordered",
+    `Every episode sorted shortest to longest. Median <b>${dur(st.durations.p50)}</b>, ` +
+    `p90 <b>${dur(st.durations.p90)}</b>, p99 <b>${dur(st.durations.p99)}</b>, ` +
+    `max <b>${dur(st.durations.max)}</b> — a ${f1(st.durations.p99 / st.durations.p50)}× straggler ratio.`);
+  const dHost = h("div", {style: "position:relative"});
+  dcard.body.appendChild(dHost);
+  wrap.appendChild(dcard.card);
+  queueMicrotask(() => lineChart(dHost, {x: st.durations.curve.map((_, i) => i / 3), height: 200,
+    xFmt: v => f0(v) + "%", yFmt: dur, xName: "of episodes are shorter than", fmt: dur,
+    markers: [{x: 50, label: "p50"}, {x: 90, label: "p90"}, {x: 99, label: "p99"}],
+    series: [{name: "episode duration", color: CAT[0], v: st.durations.curve, fill: true}]}));
+
+  // --- where the seconds go
+  const row2 = h("div", {class: "row"});
+  const ew = card("Episode wall clock",
+    "Summed over every episode. An episode is decode; tool execution barely registers.");
+  const rw = card("Request wall clock",
+    "Summed over every server request. Queueing is small — the batch is admission-limited, not server-limited.");
+  const ewH = h("div", {style: "position:relative"}), rwH = h("div", {style: "position:relative"});
+  ew.body.appendChild(ewH); rw.body.appendChild(rwH);
+  row2.appendChild(ew.card); row2.appendChild(rw.card);
+  wrap.appendChild(row2);
+  queueMicrotask(() => {
+    stackBar(ewH, {height: 30, segments: [
+      {label: "decode", value: st.ep_wall.decode, color: CAT[0]},
+      {label: "tool", value: st.ep_wall.tool, color: CAT[1]},
+      {label: "other", value: st.ep_wall.other, color: CAT[2]}]});
+    stackBar(rwH, {height: 30, segments: [
+      {label: "decode", value: st.req_time.decode, color: CAT[0]},
+      {label: "prefill", value: st.req_time.prefill, color: CAT[1]},
+      {label: "queue", value: st.req_time.queue, color: CAT[2]}]});
+  });
+
+  // --- outcomes + tools
+  const row3 = h("div", {class: "row"});
+  const ex = card("How episodes ended",
+    `<b>${pct((st.exits.find(e => e[0] === "Submitted") || [0, 0])[1] / st.episodes)}</b> ` +
+    `reached the submit tool; every other status is an episode a guard stopped.`);
+  const tl = card("Tool calls",
+    `${f0(st.tools.reduce((a, t) => a + t.calls, 0))} calls, ` +
+    `${dur(st.tools.reduce((a, t) => a + t.s, 0))} of wall clock in total.`);
+  const exH = h("div", {style: "position:relative"}), tlH = h("div", {style: "position:relative"});
+  ex.body.appendChild(exH); tl.body.appendChild(tlH);
+  row3.appendChild(ex.card); row3.appendChild(tl.card);
+  wrap.appendChild(row3);
+  queueMicrotask(() => {
+    barChart(exH, {height: 190, color: CAT[0], valueName: "episodes", fmt: f0,
+      items: st.exits.map(([k, v]) => ({label: k.replace(/Limit$/, ""), value: v,
+        foot: pct(v / st.episodes), sub: k}))});
+    // Only the real tools get their own bar -- the long tail is names the model
+    // invented, which matter as a count, not as 12 one-call categories.
+    const top = st.tools.slice(0, 5), rest = st.tools.slice(5);
+    const items = top.map(t => ({label: t.tool.replace("str_replace_based_edit_tool", "edit"),
+      value: t.calls, foot: dur(t.s), sub: `${f1(t.s / t.calls * 1000)} ms mean`}));
+    if (rest.length) items.push({label: `other (${rest.length})`,
+      value: rest.reduce((a, t) => a + t.calls, 0), foot: dur(rest.reduce((a, t) => a + t.s, 0)),
+      sub: rest.slice(0, 6).map(t => `${t.tool} ${t.calls}`).join(", ")});
+    barChart(tlH, {height: 190, color: CAT[1], valueName: "calls", fmt: f0, items});
+  });
+
+  // --- table view (accessibility + the numbers)
+  const tbl = card("Band table", "The same in-flight bands as numbers.");
+  const head = ["in-flight", "wall s", "% span", "requests", "tokens", "% tok", "ms/tok/req", "tok/s"];
+  const t = h("table", {}, [h("thead", {}, h("tr", {}, head.map(x => h("th", {text: x}))))]);
+  t.appendChild(h("tbody", {}, st.bands.map(b => h("tr", {}, [
+    h("td", {text: b.label}), h("td", {text: f0(b.wall)}), h("td", {text: pct(b.pct_span)}),
+    h("td", {text: f0(b.requests)}), h("td", {text: f0(b.tokens)}), h("td", {text: pct(b.pct_tok)}),
+    h("td", {text: f1(b.ms_per_tok)}), h("td", {text: f0(b.tok_s)})]))));
+  tbl.body.appendChild(h("div", {class: "scroll"}, t));
+  tbl.body.appendChild(h("p", {class: "note", style: "margin-top:10px", html:
+    `Prefill: <b>${big(st.prompt_tok)}</b> prompt tokens seen, <b>${pct(st.cached_tok / st.prompt_tok)}</b> ` +
+    `served from the prefix cache, leaving <b>${big((st.prompt_tok - st.cached_tok) / st.span)}</b> tok/s of real prefill.`}));
+  wrap.appendChild(tbl.card);
+  return wrap;
+}
+
+function render() {
+  app.innerHTML = "";
+  runHeader();
+  stepTabs();
+  app.appendChild(stepView(DATA.steps[current]));
+}
+render();
+let rt;
+addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(render, 150); });
+</script>
