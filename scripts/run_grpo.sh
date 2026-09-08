@@ -341,7 +341,9 @@ if [ "${AGENTIC_TIMELINE:-1}" != "0" ]; then
         python3 "${REPO_ROOT}/scripts/build_metrics_csv.py" --log "${LOG_FILE}" 2>&1 | tee -a "${LOG_FILE}" || true
         python3 "${REPO_ROOT}/scripts/profile_rollout.py" --dir "${AGENTIC_TIMELINE_DIR}" \
         > "${RUN_DIR}/profile.txt" 2>&1 || true
-        tee -a "${LOG_FILE}" < "${RUN_DIR}/profile.txt" || true' EXIT
+        tee -a "${LOG_FILE}" < "${RUN_DIR}/profile.txt" || true
+        python3 "${REPO_ROOT}/scripts/plot_timeline.py" --dir "${AGENTIC_TIMELINE_DIR}" \
+        --out "${RUN_DIR}/timeline.html" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
 else
   # No timeline trap to piggyback on -- still want metrics.csv from every run.
   trap 'python3 "${REPO_ROOT}/scripts/build_metrics_csv.py" --log "${LOG_FILE}" 2>&1 | tee -a "${LOG_FILE}" || true' EXIT
