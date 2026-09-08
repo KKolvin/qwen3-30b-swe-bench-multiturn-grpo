@@ -11,6 +11,18 @@ endpoint (launch with ``--enable-metrics``):
 * ``sglang:gen_throughput``   - decode tokens/s
 * ``sglang:token_usage``      - KV-cache utilisation
 
+Token accounting moved between SGLang versions and this is a live hazard: the
+build in use (2026-09) publishes one ``sglang:realtime_tokens_total`` counter
+split by a ``mode`` label (``prefill_compute`` / ``prefill_cache`` / ``decode``)
+instead of the separate ``prompt_tokens_total`` / ``cached_tokens_total`` /
+``generation_tokens_total`` counters, and has dropped the TTFT, inter-token and
+end-to-end latency histograms outright. Run 20260908-052218 reported six srv/*
+fields as a clean 0.0 for two whole steps because of that rename -- a zero is
+indistinguishable from an idle server. Lookups therefore take a list of
+candidate names, and anything with no source is OMITTED from the payload (with a
+one-time warning) rather than defaulted. ``tests/test_server_monitor.py`` pins
+this against a captured payload.
+
 :class:`SGLangServerMonitor` polls that endpoint on a background thread (~1 req/s,
 negligible) and locates the drain start as the last instant the server was still
 saturated - i.e. the last sample with ``num_queue_reqs > 0`` or
@@ -23,6 +35,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import threading
 import time
 import urllib.request
@@ -41,21 +54,39 @@ _PREFIX = "sglang:"
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+# Labels that SPLIT a metric into different quantities rather than into replicas
+# of the same one. Summing over tp_rank/pp_rank/moe_ep_rank is right (they are
+# parallel shards of one server), but summing over these would add unlike things
+# -- ``realtime_tokens_total`` carries prompt and generated tokens in the SAME
+# metric, separated only by ``mode``. For each of these a label-qualified key
+# ``name|label=value`` is emitted alongside the summed bare name.
+_SPLIT_LABELS = ("mode", "stage")
+
+_LABEL_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"')
+
+
 def parse_prometheus(text: str) -> dict[str, float]:
     """Parse Prometheus exposition text into ``{metric_name: value}``.
 
     The ``sglang:`` prefix is stripped and values are summed across label sets
     (e.g. data-parallel series), which is what we want for running/queue counts.
     Non-finite samples (NaN/Inf) are skipped.
+
+    Metrics carrying one of :data:`_SPLIT_LABELS` ALSO get a per-value key,
+    ``"realtime_tokens_total|mode=decode"``, because for those the bare sum mixes
+    quantities that are not the same thing. The bare name is still emitted, so
+    every existing lookup keeps working.
     """
     out: dict[str, float] = {}
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        labels = ""
         try:
             if "{" in line:
                 name = line[: line.index("{")]
+                labels = line[line.index("{") + 1 : line.rindex("}")]
                 value = line.rsplit(None, 1)[1]
             else:
                 name, value = line.split(None, 1)
@@ -71,7 +102,20 @@ def parse_prometheus(text: str) -> dict[str, float]:
         if not math.isfinite(v):
             continue
         out[name] = out.get(name, 0.0) + v
+        if labels:
+            for label, val in _LABEL_RE.findall(labels):
+                if label in _SPLIT_LABELS:
+                    key = f"{name}|{label}={val}"
+                    out[key] = out.get(key, 0.0) + v
     return out
+
+
+def _first_not_none(*vals: float | None) -> float | None:
+    """First non-None value. NOT ``a or b``: 0.0 is a legitimate counter delta."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
 
 
 @dataclass
@@ -212,39 +256,107 @@ class SGLangServerMonitor:
             return {}
         first, last = samples[0], samples[-1]
 
-        def dmean(sum_key: str, count_key: str) -> float:
-            ds = last.raw.get(sum_key, 0.0) - first.raw.get(sum_key, 0.0)
-            dc = last.raw.get(count_key, 0.0) - first.raw.get(count_key, 0.0)
+        def pick(*keys: str) -> str | None:
+            """The first of ``keys`` this server actually publishes, or None.
+
+            SGLang renames its metrics between versions, and a missing name is
+            indistinguishable from an idle server once it has been defaulted to
+            0.0 -- run 20260908-052218 logged srv/ttft_mean_s, srv/num_requests,
+            srv/prompt_tokens, srv/generation_tokens, srv/cached_tokens and
+            srv/prefix_cache_hit_rate as a clean 0.0 for two full steps because
+            the counters behind them no longer exist under those names. A metric
+            with no source is now OMITTED rather than reported as zero.
+            """
+            for k in keys:
+                if k in last.raw:
+                    return k
+            return None
+
+        def dmean(sum_keys: tuple[str, ...], count_keys: tuple[str, ...]) -> float | None:
+            sk, ck = pick(*sum_keys), pick(*count_keys)
+            if sk is None or ck is None:
+                return None
+            ds = last.raw.get(sk, 0.0) - first.raw.get(sk, 0.0)
+            dc = last.raw.get(ck, 0.0) - first.raw.get(ck, 0.0)
             return (ds / dc) if dc > 0 else 0.0
 
-        def delta(key: str) -> float:
-            d = last.raw.get(key, 0.0) - first.raw.get(key, 0.0)
+        def delta(*keys: str) -> float | None:
+            """Counter increase over the window, summed over every key present."""
+            found = [k for k in keys if k in last.raw]
+            if not found:
+                return None
+            d = sum(last.raw.get(k, 0.0) - first.raw.get(k, 0.0) for k in found)
             return d if d >= 0 else 0.0
 
         busy = [s for s in samples if s.running > 0]
         tputs = [s.throughput for s in busy if s.throughput > 0]
-        prompt = delta("prompt_tokens_total")
-        cached = delta("cached_tokens_total")
-        return {
-            # prefill vs decode vs queue -- all first-hand from the server
-            "srv/ttft_mean_s": dmean("time_to_first_token_seconds_sum", "time_to_first_token_seconds_count"),
+
+        # Token accounting. Newer SGLang folds all three into ONE counter split by
+        # a `mode` label (HELP: "mode: prefill_compute, prefill_cache, decode"),
+        # which is why parse_prometheus emits label-qualified keys -- the bare
+        # `realtime_tokens_total` is prompt+generated added together and is not a
+        # meaningful quantity. Older builds published separate *_total counters;
+        # both spellings are accepted so this works either way.
+        prompt = delta(
+            "realtime_tokens_total|mode=prefill_compute",
+            "realtime_tokens_total|mode=prefill_cache",
+        )
+        if prompt is None:
+            prompt = delta("prompt_tokens_total")
+        cached = delta("realtime_tokens_total|mode=prefill_cache")
+        if cached is None:
+            cached = delta("cached_tokens_total")
+        generated = delta("realtime_tokens_total|mode=decode")
+        if generated is None:
+            generated = delta("generation_tokens_total")
+
+        out: dict[str, float] = {
+            # queue_time_seconds is also published as per_stage_req_latency_seconds
+            # {stage="prefill_waiting"} -- verified to be the same quantity (sum
+            # 525.2 vs 524.6 over an identical count of 6536), so it is only a
+            # fallback, not a second signal.
+            "srv/queue_time_mean_s": dmean(
+                ("queue_time_seconds_sum", 'per_stage_req_latency_seconds_sum|stage=prefill_waiting'),
+                ("queue_time_seconds_count", 'per_stage_req_latency_seconds_count|stage=prefill_waiting'),
+            ),
+            # No equivalent in the SGLang build in use (2026-09): these three had
+            # dedicated histograms that are gone. Left in place so they light up
+            # again if a future build restores them; dropped from the payload
+            # meanwhile rather than logged as 0.0.
+            "srv/ttft_mean_s": dmean(
+                ("time_to_first_token_seconds_sum",), ("time_to_first_token_seconds_count",)
+            ),
             "srv/inter_token_latency_mean_s": dmean(
-                "inter_token_latency_seconds_sum", "inter_token_latency_seconds_count"
+                ("inter_token_latency_seconds_sum",), ("inter_token_latency_seconds_count",)
             ),
             "srv/e2e_latency_mean_s": dmean(
-                "e2e_request_latency_seconds_sum", "e2e_request_latency_seconds_count"
+                ("e2e_request_latency_seconds_sum",), ("e2e_request_latency_seconds_count",)
             ),
-            "srv/queue_time_mean_s": dmean("queue_time_seconds_sum", "queue_time_seconds_count"),
-            # token accounting from the server's own counters
             "srv/prompt_tokens": prompt,
-            "srv/generation_tokens": delta("generation_tokens_total"),
+            "srv/generation_tokens": generated,
             "srv/cached_tokens": cached,
             # From the server's own token counters. Nothing to do with
             # reward/eval_cache_hit_rate, which is the SWE-bench result cache.
-            "srv/prefix_cache_hit_rate": (cached / prompt) if prompt > 0 else 0.0,
-            "srv/num_requests": delta("num_requests_total"),
+            "srv/prefix_cache_hit_rate": (
+                (cached / prompt) if (cached is not None and prompt) else None
+            ),
+            # requests admitted in the window. num_requests_total is gone in the
+            # current build; queue_time_seconds_count is the same population (every
+            # request is queued before prefill) and is a counter, so its delta is
+            # the request count.
+            "srv/num_requests": _first_not_none(
+                delta("num_requests_total"), delta("queue_time_seconds_count")
+            ),
             "srv/gen_throughput_mean": (sum(tputs) / len(tputs)) if tputs else 0.0,
         }
+        missing = sorted(k for k, v in out.items() if v is None)
+        if missing:
+            self._warn_once(
+                "no source on this SGLang build for "
+                + ", ".join(missing)
+                + " -- omitted rather than logged as 0.0"
+            )
+        return {k: v for k, v in out.items() if v is not None}
 
     def drain_summary(
         self,

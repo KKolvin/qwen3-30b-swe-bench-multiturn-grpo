@@ -652,18 +652,28 @@ sample in the window (`delta(sum)/delta(count)` for histogram means):
 
 | Metric | Meaning |
 |---|---|
-| `srv/ttft_mean_s` | Mean time to first token — prefill plus queueing, server-side. |
-| `srv/inter_token_latency_mean_s` | Mean decode-step latency. |
-| `srv/e2e_latency_mean_s` | Mean end-to-end request latency (one turn, not one episode). |
 | `srv/queue_time_mean_s` | Mean time requests waited before running. Nonzero and growing = over-subscription. |
 | `srv/prompt_tokens`, `srv/generation_tokens`, `srv/cached_tokens` | Counter deltas over the window: prompt tokens processed, tokens decoded, prompt tokens served from the prefix cache. |
 | `srv/prefix_cache_hit_rate` | `cached / prompt`. The batch-level prefix-cache number. Per turn it is `TurnTiming.cache_hit_rate()` in the trajectory dump (~0.93); the `tokens/mean_cached_prompt` row that tried to carry it was a per-episode sum and was removed. |
-| `srv/num_requests` | Requests completed in the window (one per assistant turn, so ~ `traj/mean_turns` x 2048). |
+| `srv/num_requests` | Requests admitted in the window (one per assistant turn, so ~ `traj/mean_turns` x 2048). Derived from `queue_time_seconds_count` — every request queues before prefill, so its count is the request count. |
 | `srv/gen_throughput_mean` | Mean decode tokens/s while busy. |
 
-A histogram-derived value of exactly `0.0` (as `srv/ttft_mean_s` currently shows) means the
-counter did not advance between the window's first and last sample — not that latency was
-zero.
+**Not available on the current SGLang build** (2026-09): `srv/ttft_mean_s`,
+`srv/inter_token_latency_mean_s` and `srv/e2e_latency_mean_s`. Their histograms
+(`time_to_first_token_seconds`, `inter_token_latency_seconds`,
+`e2e_request_latency_seconds`) no longer exist. They are **omitted from the payload**,
+not logged as 0.0 — and the lookup still tries those names, so they reappear on their own
+if a future build restores them.
+
+That distinction is the point. Run 20260908-052218 reported six of these rows as a clean
+`0.0` for two whole steps while the endpoint answered 200 and `srv/running_peak` was live:
+the token counters had been folded into a single `sglang:realtime_tokens_total` split by a
+`mode` label (`prefill_compute` / `prefill_cache` / `decode`), and the three histograms
+above had been dropped. **A `0.0` here is indistinguishable from an idle server**, so a
+metric with no source must never be defaulted. Every lookup now takes a list of candidate
+names, `parse_prometheus` keeps label-split metrics apart instead of summing unlike
+quantities, and a one-time warning names anything with no source.
+`tests/test_server_monitor.py` pins this against a captured payload.
 
 ---
 
