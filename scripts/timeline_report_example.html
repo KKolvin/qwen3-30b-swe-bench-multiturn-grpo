@@ -143,6 +143,17 @@ function lineChart(host, cfg) {
   const yf = cfg.yFmt || big, xf = cfg.xFmt || dur;
   const svg = s("svg", {width: W, height: H, role: "img", "aria-label": cfg.label || ""});
 
+  for (const b of cfg.bands || []) {
+    const x0 = X(Math.max(0, b.t0)), x1 = X(Math.min(xmax, b.t1));
+    if (x1 - x0 < 0.5) continue;
+    svg.appendChild(s("rect", {x: x0, y: M.t, width: x1 - x0, height: ih,
+      fill: b.color, opacity: b.opacity ?? 0.09}));
+    if (b.label && x1 - x0 > 44) {
+      const lab = s("text", {x: (x0 + x1) / 2, y: M.t + ih - 6, fill: "var(--muted)",
+        "text-anchor": "middle", "font-size": 10.5});
+      lab.textContent = b.label; svg.appendChild(lab);
+    }
+  }
   for (const t of ticks(ymax)) {
     svg.appendChild(s("line", {x1: M.l, x2: M.l + iw, y1: Y(t), y2: Y(t),
       stroke: "var(--grid)", "stroke-width": 1}));
@@ -613,23 +624,46 @@ function stepView(st) {
 
   // --- occupancy + throughput, shared x
   const xs = st.series.episodes.map((_, i) => i * st.dt);
+  const oc = st.occupancy || {regions: [], peak: st.peak_inflight, lost_total: 0};
+  const REGION = {ramp: CAT[3], plateau: CAT[2], drain: CAT[1], grading: CAT[4], assembly: CAT[7]};
+  const worst = oc.regions.slice().sort((a, b) => b.pct_lost - a.pct_lost)[0];
   const occ = card("Rollout occupancy over the span",
-    `Concurrent episodes and the requests actually in flight on the server, sampled every ${f1(st.dt)}s. ` +
-    `The dashed line is where a perfect packing of the same episode-seconds into ${st.slots} slots would ` +
-    `have finished — everything right of it is drain, <b>${dur(waste)}</b> of it.`);
+    `Concurrent episodes and the requests actually in flight on the server, sampled every ${f1(st.dt)}s, ` +
+    `across the whole generate phase. The phase is not one regime: it fills, holds at what the container ` +
+    `cap allows, <b>drains</b> once the admission queue is empty and nothing refills a freed slot, then ` +
+    `sits at zero requests while grading containers and verl finish. ` +
+    (worst ? `Most of the idle GPU is in <b>${worst.name}</b> — ${pct(worst.pct_lost)} of ` +
+      `${big(oc.lost_total)} slot-seconds lost against a peak of ${oc.peak} in flight.` : ""));
   const occHost = h("div", {style: "position:relative"});
   occ.body.appendChild(occHost);
   const thrHost = h("div", {style: "position:relative"});
   occ.body.appendChild(h("div", {style: "font-size:12.5px;color:var(--ink-2);margin:14px 0 -4px",
     text: "decode throughput, cluster-wide (tok/s)"}));
   occ.body.appendChild(thrHost);
+  if (oc.regions.length) {
+    const rh = ["region", "window", "% of phase", "mean in-flight", "slot-s lost", "% of loss"];
+    const rt = h("table", {}, [h("thead", {}, h("tr", {}, rh.map(x => h("th", {text: x}))))]);
+    rt.appendChild(h("tbody", {}, oc.regions.map(r => h("tr", {}, [
+      h("td", {html: `<span class="swatch" style="background:${REGION[r.name] || "var(--axis)"}"></span>` +
+        `<span style="margin-left:6px">${r.name}</span>`}),
+      h("td", {text: `${dur(r.t0)} – ${dur(r.t1)}`}),
+      h("td", {text: pct(r.pct_span)}),
+      h("td", {text: f0(oc.peak * (1 - r.lost / Math.max(r.dur * oc.peak, 1e-9)))}),
+      h("td", {text: big(r.lost)}),
+      h("td", {text: pct(r.pct_lost)}),
+    ]))));
+    occ.body.appendChild(h("div", {class: "scroll", style: "margin-top:14px"}, rt));
+  }
   wrap.appendChild(occ.card);
   queueMicrotask(() => {
-    lineChart(occHost, {x: xs, height: 200, xAxis: false,
+    const bands = oc.regions.map(r => ({t0: r.t0, t1: r.t1, label: r.name,
+      color: REGION[r.name] || "var(--axis)"}));
+    lineChart(occHost, {x: xs, height: 200, xAxis: false, bands,
       markers: [{x: ideal, label: "perfect packing ends"}],
       series: [{name: "episodes running", color: CAT[0], v: st.series.episodes, fill: true},
-               {name: "requests in flight", color: CAT[1], v: st.series.inflight}]});
-    lineChart(thrHost, {x: xs, height: 150,
+               {name: "requests in flight", color: CAT[1], v: st.series.inflight},
+               {name: "episodes grading", color: CAT[4], v: st.series.grading || []}]});
+    lineChart(thrHost, {x: xs, height: 150, bands,
       markers: [{x: ideal, label: ""}], fmt: v => f0(v) + " tok/s",
       series: [{name: "decode tok/s", color: CAT[0], v: st.series.tok_s, fill: true}]});
   });

@@ -36,7 +36,11 @@ if [ -n "${AGENTIC_GPUS:-}" ]; then
   export CUDA_VISIBLE_DEVICES="${AGENTIC_GPUS}"
   N_GPUS=$(awk -F, '{print NF}' <<<"${AGENTIC_GPUS}")
 
-  # TP = N keeps a single rollout replica, matching the 8-GPU baseline's TP=8.
+  # TP = N keeps a single rollout replica on the reduced-GPU path. Note this is
+  # NOT the 8-GPU baseline's shape any more: that runs TP=4 / two replicas (see
+  # tensor_model_parallel_size in the config), so a reduced-GPU run is not
+  # throughput-comparable with it -- at TP=N the 4 KV heads are replicated again
+  # whenever N > 4, which is the thing TP=4 was adopted to stop doing.
   #
   # gpu_memory_utilization must come down as N shrinks, because FSDP shards bf16
   # params + grads (30.5B x 2 bytes x 2 = 122GB) across N cards. These values are
@@ -72,7 +76,7 @@ print(f'{max(0.30, (util * 100 // 1) / 100):.2f}')") ;;
   # exactly the memory resume_memory_occupation could not get back. The cost is a
   # CPU<->GPU param transfer per step, cheap next to a dead run. Only applied on
   # the reduced-GPU path -- the 8-GPU baseline is proven with it false.
-  echo "AGENTIC_GPUS=${AGENTIC_GPUS} -> ${N_GPUS} GPUs, TP=${N_GPUS}, gpu_memory_utilization=${GPU_MEM_UTIL}, actor param_offload=True (baseline is 8 GPUs / TP=8 / 0.75 / param_offload=False)"
+  echo "AGENTIC_GPUS=${AGENTIC_GPUS} -> ${N_GPUS} GPUs, TP=${N_GPUS} (1 replica), gpu_memory_utilization=${GPU_MEM_UTIL}, actor param_offload=True (baseline is 8 GPUs / TP=4 / 2 replicas / 0.75 / param_offload=False)"
   GPU_OVERRIDES=(
     trainer.n_gpus_per_node="${N_GPUS}"
     actor_rollout_ref.rollout.tensor_model_parallel_size="${N_GPUS}"
@@ -100,15 +104,20 @@ fi
 # flags in configs/grpo_swebench.yaml (see the comment block there). verl runs
 # its SGLang replicas on EPHEMERAL per-replica ports, so there is no static URL
 # to configure -- which is why every run before 2026-08-01 silently recorded
-# zero srv/* metrics. server_monitor.discover_metrics_url() resolves the address
-# at runtime from verl's named Ray actor
-# (sglang_server_<replica>_<node>.get_server_address), the same handle the
-# rollout worker uses.
-#   AGENTIC_SGLANG_METRICS_URL - pin an explicit URL, skipping discovery (needed
-#     for the standalone loop, whose server is on a known port)
+# zero srv/* metrics. server_monitor.discover_metrics_urls() resolves the
+# addresses at runtime from verl's named Ray actors
+# (sglang_server_<replica>_<node>.get_server_address), the same handles the
+# rollout workers use -- ALL of them, since tensor_model_parallel_size=4 means
+# two replicas and scraping one would halve every cluster-wide srv/* number.
+#   AGENTIC_SGLANG_METRICS_URL - pin explicit URL(s), comma-separated, skipping
+#     discovery (needed for the standalone loop, whose server is on a known port)
 #   AGENTIC_SGLANG_METRICS=0   - disable the monitor entirely
-# Capacity C mirrors rollout.max_num_seqs and sets the saturation threshold used
-# to locate the drain start; it is read only when the monitor is enabled.
+#   AGENTIC_SRV_METRICS_DIR    - where to dump the raw scrapes; defaults to
+#     AGENTIC_TIMELINE_DIR, i.e. analysis/<run>/timeline/. Set empty to skip the
+#     dump and keep only the srv/* summary.
+# Capacity C is PER SERVER, mirroring rollout.max_num_seqs (= SGLang's
+# --max-running-requests launch flag); the monitor multiplies it by the replica
+# count to get the cluster saturation threshold that locates the drain start.
 export AGENTIC_SGLANG_METRICS="${AGENTIC_SGLANG_METRICS:-1}"
 export AGENTIC_MAX_RUNNING_REQUESTS="${AGENTIC_MAX_RUNNING_REQUESTS:-256}"
 export AGENTIC_METRICS_POLL_INTERVAL="${AGENTIC_METRICS_POLL_INTERVAL:-1.0}"

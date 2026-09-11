@@ -131,10 +131,64 @@ def trace_row(events, env, start: float, instances: list, tools: list) -> dict:
     }
 
 
+# Occupancy regions. A rollout phase is not one regime: it fills, holds at the
+# concurrency the container cap allows, drains once the admission queue is empty
+# and nothing refills a freed slot, and then sits at zero requests while the
+# grading containers and verl finish. Only the last three cost anything, and
+# naming them separately is what makes the cost attributable.
+PLATEAU_FRAC = 0.9  # "at capacity" = within 10% of the phase's peak in-flight
+
+
+def occupancy_regions(times, conc, start: float, gen_end: float,
+                      grade_end: float | None) -> dict:
+    """Split the phase into ramp / plateau / drain / grading / assembly.
+
+    ``times``/``conc`` are the in-flight step function (``conc[i]`` holds from
+    ``times[i]`` to ``times[i+1]``). Each region carries the slot-seconds lost
+    against the peak, which is what makes two regions comparable: a short region
+    at zero occupancy can cost more than a long one that is merely off-peak.
+    """
+    peak = max(conc) if conc else 0
+    if not peak:
+        return {}
+
+    def lost(a: float, b: float) -> float:
+        """Slot-seconds below peak over [a, b), the step function integrated."""
+        total = 0.0
+        for i, t in enumerate(times[:-1]):
+            lo, hi = max(t, a), min(times[i + 1], b)
+            if hi > lo:
+                total += (peak - conc[i]) * (hi - lo)
+        # past the last event the engine is empty, so the whole peak is lost
+        tail_lo, tail_hi = max(times[-1], a), min(gen_end, b)
+        if tail_hi > tail_lo:
+            total += peak * (tail_hi - tail_lo)
+        return total
+
+    hi = [i for i, c in enumerate(conc) if c >= PLATEAU_FRAC * peak]
+    p0 = times[hi[0]] if hi else start
+    p1 = times[hi[-1]] if hi else start
+    busy_end = times[-1]  # last token of the last request
+    g_end = min(max(grade_end or busy_end, busy_end), gen_end)
+
+    cuts = [("ramp", start, p0), ("plateau", p0, p1), ("drain", p1, busy_end),
+            ("grading", busy_end, g_end), ("assembly", g_end, gen_end)]
+    regions = [{"name": name, "t0": a - start, "t1": b - start,
+                "dur": b - a, "lost": lost(a, b)} for name, a, b in cuts if b - a > 0.5]
+    total = sum(r["lost"] for r in regions) or 1.0
+    for r in regions:
+        r["pct_lost"] = r["lost"] / total
+        r["pct_span"] = r["dur"] / max(gen_end - start, 1e-9)
+        r["lost"] = round(r["lost"], 1)
+        r["dur"] = round(r["dur"], 1)
+        r["t0"], r["t1"] = round(r["t0"], 1), round(r["t1"], 1)
+    return {"peak": peak, "lost_total": round(total, 1), "regions": regions}
+
+
 def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dict | None:
     """Every reduction one step's charts need, in one JSON-able dict."""
     t0, t1 = gen["t"], gen["t"] + gen.get("dur", 0.0)
-    episodes, requests, tools, traced = [], [], [], []
+    episodes, requests, tools, grading, traced = [], [], [], [], []
     for events in by_traj.values():
         env = next((e for e in events if e["name"] == "episode" and e.get("t_end")), None)
         if env is None or not (t0 - 1 <= env["t"] <= t1 + 1):
@@ -146,12 +200,18 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
                 requests.append(e)
             elif e["name"] == "tool_call":
                 tools.append(e)
+            elif e["name"] in ("eval_wait", "score") and e.get("t_end"):
+                grading.append(e)
     if not episodes or not requests:
         return None
 
     start = min(e["t"] for e in episodes)
     end = max(e["t_end"] for e in episodes)
     span = end - start
+    # The series run to the end of the *gen phase*, not the last episode: the
+    # phase keeps running after the agent loops stop -- grading containers, then
+    # verl assembling the batch -- and that trailing flat zero is the point.
+    full = max(t0 + gen.get("dur", 0.0) - start, span)
 
     # In-flight concurrency: +1 when a request starts occupying the GPU (it is
     # scheduled), -1 when its last token is sampled.
@@ -194,9 +254,9 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
     ]
 
     # Sampled series: concurrent episodes, in-flight requests, decode tok/s.
-    dt = max(span / SERIES_POINTS, 0.5)
-    nb = int(span / dt) + 1
-    ep_grid, req_grid, tok_grid = [0.0] * nb, [0.0] * nb, [0.0] * nb
+    dt = max(full / SERIES_POINTS, 0.5)
+    nb = int(full / dt) + 1
+    ep_grid, req_grid, tok_grid, gr_grid = [0.0] * nb, [0.0] * nb, [0.0] * nb, [0.0] * nb
 
     def occupancy(intervals, grid: list[float]) -> None:
         """Instantaneous concurrency, sampled at each bucket's midpoint."""
@@ -218,8 +278,13 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
 
     occupancy([(e["t"], e["t_end"]) for e in episodes], ep_grid)
     occupancy(busy, req_grid)
+    if grading:
+        occupancy([(e["t"], e["t_end"]) for e in grading], gr_grid)
     for e in requests:
         spread(e["decode_start"], e["decode_finished"], tok_grid, e.get("completion_tokens", 0))
+
+    occ = occupancy_regions(times, conc, start, start + full,
+                            max((e["t_end"] for e in grading), default=None))
 
     durations = sorted(e["t_end"] - e["t"] for e in episodes)
     n = len(durations)
@@ -271,8 +336,10 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
         "series": {
             "episodes": [round(v, 1) for v in ep_grid],
             "inflight": [round(v, 1) for v in req_grid],
+            "grading": [round(v, 1) for v in gr_grid],
             "tok_s": [round(v / dt, 1) for v in tok_grid],
         },
+        "occupancy": occ,
         "durations": {
             "p50": pct(0.5),
             "p90": pct(0.9),
@@ -352,7 +419,11 @@ def main() -> None:
                     help="output HTML (default: timeline.html in the run dir, i.e. <dir>/..)")
     args = ap.parse_args()
     data = build(args.dir, args.experiment)
-    tmpl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timeline_report.html")
+    here = os.path.dirname(os.path.abspath(__file__))
+    # The committed template is the "_example" file: it carries the __DATA__
+    # placeholder, not a rendered run. Prefer an un-suffixed name if one appears.
+    tmpl = next(os.path.join(here, n) for n in ("timeline_report.html", "timeline_report_example.html")
+                if os.path.exists(os.path.join(here, n)))
     with open(tmpl) as fh:
         html = fh.read()
     html = html.replace("/*__DATA__*/null", json.dumps(data, separators=(",", ":")))

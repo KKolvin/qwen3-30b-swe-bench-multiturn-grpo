@@ -174,11 +174,43 @@ actor_rollout_ref:
       # Watch traj/exit/ContextLimit (0.8% under the new caps) if raising it.
       max_tool_response_length: 2000
     n: 8                        # GRPO group size (>1 required)
-    # Sized for the full node. To run on fewer cards (e.g. when another user
-    # holds one), do NOT edit this: set AGENTIC_GPUS in run_grpo.sh, which
-    # derives a matching TP + gpu_memory_utilization. TP must divide
-    # n_gpus_per_node.
-    tensor_model_parallel_size: 8
+    # 8 -> 4 on 2026-09-11. This does NOT shrink the rollout: verl derives
+    # num_replicas = n_gpus // (tp * dp * pp) (workers/rollout/llm_server.py), so
+    # 8 GPUs at TP=4 run TWO independent SGLang servers of 4 cards each, and the
+    # agent loop's GlobalRequestLoadBalancer spreads episodes over both.
+    #
+    # The reason is KV bandwidth, not the MoE. Qwen3-30B-A3B has 4 KV heads, so
+    # at TP=8 sglang takes the replication branch (qwen3_moe.py:
+    # `assert attn_tp_size % total_num_kv_heads == 0`, num_kv_heads = max(1, 4//8)
+    # = 1): the 4 heads are stored on 8 ranks, so every KV byte is held twice AND
+    # READ TWICE on every decode step. Decode at 16k mean context is bound by
+    # exactly that read, which is why run 20260908-052218 sat at 2.7k tok/s with
+    # 81 ms between tokens per request. At TP=4 the 4 heads land on 4 ranks with
+    # no replication:
+    #   * decode roofline ~2x (each rank reads its own requests' KV once)
+    #   * KV capacity ~1.9x (weights/rank go 7.6 -> 15.3GB, but the pool stops
+    #     storing everything twice) -- srv/token_usage_peak was 0.85, i.e. the
+    #     pool was nearly the binding constraint
+    #
+    # gpu_memory_utilization stays 0.75: it is a fraction of TOTAL memory, so the
+    # extra 7.7GB of weights per rank comes out of SGLang's own KV pool and the
+    # training side's headroom is unchanged. Watch the step-2 peak anyway (see
+    # optimizer_offload); that boundary has OOMed before.
+    #
+    # Two things had to move with this and must not be reverted piecemeal:
+    #   * agent_loop._generate sends a STABLE request_id (Episode.uid). verl
+    #     routes sticky sessions on it; a per-turn uuid scatters one episode over
+    #     both replicas and re-prefills its transcript on every hop.
+    #   * server_monitor scrapes BOTH replicas. Scraping one halves running_peak
+    #     and gen_throughput, which reads exactly like a regression.
+    #
+    # EP was considered and left at 1. verl asserts expert_parallel_size ==
+    # tp * dp (workers/config/rollout.py), so the only legal value here is 4, and
+    # the MoE term it would fix is ~1-2% of a step against this change's ~2x.
+    #
+    # To run on fewer cards (e.g. another user holds one), do NOT edit this: set
+    # AGENTIC_GPUS in run_grpo.sh. TP must divide n_gpus_per_node.
+    tensor_model_parallel_size: 4
     max_model_len: 65536        # enforced context_length (= prompt + response)
     # Headroom for the bf16 gradients that appear during the actor update; the
     # pool is sized once at init, before grads/optimizer exist. 0.85 left too
@@ -199,7 +231,12 @@ actor_rollout_ref:
       top_p: 1.0
       do_sample: true
       n: 8
-    max_num_seqs: 256           # server running-batch capacity (C) -> SGLang --max-running-requests
+    # PER-SERVER running-batch capacity (C) -> SGLang --max-running-requests.
+    # With TP=4 there are two servers, so the cluster admits 512 while the
+    # container cap allows ~264 concurrent episodes (~132 per server): this stops
+    # being a binding constraint at all. Left at 256 so neither server can be
+    # driven past the batch where decode throughput is known to fall off.
+    max_num_seqs: 256
     # Ask SGLang for the logprob of every sampled token (``return_logprob``);
     # the agent loop carries them as response_logprobs -> rollout_log_probs for
     # algorithm.rollout_correction above. Tool-observation tokens get 0.0 and
