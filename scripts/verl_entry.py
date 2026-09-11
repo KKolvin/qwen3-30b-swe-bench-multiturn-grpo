@@ -4,7 +4,8 @@
 Why this file exists
 --------------------
 verl runs the trainer inside a ``TaskRunner`` **Ray actor** (see
-``verl.trainer.main_ppo.run_ppo``): ``RayPPOTrainer.fit()`` — and therefore
+``verl.trainer.main_ppo.run_ppo``; the legacy runner itself lives in
+``verl.trainer.main_ppo_v0`` since verl 0.9.0): ``RayPPOTrainer.fit()`` — and therefore
 ``compute_data_metrics`` and ``logger.log`` — executes in *that* actor process.
 
 Our W&B metrics are injected by monkeypatching ``compute_data_metrics``, and that
@@ -24,10 +25,26 @@ from __future__ import annotations
 
 import hydra
 import ray
-from verl.trainer.main_ppo import TaskRunner, run_ppo
+from verl.trainer import main_ppo_v0
+from verl.trainer.main_ppo import run_ppo
 
 
-class _PatchedTaskRunner(TaskRunner):
+def _legacy_task_runner_class() -> type:
+    """The *undecorated* legacy ``TaskRunner``, so it can be subclassed.
+
+    verl 0.8.0 exported a plain class as ``verl.trainer.main_ppo.TaskRunner``.
+    0.9.0 moved the legacy (non-V1) trainer to ``verl.trainer.main_ppo_v0`` and
+    applies ``@ray.remote`` to it there — and a Ray ``ActorClass`` cannot be
+    subclassed. ``__ray_metadata__.modified_class`` is Ray's own handle on the
+    class it wrapped, which is the one we extend; the fallback keeps this file
+    working against a verl that exports a plain class again.
+    """
+    cls = main_ppo_v0.TaskRunner
+    metadata = getattr(cls, "__ray_metadata__", None)
+    return metadata.modified_class if metadata is not None else cls
+
+
+class _PatchedTaskRunner(_legacy_task_runner_class()):
     def run(self, config):
         # Import inside the actor process so agent_loop._patch_verl_data_metrics()
         # patches THIS process's verl.trainer.ppo.ray_trainer.compute_data_metrics,

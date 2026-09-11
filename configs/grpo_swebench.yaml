@@ -308,6 +308,15 @@ actor_rollout_ref:
     log_prob_micro_batch_size_per_gpu: 1
 
 trainer:
+  # verl 0.9.0 defaults this to true, which routes the run through the new V1
+  # trainer stack (verl/trainer/ppo/v1/*, TaskRunnerV1). Everything this repo
+  # hooks lives on the legacy RayPPOTrainer path: timeline.py rebinds
+  # verl.trainer.ppo.ray_trainer.marked_timer and agent_loop.py patches
+  # compute_data_metrics there, and scripts/verl_entry.py subclasses the legacy
+  # TaskRunner. Pinned false so the 0.8.0 -> 0.9.0 upgrade changes the weight
+  # sync only; porting the hooks to V1 is a separate piece of work (verl warns
+  # the legacy trainer is deprecated and will be removed after 0.9.0).
+  use_v1: false
   project_name: agentic-grpo-swebench
   experiment_name: null  # set by run_grpo.sh to start timestamp (YYYYMMDD-HHMMSS)
   n_gpus_per_node: 8
