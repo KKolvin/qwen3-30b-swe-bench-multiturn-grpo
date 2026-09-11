@@ -6,8 +6,11 @@
 Companion to :mod:`scripts.profile_rollout`, which prints the same reductions as
 text. This one draws them: where the step's wall clock goes, how rollout
 occupancy decays over the span, what throughput the server actually gets at each
-in-flight band, and how long episodes take. One page per run, self-contained
-(no network), written next to the shards as ``timeline.html``.
+in-flight band, how long episodes take, and what the step's tool calls cost --
+grouped by the program each call ran (``pytest``, ``find``, ``edit:view``), not
+by the tool that ran it, and sortable by total wall clock, call count or
+per-call latency. One page per run, self-contained (no network), written next to
+the shards as ``timeline.html``.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import collections
 import glob
 import json
 import os
+import re
 import statistics
 
 # In-flight request bands -- the load regimes the server runs in, same cuts as
@@ -40,6 +44,172 @@ def band_of(c: int) -> tuple[int, int]:
 def band_label(b: tuple[int, int]) -> str:
     lo, hi = b
     return str(lo) if lo == hi else (f"{lo}-{hi}" if hi < 10**9 else f"{lo}+")
+
+
+# ---------------------------------------------------------------------------
+# what a tool call actually ran
+# ---------------------------------------------------------------------------
+# A timeline event's ``tool`` field names the registry entry -- ``bash``,
+# ``str_replace_based_edit_tool``, ``submit`` -- which is three buckets for the
+# ~100k calls in a step and says nothing about what any of them cost: a ``find``
+# over /testbed and an ``ls`` are both "bash", a 0.15s ``view`` and a 300s test
+# run are both "the edit tool" and "a tool call". What costs wall clock is the
+# program the call actually ran, so that is the unit reported here: the edit
+# tool's sub-command, or the first real program on the bash line.
+EDIT_TOOL = "str_replace_based_edit_tool"
+
+MAX_LABEL = 40  # a label is a group name, not the command; the trace hover has the rest
+
+# Segment separators, matched outside quotes only (see :func:`shell_segments`).
+_SEP = re.compile(r"&&|\|\||;|\||\n")
+# ``DJANGO_SETTINGS_MODULE=settings python x.py`` runs python, not an assignment.
+_ENV_ASSIGN = re.compile(r"^(?:\w+=(?:'[^']*'|\"[^\"]*\"|\S*)\s+)+")
+# Prefixes that run something else; the something else is what took the time.
+_WRAPPER = re.compile(
+    r"^(?:sudo|nohup|command|exec|time|env|stdbuf(?:\s+-\S+)*"
+    r"|timeout(?:\s+-\S+)*\s+[\d.]+[smhd]?)\s+"
+)
+# Segments that only move the shell around. ``cd /testbed && pytest`` is a
+# pytest call; charging its 90 seconds to ``cd`` would be the whole point missed.
+_NAVIGATION = {"cd", "export", "source", ".", "set", "unset", "pushd", "popd", "true", ":", "eval"}
+_PYTHON = re.compile(r"^python[\d.]*$")
+
+
+def shell_segments(command: str) -> list[str]:
+    """Split on ``&&`` / ``||`` / ``;`` / ``|`` / newline, ignoring quoted text.
+
+    Quote-aware rather than :mod:`re`-only because the model writes
+    ``grep -r "a|b" .`` and ``find . -name '*.py;*'``: splitting those on the
+    quoted separator would attribute the call to whatever follows the quote.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"' and i + 1 < len(command):
+                i += 1
+                buf.append(command[i])
+        elif ch in "'\"":
+            quote = ch
+            buf.append(ch)
+        elif ch in "&|;\n":
+            m = _SEP.match(command, i)
+            if m:
+                out.append("".join(buf))
+                buf = []
+                i = m.end()
+                continue
+            buf.append(ch)
+        else:
+            buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return [seg.strip() for seg in out if seg.strip()]
+
+
+def segment_program(segment: str) -> str | None:
+    """The program one shell segment runs, as a group label, or None if empty.
+
+    ``python`` keeps its module or test runner (``python -m pytest``,
+    ``manage.py test``, ``runtests.py``): those are different workloads with
+    different timeouts, and collapsing them into one ``python`` row hides the
+    only tool calls that legitimately run for minutes. A dotted module is cut at
+    its first component, so a hundred one-off ``python -m test_pkg_dir.thing``
+    calls group under one row instead of a hundred.
+    """
+    seg = segment.lstrip("({ \t")
+    while True:
+        stripped = _WRAPPER.sub("", _ENV_ASSIGN.sub("", seg))
+        if stripped == seg:
+            break
+        seg = stripped
+    tokens = seg.split()
+    if not tokens:
+        return None
+    prog = os.path.basename(tokens[0].strip("'\"")) or tokens[0]
+    if prog == "py.test":
+        prog = "pytest"
+    if _PYTHON.match(prog):
+        rest = list(tokens[1:])
+        while rest and rest[0].startswith("-") and rest[0] != "-m":
+            rest.pop(0)
+        if rest and rest[0] == "-m" and len(rest) > 1:
+            return "python -m " + os.path.basename(rest[1]).split(".")[0]
+        if rest:
+            script = os.path.basename(rest[0])
+            if script == "manage.py" and rest[1:2] == ["test"]:
+                return "manage.py test"
+            if script == "runtests.py":
+                return "runtests.py"
+        return "python"
+    return prog
+
+
+def call_action(event: dict) -> str:
+    """The group a ``tool_call`` event belongs to: ``pytest``, ``edit:view``, ...
+
+    Names the model invented are kept apart from real programs (``unknown:find``
+    is the model calling a ``find`` *tool*, which returns an error observation in
+    microseconds; ``find`` is the shell one, which can run for a minute).
+    """
+    tool = event.get("tool") or "?"
+    command = event.get("command") or ""
+    if tool == EDIT_TOOL:
+        return "edit:" + (command.split(" ", 1)[0][:MAX_LABEL] or "?")
+    if tool == "submit":
+        return "submit"
+    if tool != "bash":
+        return "unknown:" + tool[:24]
+    segments = shell_segments(command)
+    for seg in segments:
+        prog = segment_program(seg)
+        if prog and prog not in _NAVIGATION:
+            return prog[:MAX_LABEL]
+    first = segment_program(segments[0]) if segments else None
+    return (first or "?")[:MAX_LABEL]
+
+
+def action_rows(events: list[dict]) -> list[dict]:
+    """Per-action call count, wall clock and per-call distribution, worst first.
+
+    Total and per-call are different questions with different answers -- 39k
+    ``edit:view`` calls at 0.18s cost more than 500 ``pytest`` calls at 0.6s,
+    and only one of the two is worth making faster -- so both are reported and
+    the table is sortable by either.
+    """
+    by_action: dict[str, dict] = {}
+    for e in events:
+        action = call_action(e)
+        row = by_action.setdefault(action, {"action": action, "tool": e.get("tool", "?"), "d": [], "err": 0})
+        row["d"].append(e.get("dur", 0.0))
+        if e.get("returncode") not in (0, None):
+            row["err"] += 1
+    total = sum(sum(r["d"]) for r in by_action.values()) or 1.0
+    rows = []
+    for r in by_action.values():
+        d = sorted(r["d"])
+        n = len(d)
+        rows.append({
+            "action": r["action"],
+            # Which registry entry ran it; a bash row and an ``unknown:`` row can
+            # carry the same program name and are not the same call.
+            "tool": "edit" if r["tool"] == EDIT_TOOL else r["tool"],
+            "calls": n,
+            "s": round(sum(d), 2),
+            "pct": sum(d) / total,
+            "mean": sum(d) / n,
+            "p50": d[n // 2],
+            "p90": d[min(n - 1, int(n * 0.9))],
+            "max": d[-1],
+            "err": r["err"],
+        })
+    return sorted(rows, key=lambda r: -r["s"])
 
 
 def load(directory: str):
@@ -79,7 +249,7 @@ KIND_OF = {
 }
 
 
-def trace_row(events, env, start: float, instances: list, tools: list) -> dict:
+def trace_row(events, env, start: float, instances: list, actions: list) -> dict:
     """One trajectory as a contiguous run of ``[kind, ms, kind, ms, ...]``.
 
     Contiguous is what makes it small: only durations are stored, so a segment's
@@ -91,7 +261,7 @@ def trace_row(events, env, start: float, instances: list, tools: list) -> dict:
         for e in events
         if e["name"] in KIND_OF and e.get("t_end")
     )
-    flat, tool_codes, cur = [], [], env["t"]
+    flat, action_codes, cur = [], [], env["t"]
 
     def push(kind: int, secs: float) -> None:
         ms = int(round(secs * 1000))
@@ -109,10 +279,10 @@ def trace_row(events, env, start: float, instances: list, tools: list) -> dict:
             push(0, t0 - cur)
         push(kind, t1 - max(t0, cur))
         if kind == 4:
-            name = e.get("tool", "?")
-            if name not in tools:
-                tools.append(name)
-            tool_codes.append(tools.index(name))
+            name = call_action(e)
+            if name not in actions:
+                actions.append(name)
+            action_codes.append(actions.index(name))
         cur = t1
     if env["t_end"] > cur:
         push(0, env["t_end"] - cur)
@@ -127,7 +297,7 @@ def trace_row(events, env, start: float, instances: list, tools: list) -> dict:
         "x": env.get("exit_status", "?"),
         "r": env.get("reward", 0.0) or 0.0,
         "n": env.get("num_turns", 0),
-        "tt": tool_codes,
+        "tt": action_codes,
     }
 
 
@@ -185,10 +355,10 @@ def occupancy_regions(times, conc, start: float, gen_end: float,
     return {"peak": peak, "lost_total": round(total, 1), "regions": regions}
 
 
-def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dict | None:
+def step_payload(by_traj, gen, phases, instances: list, action_names: list) -> dict | None:
     """Every reduction one step's charts need, in one JSON-able dict."""
     t0, t1 = gen["t"], gen["t"] + gen.get("dur", 0.0)
-    episodes, requests, tools, grading, traced = [], [], [], [], []
+    episodes, requests, tool_events, grading, traced = [], [], [], [], []
     for events in by_traj.values():
         env = next((e for e in events if e["name"] == "episode" and e.get("t_end")), None)
         if env is None or not (t0 - 1 <= env["t"] <= t1 + 1):
@@ -199,7 +369,7 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
             if e["name"] == "generate" and e.get("decode_start") and e.get("decode_finished"):
                 requests.append(e)
             elif e["name"] == "tool_call":
-                tools.append(e)
+                tool_events.append(e)
             elif e["name"] in ("eval_wait", "score") and e.get("t_end"):
                 grading.append(e)
     if not episodes or not requests:
@@ -213,9 +383,14 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
     # verl assembling the batch -- and that trailing flat zero is the point.
     full = max(t0 + gen.get("dur", 0.0) - start, span)
 
-    # In-flight concurrency: +1 when a request starts occupying the GPU (it is
-    # scheduled), -1 when its last token is sampled.
-    busy = [(e.get("request_scheduled") or e["decode_start"], e["decode_finished"]) for e in requests]
+    # In-flight concurrency: +1 when a request starts occupying the GPU, -1 when
+    # its last token is sampled. That is ``decode_start``, NOT ``request_scheduled``:
+    # scheduled fires ~0.4ms after the request arrives, when the server accepts it
+    # into its *waiting* queue, and the real wait for a decode slot is the 200ms
+    # median between the two. Counting from scheduled put queued requests on the
+    # GPU-occupancy curve and pushed it above max_num_seqs, which a decode batch
+    # cannot exceed.
+    busy = [(e["decode_start"], e["decode_finished"]) for e in requests]
     times, conc, running = [], [], 0
     for t, delta in sorted([(a, 1) for a, _ in busy] + [(b, -1) for _, b in busy]):
         running += delta
@@ -290,7 +465,7 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
     n = len(durations)
     slots = max(concurrency_peak([(e["t"], e["t_end"]) for e in episodes]), 1)
     ideal = sum(durations) / slots  # a perfect packing of the same work
-    tool_s = sum(e.get("dur", 0.0) for e in tools)
+    tool_s = sum(e.get("dur", 0.0) for e in tool_events)
     dec_s = sum(e["decode_finished"] - e["decode_start"] for e in requests)
     q_s = sum(e.get("queue_s", 0.0) for e in requests)
     pre_s = sum(e.get("prefill_s", 0.0) for e in requests)
@@ -301,16 +476,11 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
 
     trace = sorted(
         (trace_row(ev, next(e for e in ev if e["name"] == "episode" and e.get("t_end")), start,
-                   instances, tool_names) for ev in traced),
+                   instances, action_names) for ev in traced),
         key=lambda r: r["s"],
     )
 
     exits = collections.Counter(e.get("exit_status", "?") for e in episodes)
-    tool_mix: dict[str, dict] = {}
-    for e in tools:
-        row = tool_mix.setdefault(e.get("tool", "?"), {"tool": e.get("tool", "?"), "calls": 0, "s": 0.0})
-        row["calls"] += 1
-        row["s"] += e.get("dur", 0.0)
 
     def pct(p: float) -> float:
         return durations[min(n - 1, int(n * p))]
@@ -363,7 +533,8 @@ def step_payload(by_traj, gen, phases, instances: list, tool_names: list) -> dic
         },
         "trace": trace,
         "exits": sorted(exits.items(), key=lambda kv: -kv[1]),
-        "tools": sorted(tool_mix.values(), key=lambda r: -r["calls"]),
+        "tool_calls": len(tool_events),
+        "actions": action_rows(tool_events),
     }
 
 
@@ -395,16 +566,16 @@ def build(directory: str, experiment: str | None = None) -> dict:
     for e in train:
         if e.get("t_end"):
             by_step[e.get("step")][e["name"]] = {"dur": e.get("dur", 0.0), "t": e["t"], "t_end": e["t_end"]}
-    steps, instances, tool_names = [], [], []
+    steps, instances, action_names = [], [], []
     for gen in gens:
-        payload = step_payload(by_traj, gen, by_step.get(gen.get("step"), {}), instances, tool_names)
+        payload = step_payload(by_traj, gen, by_step.get(gen.get("step"), {}), instances, action_names)
         if payload:
             steps.append(payload)
     return {
         "experiment": experiment or experiment_name(directory),
         "kinds": KINDS,
         "instances": instances,
-        "tool_names": tool_names,
+        "action_names": action_names,
         "t_start": min(e["t"] for e in train),
         "t_end": max(e.get("t_end") or e["t"] for e in train),
         "steps": steps,
