@@ -13,6 +13,7 @@ Everything runs inside verl's agentic rollout path:
 * :mod:`agentic_grpo.metrics`        - per-trajectory metrics and their batch aggregation
 * :mod:`agentic_grpo.timeline`       - run timeline: every rollout + training event, timestamped
 * :mod:`agentic_grpo.sglang_timing`  - per-request server timestamps (queue / prefill / decode)
+* :mod:`agentic_grpo.flashinfer_moe_loader` - FSDP→SGLang pad+permute for flashinfer_trtllm MoE
 * :mod:`agentic_grpo.server_monitor` - SGLang /metrics scrape (srv/*)
 * :mod:`agentic_grpo.config`         - AgentConfig + container env resolution
 """

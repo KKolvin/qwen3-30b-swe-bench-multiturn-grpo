@@ -293,8 +293,17 @@ actor_rollout_ref:
         # HTTP route, no request-path middleware, and independent of
         # disable_log_stats (ServerArgs.enable_metrics has no coupling to it).
         enable_metrics: true
-        attention_backend: flashinfer  # B200 (SM 10.0) — fa3 only supports SM 80-90
-        moe_runner_backend: triton     # avoid flashinfer_trtllm padded layout — breaks FSDP weight sync
+        attention_backend: trtllm_mha   # B200/SM100 native; sglang 对 MHA+sm100 的自选值
+                                        # (server_args.py:1674)。不能留空:verl 0.9.0 在
+                                        # sglang<0.5.12 时会填 fa3,B200 上起不来。
+        page_size: 64                   # trtllm_mha 只支持 16/32/64;不写会从默认 1 被强改成 64
+        moe_runner_backend: flashinfer_trtllm  # B200 grouped GEMM; needs the padded loader below
+        # FSDP still holds the unpadded HF layout (192 at TP=4). This loader
+        # reshapes the live Parameter back, lets FusedMoE.weight_loader pad+swap,
+        # then re-runs process_weights_after_loading on the post-sync flush_cache.
+        # Without it, update_weights copy_s 192 into a 256/block-layout tensor.
+        custom_weight_loader:
+          - agentic_grpo.flashinfer_moe_loader.load_weights
     agent:
       default_agent_loop: swebench_agent
       agent_loop_config_path: configs/agent_loop.yaml

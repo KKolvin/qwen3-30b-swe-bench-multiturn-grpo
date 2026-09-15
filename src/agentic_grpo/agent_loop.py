@@ -48,7 +48,6 @@ import yaml
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
-from uuid import uuid4
 
 from agentic_grpo import submit_tool
 from agentic_grpo.config import AgentConfig, int_env as _int_env, resolve_container_env
@@ -317,8 +316,19 @@ class SWEBenchAgentLoop(AgentLoopBase):
     async def _generate(self, ep: Episode, sp: dict[str, Any]) -> Any:
         t0 = time.perf_counter()
         call_start = time.time()
+        # ep.uid, NOT a fresh uuid per turn. This is verl's STICKY-SESSION key:
+        # GlobalRequestLoadBalancer.acquire_server maps request_id -> server and
+        # otherwise falls back to least-loaded (verl/workers/rollout/llm_server.py).
+        # With one replica a per-turn uuid is harmless, which is why it survived;
+        # with tensor_model_parallel_size < n_gpus verl runs several independent
+        # SGLang servers, each with its OWN radix prefix cache, and a new id every
+        # turn scatters one episode's turns across them. Each miss re-prefills the
+        # transcript back to whichever turn that replica last saw -- against a
+        # 95.8% prefix-cache hit rate and ~14k-token prompts, that is the
+        # difference between prefill being free and prefill being the bottleneck.
+        # A stable per-rollout id pins the whole episode to one cache.
         out = await self.server_manager.generate(
-            request_id=uuid4().hex,
+            request_id=ep.uid,
             prompt_ids=ep.traj.current_ids(),
             sampling_params=sp,
         )
@@ -698,6 +708,7 @@ def _patch_verl_data_metrics() -> None:
     if _METRICS_PATCHED or not _HAS_VERL:
         return
 
+    from agentic_grpo.flashinfer_moe_loader import patch_sglang_weight_sync
     from agentic_grpo.metrics import TrajectoryMetrics, guard_infra_failures
     from agentic_grpo.server_monitor import get_shared_monitor
     from agentic_grpo.sglang_timing import patch_verl_rollout_timing
@@ -709,6 +720,10 @@ def _patch_verl_data_metrics() -> None:
     # class) is called from RayPPOTrainer.init_workers, i.e. this process. Doing it
     # in the AgentLoopWorker would be too late and in the wrong process.
     patch_verl_rollout_timing()
+    # Same process: TimedSGLangHttpServer.launch_server rewires naive FSDP
+    # updates onto the padded flashinfer_trtllm loader. Harmless if the yaml
+    # does not register that FQN.
+    patch_sglang_weight_sync()
 
     # Absolute timestamps for every training phase (gen, reward, update_actor,
     # ...). Same reasoning as above: fit() runs in THIS process, so the
