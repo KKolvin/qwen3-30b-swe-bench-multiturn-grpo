@@ -13,6 +13,13 @@ _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 DATASET_PATH = "/data1/shared/swe_bench_train_hf"
 
+# Resolved from this file, not the cwd: Ray actors inherit the launcher's
+# directory, and both readers of agent_config_path guard with os.path.isfile, so
+# a relative default goes missing silently. Run 20260915-113821 was launched from
+# scripts/ and lost agent.yaml that way -- containers took cwd "/" instead of
+# /testbed, every git command returned 128, and all 2048 episodes graded 0.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def resolve_container_env(env: dict) -> dict:
     """Expand ``${VAR}`` references in a mini-swe-agent ``environment.env`` block.
@@ -59,7 +66,7 @@ class AgentConfig:
     # bash timeout and observation cap live in configs/agent.yaml and
     # configs/grpo_swebench.yaml respectively.
     step_limit: int = 40
-    agent_config_path: str = "configs/agent.yaml"
+    agent_config_path: str = os.path.join(REPO_ROOT, "configs", "agent.yaml")
 
 
 @dataclass
