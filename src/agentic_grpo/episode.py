@@ -21,6 +21,7 @@ import re
 import time
 from contextlib import nullcontext
 from typing import Any
+from uuid import uuid4
 
 from agentic_grpo import bash_tool, tools
 from agentic_grpo.bash_tool import BASH_TOOL_NAME
@@ -367,6 +368,13 @@ class Episode:
 
     def __init__(self, instance_id: str, prompt_ids: list[int]):
         self.instance_id = instance_id
+        # Stable identity for this ROLLOUT (GRPO samples the same instance
+        # rollout.n times per step, and again every epoch). Two consumers:
+        # the timeline's `traj` key, and the sticky-session key verl's
+        # GlobalRequestLoadBalancer routes on -- see _generate in agent_loop.
+        # They are deliberately the same string so a routing question can be
+        # answered from the timeline. Minted before `tl` because tl takes it.
+        self.uid = f"{instance_id}#{uuid4().hex[:8]}"
         self.metrics = TrajectoryMetrics(instance_id=instance_id)
         self.traj = Trajectory(prompt_ids)
         self.turns: list[TurnTiming] = []  # per-turn timeline, always collected
@@ -375,7 +383,7 @@ class Episode:
         # set). Generate events are derived from `turns` at finish(); what is
         # recorded here is everything that has no other record: the two waits
         # before the first token, each individual tool call, and cleanup.
-        self.tl = trajectory_timeline(instance_id)
+        self.tl = trajectory_timeline(instance_id, self.uid)
 
         self.gen_s = 0.0
         self.tool_s = 0.0
@@ -481,6 +489,10 @@ class Episode:
                 self.assistant_turns, name, command, call_t,
                 returncode=obs.get("returncode"),
                 submitted=sub is not None or None,
+                # Why a refused edit was refused (editor_tool.EditError.reason).
+                # returncode alone cannot separate "old_str did not match" from
+                # "the container read failed", and those want opposite fixes.
+                reason=obs.get("reason"),
             )
         if dump_enabled():
             record = {

@@ -58,8 +58,12 @@ AMBIGUOUS_CONTEXT = 2
 # Minimum difflib ratio for a fuzzy single-line anchor when no line matches exactly.
 FUZZY_ANCHOR_RATIO = 0.6
 # ``view`` output prefix: right-aligned number then a tab. Stripped from old_str
-# when every line carries it (see strip_line_numbers).
-_LINE_NUMBER_PREFIX = re.compile(r"^[ \t]*\d+\t")
+# when every line carries it (see strip_line_numbers). End-of-line counts as a
+# separator too: a blank line renders as "     3\t", the only line whose tab is
+# its last character, so any trailing-whitespace cleanup on the way through the
+# model drops it -- and that one line then makes strip_line_numbers give up on
+# the whole old_str, refusing a copy-from-view edit as "not found".
+_LINE_NUMBER_PREFIX = re.compile(r"^[ \t]*\d+(?:\t|$)")
 # Line numbers listed when old_str is ambiguous. A one-word old_str in a real
 # file matched 155 times; the model needs to know it is far off, not every line.
 MAX_LISTED_MATCHES = 5
@@ -126,7 +130,16 @@ EDIT_TOOL_SCHEMA: dict = {
 
 
 class EditError(Exception):
-    """A refused edit. The message is shown to the model verbatim, so it says what to do next."""
+    """A refused edit. The message is shown to the model verbatim, so it says what to do next.
+
+    ``reason`` is a short slug for the timeline, so a run can say *why* the
+    28% of str_replace calls that fail failed -- the message text itself is only
+    kept when the trajectory dump is on, which is too expensive to leave running.
+    """
+
+    def __init__(self, message: str, reason: str = "other"):
+        super().__init__(message)
+        self.reason = reason
 
 
 # --------------------------------------------------------------------------- #
@@ -179,14 +192,14 @@ def view_text(
             f"Use view_range [start, end] to see a specific part.)"
         )
     if not (isinstance(view_range, list) and len(view_range) == 2 and all(isinstance(x, int) for x in view_range)):
-        raise EditError("view_range must be [start_line, end_line], two integers.")
+        raise EditError("view_range must be [start_line, end_line], two integers.", "bad_args")
     start, end = view_range
     if end == -1:
         end = n
     if start < 1 or start > max(n, 1):
-        raise EditError(f"view_range start {start} is out of bounds; the file has {n} lines.")
+        raise EditError(f"view_range start {start} is out of bounds; the file has {n} lines.", "bad_args")
     if end < start:
-        raise EditError(f"view_range end {end} is before start {start}.")
+        raise EditError(f"view_range end {end} is before start {start}.", "bad_args")
     end = min(end, n)
     out, shown = _numbered_within(lines[start - 1 : end], start, max_chars, max_lines)
     if shown >= end - start + 1:
@@ -372,7 +385,7 @@ def str_replace_text(text: str, old_str: str, new_str: str) -> tuple[str, str, s
     the arguments to make the edit match.
     """
     if not old_str:
-        raise EditError("old_str is empty; give the exact existing text to replace.")
+        raise EditError("old_str is empty; give the exact existing text to replace.", "empty_old_str")
     note = ""
     count = text.count(old_str)
     if count == 0:
@@ -381,7 +394,8 @@ def str_replace_text(text: str, old_str: str, new_str: str) -> tuple[str, str, s
             if text.count(bare) == 0:
                 raise EditError(
                     "old_str was not found in the file, so nothing was changed. "
-                    + _not_found_detail(text, bare, had_line_numbers=True)
+                    + _not_found_detail(text, bare, had_line_numbers=True),
+                    "not_found_after_stripping_line_numbers",
                 )
             old_str, count = bare, text.count(bare)
             bare_new = strip_line_numbers(new_str)
@@ -395,7 +409,8 @@ def str_replace_text(text: str, old_str: str, new_str: str) -> tuple[str, str, s
         else:
             raise EditError(
                 "old_str was not found in the file, so nothing was changed. "
-                + _not_found_detail(text, old_str, had_line_numbers=False)
+                + _not_found_detail(text, old_str, had_line_numbers=False),
+                "not_found",
             )
     if count > 1:
         at = _match_lines(text, old_str)
@@ -406,7 +421,8 @@ def str_replace_text(text: str, old_str: str, new_str: str) -> tuple[str, str, s
             f"old_str occurs {count} times (at lines {shown}); "
             "nothing was changed. Include more surrounding lines so it matches exactly once. "
             f"The first {min(len(at), MAX_SHOWN_MATCHES)} occurrences with their context:\n"
-            + _ambiguous_detail(text, old_str, at)
+            + _ambiguous_detail(text, old_str, at),
+            "ambiguous",
         )
     idx = text.index(old_str)
     new_text = text[:idx] + new_str + text[idx + len(old_str) :]
@@ -422,7 +438,7 @@ def insert_text(text: str, insert_line: int, new_str: str) -> tuple[str, str]:
         lines = lines[:-1]
     n = len(lines)
     if not isinstance(insert_line, int) or insert_line < 0 or insert_line > n:
-        raise EditError(f"insert_line must be between 0 and {n} (the file has {n} lines).")
+        raise EditError(f"insert_line must be between 0 and {n} (the file has {n} lines).", "bad_args")
     new_lines = new_str.split("\n")
     if new_lines and new_lines[-1] == "":
         new_lines = new_lines[:-1]
@@ -436,7 +452,7 @@ def insert_text(text: str, insert_line: int, new_str: str) -> tuple[str, str]:
 # --------------------------------------------------------------------------- #
 def resolve_path(path: Any, cwd: str = DEFAULT_CWD) -> str:
     if not isinstance(path, str) or not path.strip():
-        raise EditError("path is required.")
+        raise EditError("path is required.", "bad_args")
     p = path.strip()
     if not p.startswith("/"):
         p = posixpath.join(cwd, p)
@@ -459,11 +475,11 @@ def _decode_b64_text(path: str, b64: str) -> str:
     try:
         raw = base64.b64decode(b64.strip(), validate=True)
     except (ValueError, TypeError) as exc:
-        raise EditError(f"Could not read {path}: unexpected output from the container ({exc}).")
+        raise EditError(f"Could not read {path}: unexpected output from the container ({exc}).", "container_io")
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
-        raise EditError(f"{path} is not a UTF-8 text file; this tool only edits text files.")
+        raise EditError(f"{path} is not a UTF-8 text file; this tool only edits text files.", "not_utf8")
 
 
 def read_entry(env: Any, path: str) -> tuple[str, str | None]:
@@ -485,14 +501,15 @@ def read_entry(env: Any, path: str) -> tuple[str, str | None]:
     if tag == "MISSING":
         return "missing", None
     if tag != "FILE" or out.get("returncode") != 0:
-        raise EditError(f"Could not read {path}: {(out.get('output') or '').strip()[:300]}")
+        raise EditError(f"Could not read {path}: {(out.get('output') or '').strip()[:300]}", "container_io")
     return "file", _decode_b64_text(path, lines[1] if len(lines) > 1 else "")
 
 
 def read_text(env: Any, path: str) -> str:
     kind, text = read_entry(env, path)
     if kind != "file":
-        raise EditError(f"{path} is a directory." if kind == "dir" else f"{path} does not exist.")
+        raise EditError(f"{path} is a directory." if kind == "dir" else f"{path} does not exist.",
+            "is_directory" if kind == "dir" else "file_missing")
     return text  # type: ignore[return-value]
 
 
@@ -508,7 +525,7 @@ def write_text(env: Any, path: str, text: str, *, chunk: int | None = None) -> N
         prefix = f"mkdir -p {shlex.quote(posixpath.dirname(path) or '/')} && " if i == 0 else ""
         out = _exec(env, f"{prefix}printf %s {shlex.quote(piece)} | base64 -d {redir} {q}")
         if out.get("returncode") != 0:
-            raise EditError(f"Could not write {path}: {(out.get('output') or '').strip()[:300]}")
+            raise EditError(f"Could not write {path}: {(out.get('output') or '').strip()[:300]}", "container_io")
 
 
 def list_dir(env: Any, path: str) -> str:
@@ -569,16 +586,17 @@ def _run_edit_tool(env: Any, args: dict, *, cwd: str) -> dict:
     try:
         if cmd not in ("view", "create", "str_replace", "insert"):
             raise EditError(
-                f"Unknown command {cmd!r}. Use one of: view, create, str_replace, insert."
+                f"Unknown command {cmd!r}. Use one of: view, create, str_replace, insert.",
+                "bad_args",
             )
         path = resolve_path(args.get("path"), cwd)
 
         if cmd == "create":
             if stat_path(env, path) != "missing":
-                raise EditError(f"{path} already exists; use str_replace or insert to change it.")
+                raise EditError(f"{path} already exists; use str_replace or insert to change it.", "already_exists")
             file_text = args.get("file_text")
             if not isinstance(file_text, str):
-                raise EditError("create requires `file_text` (the full file content).")
+                raise EditError("create requires `file_text` (the full file content).", "bad_args")
             write_text(env, path, file_text)
             return {"returncode": 0, "output": f"Created {path} ({file_text.count(chr(10))} lines).", "edit": cmd}
 
@@ -587,18 +605,18 @@ def _run_edit_tool(env: Any, args: dict, *, cwd: str) -> dict:
             if kind == "dir":
                 return {"returncode": 0, "output": list_dir(env, path)}
             if kind == "missing":
-                raise EditError(f"{path} does not exist.")
+                raise EditError(f"{path} does not exist.", "file_missing")
             return {"returncode": 0, "output": view_text(text or "", args.get("view_range"))}
         if kind == "dir":
-            raise EditError(f"{path} is a directory.")
+            raise EditError(f"{path} is a directory.", "is_directory")
         if kind == "missing":
-            raise EditError(f"{path} does not exist. Use `create` for a new file.")
+            raise EditError(f"{path} does not exist. Use `create` for a new file.", "file_missing")
         assert text is not None
 
         if cmd == "str_replace":
             old_str, new_str = args.get("old_str"), args.get("new_str")
             if not isinstance(old_str, str):
-                raise EditError("str_replace requires `old_str`.")
+                raise EditError("str_replace requires `old_str`.", "bad_args")
             if not isinstance(new_str, str):
                 new_str = ""  # deleting text is a legitimate replacement
             new_text, snippet, note = str_replace_text(text, old_str, new_str)
@@ -609,17 +627,17 @@ def _run_edit_tool(env: Any, args: dict, *, cwd: str) -> dict:
         # insert
         new_str = args.get("new_str")
         if not isinstance(new_str, str):
-            raise EditError("insert requires `new_str`.")
+            raise EditError("insert requires `new_str`.", "bad_args")
         line = args.get("insert_line")
         if isinstance(line, str) and line.strip().lstrip("-").isdigit():
             line = int(line)
         if not isinstance(line, int) or isinstance(line, bool):
-            raise EditError("insert requires an integer `insert_line`.")
+            raise EditError("insert requires an integer `insert_line`.", "bad_args")
         new_text, snippet = insert_text(text, line, new_str)
         write_text(env, path, new_text)
         return {"returncode": 0, "output": f"Inserted into {path}. The region now reads:\n{snippet}", "edit": cmd}
     except EditError as exc:
-        return {"returncode": 1, "output": str(exc)}
+        return {"returncode": 1, "output": str(exc), "reason": exc.reason}
 
 
 def summarize_call(args: Any) -> str:
