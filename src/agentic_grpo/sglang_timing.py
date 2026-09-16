@@ -204,6 +204,18 @@ def _build_timed_server_class() -> type:
     class TimedSGLangHttpServer(SGLangHttpServer):  # type: ignore[misc, valid-type]
         """verl's SGLang rollout server, plus per-request timing on the output."""
 
+        async def launch_server(self, *args, **kwargs):  # type: ignore[override]
+            await super().launch_server(*args, **kwargs)
+            # Naive FSDP sync must hit the padded flashinfer_trtllm loader.
+            # This override is pickled onto the actor with the class; patching
+            # SGLangHttpServer.launch_server in the trainer would not be.
+            try:
+                from agentic_grpo.flashinfer_moe_loader import rewire_tokenizer_manager
+
+                rewire_tokenizer_manager(self)
+            except Exception:  # noqa: BLE001 - loader is optional if yaml omits it
+                logger.warning("sglang_timing: flashinfer MoE loader rewire failed", exc_info=True)
+
         async def generate(self, prompt_ids, sampling_params, request_id, **kwargs):  # type: ignore[override]
             # tokenizer_manager only exists on node_rank 0, and only after
             # launch_server; installing lazily avoids depending on either.
