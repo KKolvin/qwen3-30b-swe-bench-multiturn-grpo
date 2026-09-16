@@ -453,6 +453,7 @@ echo "Training: ${N_TRAIN} instances, batch_size=256, 3 epochs -> ${TOTAL_STEPS}
 python3 "${REPO_ROOT}/scripts/verl_entry.py" \
   data.train_files="${TRAIN_FILE}" \
   data.val_files="${REPO_ROOT}/data/swebench_verified/val.parquet" \
+  actor_rollout_ref.rollout.agent.agent_loop_config_path="${REPO_ROOT}/configs/agent_loop.yaml" \
   trainer.total_training_steps="${TOTAL_STEPS}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.default_local_dir="${CKPT_ROOT}/${EXPERIMENT_NAME}" \
