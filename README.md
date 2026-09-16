@@ -17,9 +17,24 @@ multi-turn coding agent evaluated on **SWE-bench**.
 ## Setup
 
 ```bash
-pip install "verl[sglang]>=0.5.0"
+# sglang (0.5.8) pins transformers==4.57.1, while verl 0.9.0 *declares*
+# transformers>=5.5.3 -- a floor its code does not actually need on this path
+# (it still carries 4.5x version gates). So install verl without its deps:
+git clone https://github.com/volcengine/verl /data0/shared/$USER/verl
+git -C /data0/shared/$USER/verl checkout release/v0.9.0
+pip install "sglang[all]==0.5.8"
+pip install -e /data0/shared/$USER/verl --no-deps   # verl 0.9.0, editable
 pip install -e .
 ```
+
+verl is pinned to the **`release/v0.9.0`** branch, not the 0.8.0 wheel: 0.8.0
+OOMs at the SGLang weight sync (`resume_memory_occupation` ->
+`cu_mem_create: out of memory`), which killed the 4-GPU run on 2026-07-30 and
+the 8-GPU run 20260908-052218 at step 2. 0.9.0 carries both fixes —
+`aggressive_empty_cache()` before `rollout.resume(tags=["weights"])`
+(commit d908005d) and `enable_weights_cpu_backup` for HYBRID rollout mode —
+and `trainer.use_v1=false` in the config keeps the run on the legacy
+`RayPPOTrainer` path this repo hooks.
 
 Docker is required for SWE-bench instance images.
 

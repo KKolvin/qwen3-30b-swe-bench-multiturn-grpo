@@ -6,9 +6,11 @@
 # ---------------------------------------------------------------------------
 
 # --- RL framework (actor / ref / GRPO) ---
-# Installed separately with the sglang extra:
-#   pip install "verl[sglang]>=0.5.0"
-# verl>=0.5.0
+# NOT a wheel: verl is installed editable from its release/v0.9.0 branch (see
+# README Setup). The 0.8.0 wheel OOMs at the SGLang weight sync. Install with
+# --no-deps -- 0.9.0 declares transformers>=5.5.3, which conflicts with the
+# transformers==4.57.1 that sglang 0.5.8 pins, and does not need it here.
+#   pip install -e /path/to/verl --no-deps   # release/v0.9.0
 
 # --- Rollout engine ---
 # sglang is pulled in by verl[sglang]; pin if installing standalone:
