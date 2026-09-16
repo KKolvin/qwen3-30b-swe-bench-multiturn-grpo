@@ -633,7 +633,25 @@ the rollout server's Prometheus `/metrics` about once a second, summarized per s
 same `compute_data_metrics` patch. Requires `rollout.prometheus.enable: true` **and**
 `disable_log_stats: false`; the scrape deliberately bypasses `HTTP_PROXY`, and the server URL
 is discovered from verl's named Ray actor `sglang_server_<rank>_<node>` because the port is
-ephemeral. With more than one replica only one is scraped, so the counts are per-replica.
+ephemeral.
+
+Since 2026-09-11 **every** replica is scraped, not just the first. `tensor_model_parallel_size`
+is 4 on 8 GPUs, so verl runs two independent SGLang servers; the snapshots are merged by
+[`merge_replicas`](src/agentic_grpo/server_monitor.py) — counts and counters summed,
+pressure gauges (`token_usage`) maxed, rate gauges (`cache_hit_rate`) averaged. So every
+`srv/*` below is cluster-wide. `AGENTIC_MAX_RUNNING_REQUESTS` stays **per server** (it mirrors
+a launch flag) and is scaled by the replica count before it is used as the saturation threshold.
+
+**The raw scrapes are kept.** The poller parses the whole `sglang:` namespace — ~90 metrics,
+against the dozen `srv/*` fields summarized here — and writes every tick to
+`analysis/<run>/timeline/srv-metrics-<pid>.jsonl`, one line per replica per second,
+*unmerged*, plus the first response verbatim as `srv-metrics-raw-<replica>.txt`. `srv/*` is the
+wandb summary; that JSONL is the data, at 1 s resolution against Prometheus's 10 s, and it is
+where questions like `gpu_execution_seconds_total`, `num_retracted_reqs`,
+`prefill_delayer_wait_seconds` or `decode_sum_seq_lens` get answered without another run.
+Which metrics a build actually *exports* is not the same question as which ones its
+`collector.py` defines (the scheduler and the tokenizer manager are separate processes and
+only one reaches this registry) — the archived raw response settles that per run.
 
 **Drain phase** (is the GPU staying saturated?), computed over the busy window
 (`num_running_reqs > 0`):
