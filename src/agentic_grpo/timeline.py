@@ -61,11 +61,16 @@ def _int_env(name: str, default: int) -> int:
 
 
 class TimelineWriter:
-    """Buffered append-only JSONL writer, one file per process."""
+    """Buffered append-only JSONL writer, one file per process.
 
-    def __init__(self, directory: str, flush_every: int = 400):
+    ``prefix`` names the file (``<prefix>-<pid>.jsonl``) so other diagnostics can
+    reuse the buffering and the never-break-training guarantees while keeping
+    their own stream; see :mod:`agentic_grpo.server_monitor`.
+    """
+
+    def __init__(self, directory: str, flush_every: int = 400, prefix: str = "timeline"):
         self.directory = directory
-        self.path = os.path.join(directory, f"timeline-{os.getpid()}.jsonl")
+        self.path = os.path.join(directory, f"{prefix}-{os.getpid()}.jsonl")
         self.flush_every = max(1, flush_every)
         self._buf: list[str] = []
         self._lock = threading.Lock()
@@ -151,11 +156,16 @@ class TrajectoryTimeline:
     ``traj`` is unique per *rollout*: GRPO samples the same instance
     ``rollout.n`` times per step and again every epoch, so ``instance_id`` alone
     cannot key a trajectory on a timeline.
+
+    The caller may supply that id (:class:`~agentic_grpo.episode.Episode` does,
+    as ``Episode.uid``) so the timeline and the rollout's sticky routing key are
+    the same string -- which is what lets a routing question be answered from the
+    timeline. Omitted, one is minted here, so the timeline still works standalone.
     """
 
-    def __init__(self, instance_id: str):
+    def __init__(self, instance_id: str, traj: str | None = None):
         self.instance_id = instance_id
-        self.traj = f"{instance_id}#{uuid4().hex[:8]}"
+        self.traj = traj or f"{instance_id}#{uuid4().hex[:8]}"
         self.events: list[dict[str, Any]] = []
         self.max_cmd = _int_env("AGENTIC_TIMELINE_MAX_CMD", 200)
 
@@ -242,9 +252,9 @@ class TrajectoryTimeline:
         self.events.clear()
 
 
-def trajectory_timeline(instance_id: str) -> TrajectoryTimeline | None:
+def trajectory_timeline(instance_id: str, traj: str | None = None) -> TrajectoryTimeline | None:
     """A recorder for one episode, or None when the timeline is off."""
-    return TrajectoryTimeline(instance_id) if enabled() else None
+    return TrajectoryTimeline(instance_id, traj) if enabled() else None
 
 
 # ---------------------------------------------------------------------------
