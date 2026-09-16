@@ -65,6 +65,12 @@
   details { margin-top: 10px; }
   summary { cursor: pointer; font-size: 12.5px; color: var(--ink-2); }
   .scroll { overflow-x: auto; }
+  .tall { max-height: 340px; overflow-y: auto; }
+  .tall thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  th.sort { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.sort:hover { color: var(--ink-2); }
+  th[aria-sort] { color: var(--ink); }
+  td.dim { color: var(--muted); }
   .tip { position: absolute; pointer-events: none; opacity: 0; transition: opacity .08s;
          background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
          padding: 7px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.14);
@@ -86,9 +92,12 @@ const f0 = n => Math.round(n).toLocaleString();
 const pct = n => (n * 100).toFixed(n < 0.1 ? 1 : 0) + "%";
 function dur(s) {
   if (s < 90) return f1(s) + "s";
-  const m = Math.floor(s / 60), r = Math.round(s % 60);
+  let m = Math.floor(s / 60), r = Math.round(s % 60);
+  if (r === 60) { m += 1; r = 0; }  // 299.7s is "5m 0s", not "4m 60s"
   return m >= 60 ? `${Math.floor(m/60)}h ${m%60}m` : `${m}m ${r}s`;
 }
+// one call, not a total: sub-second times are the common case here
+const perCall = s => s < 1 ? f0(s * 1000) + "ms" : dur(s);
 function big(n) {
   if (n >= 1e9) return (n/1e9).toFixed(2) + "G";
   if (n >= 1e6) return (n/1e6).toFixed(2) + "M";
@@ -506,7 +515,7 @@ function traceView(host, st) {
     }
     const total = row.T;
     const toolName = seg && seg.kind === 4 && row.tt[seg.tool] !== undefined
-      ? " · " + DATA.tool_names[row.tt[seg.tool]] : "";
+      ? " · " + DATA.action_names[row.tt[seg.tool]] : "";
     tp.show(
       `<b>${DATA.instances[row.i]}</b><br>` +
       `${row.x} · ${row.n} turns · reward ${row.r.toFixed(2)} · ${dur(total / 1000)}<br>` +
@@ -517,6 +526,45 @@ function traceView(host, st) {
       mx, my);
   });
   draw();
+}
+
+/* A table whose columns can be re-sorted in place. Three of this report's
+   questions about a tool call -- how often, how long in total, how long each
+   time -- are the same rows in a different order, so the order is a control
+   rather than three tables. */
+function sortTable(cols, rows, initial) {
+  const host = h("div", {class: "scroll tall"});
+  let key = initial, desc = true;
+  const body = h("tbody");
+  const heads = cols.map(c => h("th", {class: "sort", text: c.label, title: c.help || c.label}));
+  const table = h("table", {}, [h("thead", {}, h("tr", {}, heads)), body]);
+  const draw = () => {
+    heads.forEach((th, i) => {
+      if (cols[i].k === key) th.setAttribute("aria-sort", desc ? "descending" : "ascending");
+      else th.removeAttribute("aria-sort");
+      th.textContent = cols[i].label + (cols[i].k === key ? (desc ? " \u2193" : " \u2191") : "");
+    });
+    const sorted = rows.slice().sort((a, b) => {
+      const x = a[key], y = b[key];
+      const c = typeof x === "string" ? x.localeCompare(y) : (x - y);
+      return desc ? -c : c;
+    });
+    body.innerHTML = "";
+    for (const r of sorted) {
+      body.appendChild(h("tr", {}, cols.map(c =>
+        h("td", {text: c.fmt ? c.fmt(r[c.k], r) : r[c.k], class: c.dim ? "dim" : ""}))));
+    }
+  };
+  heads.forEach((th, i) => th.addEventListener("click", () => {
+    // A new column starts on its most useful order: biggest first for numbers,
+    // A-Z for the name.
+    if (key === cols[i].k) desc = !desc;
+    else { key = cols[i].k; desc = typeof rows[0][key] !== "string"; }
+    draw();
+  }));
+  draw();
+  host.appendChild(table);
+  return host;
 }
 
 function card(title, note) {
@@ -648,7 +696,8 @@ function stepView(st) {
         `<span style="margin-left:6px">${r.name}</span>`}),
       h("td", {text: `${dur(r.t0)} – ${dur(r.t1)}`}),
       h("td", {text: pct(r.pct_span)}),
-      h("td", {text: f0(oc.peak * (1 - r.lost / Math.max(r.dur * oc.peak, 1e-9)))}),
+      h("td", {text: f0(Math.max(0, Math.min(oc.peak,
+        oc.peak * (1 - r.lost / Math.max(r.dur * oc.peak, 1e-9)))))}),
       h("td", {text: big(r.lost)}),
       h("td", {text: pct(r.pct_lost)}),
     ]))));
@@ -660,9 +709,9 @@ function stepView(st) {
       color: REGION[r.name] || "var(--axis)"}));
     lineChart(occHost, {x: xs, height: 200, xAxis: false, bands,
       markers: [{x: ideal, label: "perfect packing ends"}],
-      series: [{name: "episodes running", color: CAT[0], v: st.series.episodes, fill: true},
-               {name: "requests in flight", color: CAT[1], v: st.series.inflight},
-               {name: "episodes grading", color: CAT[4], v: st.series.grading || []}]});
+      series: [{name: "episodes in the agent loop", color: CAT[0], v: st.series.episodes, fill: true},
+               {name: "episodes decoding (requests on the GPU)", color: CAT[1], v: st.series.inflight},
+               {name: "episodes in reward grading", color: CAT[4], v: st.series.grading || []}]});
     lineChart(thrHost, {x: xs, height: 150, bands,
       markers: [{x: ideal, label: ""}], fmt: v => f0(v) + " tok/s",
       series: [{name: "decode tok/s", color: CAT[0], v: st.series.tok_s, fill: true}]});
@@ -726,9 +775,11 @@ function stepView(st) {
   const ex = card("How episodes ended",
     `<b>${pct((st.exits.find(e => e[0] === "Submitted") || [0, 0])[1] / st.episodes)}</b> ` +
     `reached the submit tool; every other status is an episode a guard stopped.`);
+  const toolTotal = st.actions.reduce((a, t) => a + t.s, 0);
   const tl = card("Tool calls",
-    `${f0(st.tools.reduce((a, t) => a + t.calls, 0))} calls, ` +
-    `${dur(st.tools.reduce((a, t) => a + t.s, 0))} of wall clock in total.`);
+    `${f0(st.tool_calls)} calls, ${dur(toolTotal)} of wall clock in total — ` +
+    `${pct(toolTotal / (st.ep_wall.decode + st.ep_wall.tool + st.ep_wall.other))} of episode wall clock. ` +
+    `Grouped by what the call ran, not by which tool ran it.`);
   const exH = h("div", {style: "position:relative"}), tlH = h("div", {style: "position:relative"});
   ex.body.appendChild(exH); tl.body.appendChild(tlH);
   row3.appendChild(ex.card); row3.appendChild(tl.card);
@@ -737,16 +788,36 @@ function stepView(st) {
     barChart(exH, {height: 190, color: CAT[0], valueName: "episodes", fmt: f0,
       items: st.exits.map(([k, v]) => ({label: k.replace(/Limit$/, ""), value: v,
         foot: pct(v / st.episodes), sub: k}))});
-    // Only the real tools get their own bar -- the long tail is names the model
-    // invented, which matter as a count, not as 12 one-call categories.
-    const top = st.tools.slice(0, 5), rest = st.tools.slice(5);
-    const items = top.map(t => ({label: t.tool.replace("str_replace_based_edit_tool", "edit"),
-      value: t.calls, foot: dur(t.s), sub: `${f1(t.s / t.calls * 1000)} ms mean`}));
+    // By total wall clock, because that is the thing a rollout pays: the long
+    // tail is one-off programs and names the model invented, which cost nothing
+    // individually and are worth one row between them.
+    const top = st.actions.slice(0, 6), rest = st.actions.slice(6);
+    const items = top.map(t => ({label: t.action, value: t.s,
+      foot: `${f0(t.calls)} calls`, sub: `${perCall(t.mean)} mean · ${perCall(t.p90)} p90 · ${perCall(t.max)} max`}));
     if (rest.length) items.push({label: `other (${rest.length})`,
-      value: rest.reduce((a, t) => a + t.calls, 0), foot: dur(rest.reduce((a, t) => a + t.s, 0)),
-      sub: rest.slice(0, 6).map(t => `${t.tool} ${t.calls}`).join(", ")});
-    barChart(tlH, {height: 190, color: CAT[1], valueName: "calls", fmt: f0, items});
+      value: rest.reduce((a, t) => a + t.s, 0), foot: `${f0(rest.reduce((a, t) => a + t.calls, 0))} calls`,
+      sub: rest.slice(0, 6).map(t => `${t.action} ${f0(t.s)}s`).join(", ")});
+    barChart(tlH, {height: 190, color: CAT[1], valueName: "wall clock", fmt: dur, items});
   });
+
+  // --- every action as numbers, in whichever order the question needs
+  const atbl = card("Tool calls by what they ran",
+    `${st.actions.length} distinct actions this step. Click a column to re-sort: ` +
+    `<b>total</b> is what the step pays, <b>calls</b> is how often the policy reaches for it, ` +
+    `<b>mean</b>/<b>p90</b>/<b>max</b> are one call — a rare program can be slow and still cost nothing.`);
+  atbl.body.appendChild(sortTable([
+    {k: "action", label: "action", help: "the edit sub-command, or the first real program on the bash line"},
+    {k: "tool", label: "tool", dim: true, help: "the registry entry that ran it"},
+    {k: "calls", label: "calls", fmt: f0},
+    {k: "s", label: "total", fmt: dur},
+    {k: "pct", label: "% tool", fmt: pct},
+    {k: "mean", label: "mean", fmt: perCall},
+    {k: "p50", label: "p50", fmt: perCall},
+    {k: "p90", label: "p90", fmt: perCall},
+    {k: "max", label: "max", fmt: perCall},
+    {k: "err", label: "nonzero rc", fmt: (v, r) => v ? `${f0(v)} (${pct(v / r.calls)})` : "0"},
+  ], st.actions, "s"));
+  wrap.appendChild(atbl.card);
 
   // --- table view (accessibility + the numbers)
   const tbl = card("Band table", "The same in-flight bands as numbers.");

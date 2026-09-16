@@ -42,6 +42,13 @@ import glob
 import json
 import os
 import statistics
+import sys
+
+# The tool-call taxonomy lives with the HTML report (same directory, which is
+# ``sys.path[0]`` when either script is run) so both answer "what did this call
+# actually run" the same way.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from plot_timeline import action_rows  # noqa: E402
 
 # In-flight request bands. Chosen to separate the regimes, not the quantiles:
 # empty, single-digit (where a bs=1 backend would live), the ramp, and the
@@ -83,9 +90,9 @@ def load(directory: str):
     return by_traj, sorted(gens, key=lambda e: e["t"])
 
 
-def profile_step(by_traj, gen) -> None:
+def profile_step(by_traj, gen, tool_sort: str = "s", tool_top: int = 12) -> None:
     t0, t1 = gen["t"], gen["t"] + gen.get("dur", 0.0)
-    episodes, requests, tool_s = [], [], 0.0
+    episodes, requests, tool_events = [], [], []
     for events in by_traj.values():
         env = next((e for e in events if e["name"] == "episode" and e.get("t_end")), None)
         if env is None or not (t0 - 1 <= env["t"] <= t1 + 1):
@@ -106,10 +113,11 @@ def profile_step(by_traj, gen) -> None:
                     }
                 )
             elif e["name"] == "tool_call":
-                tool_s += e.get("dur", 0.0)
+                tool_events.append(e)
     if not episodes or not requests:
         return
 
+    tool_s = sum(e.get("dur", 0.0) for e in tool_events)
     start, end = min(a for a, _ in episodes), max(b for _, b in episodes)
     span = end - start
 
@@ -191,6 +199,28 @@ def profile_step(by_traj, gen) -> None:
         f"queue {q/(dec+q+pre):.1%}   |   episode wall: decode {dec/ep_wall:.1%}, "
         f"tool {tool_s/ep_wall:.1%}, other {1-(dec+tool_s)/ep_wall:.1%}"
     )
+    # Tool calls grouped by the program they ran, not by the tool that ran it:
+    # ``bash`` is one registry entry and forty different workloads, from a 0.2s
+    # ``ls`` to a 60s test run. Sorted by whichever of the three questions was
+    # asked -- total cost, how often, or how slow one call is.
+    rows = action_rows(tool_events)
+    if rows:
+        rows.sort(key=lambda r: -r[tool_sort] if tool_sort != "action" else r["action"])
+        print(
+            f"  tool calls: {len(tool_events):,} over {len(rows)} distinct actions, {tool_s:,.0f}s total"
+            f" (top {min(tool_top, len(rows))} by {TOOL_SORTS[tool_sort]})"
+        )
+        print(
+            f"    {'action':<24} {'tool':<8} {'calls':>7} {'total s':>9} {'% tool':>7} "
+            f"{'mean':>8} {'p50':>8} {'p90':>8} {'max':>8} {'rc!=0':>7}"
+        )
+        for r in rows[:tool_top]:
+            print(
+                f"    {r['action']:<24.24} {r['tool']:<8.8} {r['calls']:7,d} {r['s']:9,.0f} "
+                f"{r['pct']:7.1%} {r['mean']:7.2f}s {r['p50']:7.2f}s {r['p90']:7.2f}s "
+                f"{r['max']:7.2f}s {r['err']/r['calls']:7.0%}"
+            )
+
     # Wave depth: how many episodes each slot runs back to back. It is what makes
     # the drain thin -- a one-wave batch would expose the whole duration spread.
     slots = max(_concurrency_peak(episodes), 1)
@@ -198,6 +228,11 @@ def profile_step(by_traj, gen) -> None:
         f"  waves: {len(episodes)} episodes over {slots} container slots = "
         f"{len(episodes)/slots:.1f} deep"
     )
+
+
+# The three orderings of the same rows, as the flag spells them.
+TOOL_SORTS = {"s": "total wall clock", "calls": "call count", "mean": "mean per call",
+              "p90": "p90 per call", "max": "slowest call", "action": "name"}
 
 
 def _concurrency_peak(intervals: list[tuple[float, float]]) -> int:
@@ -211,12 +246,15 @@ def _concurrency_peak(intervals: list[tuple[float, float]]) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", required=True, help="timeline shard directory (analysis/<run>/timeline)")
+    ap.add_argument("--tool-sort", default="s", choices=sorted(TOOL_SORTS),
+                    help="order the per-step tool table: s=total wall clock (default), calls, mean, p90, max, action")
+    ap.add_argument("--tool-top", type=int, default=12, help="rows of the tool table to print (default 12)")
     args = ap.parse_args()
     by_traj, gens = load(args.dir)
     if not gens:
         raise SystemExit(f"no trainer 'gen' spans in {args.dir}; nothing to attribute episodes to")
     for gen in gens:
-        profile_step(by_traj, gen)
+        profile_step(by_traj, gen, args.tool_sort, args.tool_top)
 
 
 if __name__ == "__main__":
