@@ -4,13 +4,21 @@
     python scripts/plot_timeline.py --dir analysis/<experiment>/timeline
 
 Companion to :mod:`scripts.profile_rollout`, which prints the same reductions as
-text. This one draws them: where the step's wall clock goes, how rollout
-occupancy decays over the span, what throughput the server actually gets at each
-in-flight band, how long episodes take, and what the step's tool calls cost --
-grouped by the program each call ran (``pytest``, ``find``, ``edit:view``), not
-by the tool that ran it, and sortable by total wall clock, call count or
-per-call latency. One page per run, self-contained (no network), written next to
-the shards as ``timeline.html``.
+text. This one draws them, as two views behind a nav bar:
+
+* **overview** — where the step's wall clock goes, then one rollout phase at a
+  time: the trajectory trace, how occupancy decays over the span, what
+  throughput the server gets at each in-flight band, how long episodes take, and
+  what the tool calls cost -- grouped by the program each call ran (``pytest``,
+  ``find``, ``edit:view``), not by the tool that ran it, and sortable by total
+  wall clock, call count or per-call latency.
+* **metrics** — every per-step scalar as a number, not a plot: ``metrics.csv``
+  (what the run printed to its log, so what W&B got) plus the timeline's own
+  ``rollout/*`` reductions, in a browsable tag tree with METRICS.md's own
+  one-line meaning against each tag.
+
+One page per run, self-contained (no network), written next to the shards as
+``timeline.html``.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import collections
+import csv
 import glob
 import json
 import os
@@ -538,6 +547,227 @@ def step_payload(by_traj, gen, phases, instances: list, action_names: list) -> d
     }
 
 
+# ---------------------------------------------------------------------------
+# per-step scalars: metrics.csv, METRICS.md, and the timeline's own reductions
+# ---------------------------------------------------------------------------
+# The report's metrics view is a browser over every scalar the run produced per
+# step. Two sources feed it: ``metrics.csv`` next to the report -- the metric x
+# step table scripts/build_metrics_csv.py extracts from run.log, i.e. exactly
+# what verl logged to W&B -- and the reductions only the timeline can produce,
+# emitted here under ``rollout/``. METRICS.md documents one tag per table row;
+# those sentences ride along so a tag can be read without leaving the page.
+
+_CODE = re.compile(r"`([^`]+)`")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_BRACE = re.compile(r"^(.*)\{([^}]*)\}(.*)$")
+
+
+def expand_braces(name: str) -> list[str]:
+    """``critic/score/{mean,max,min}`` -> the three tags it documents."""
+    m = _BRACE.match(name)
+    if not m:
+        return [name]
+    head, body, tail = m.groups()
+    return [x for opt in body.split(",") for x in expand_braces(head + opt.strip() + tail)]
+
+
+def load_docs(path: str) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """``({tag: meaning}, [(prefix, meaning)])`` from the METRICS.md tables.
+
+    A row's first cell names what the sentence after it documents: one tag,
+    several (``srv/prompt_tokens``, ``srv/generation_tokens``), a brace family
+    (``prompt_length/{mean,max,min}``), a wildcard (``rollout_corr/*``) or a
+    placeholder (``traj/exit/<Status>``). The last two become prefixes, matched
+    longest-first and only where no row names the tag outright. The first row to
+    claim a tag wins, which keeps the reference sections ahead of the
+    known-dead-rows table at the end. Markdown is stripped so the sentence reads
+    inside a table cell.
+    """
+    if not os.path.exists(path):
+        return {}, []
+    docs: dict[str, str] = {}
+    patterns: dict[str, str] = {}
+    with open(path) as fh:
+        for line in fh:
+            cells = line.strip().split("|")
+            if len(cells) < 4 or not line.startswith("|"):  # not a table row
+                continue
+            names, desc = cells[1], _MD_LINK.sub(r"\1", cells[2]).replace("**", "").replace("`", "").strip()
+            if not desc or set(desc) <= set("- :"):  # the header separator
+                continue
+            for code in _CODE.findall(names):
+                for name in expand_braces(code.strip()):
+                    if "*" in name or "<" in name:
+                        patterns.setdefault(name.split("*")[0].split("<")[0], desc)
+                    else:
+                        docs.setdefault(name, desc)
+    return docs, sorted(patterns.items(), key=lambda kv: -len(kv[0]))
+
+
+def load_metrics_csv(path: str) -> tuple[list[int], dict[str, dict[int, float]]]:
+    """``metrics.csv`` as (steps, {tag: {step: value}}). Blank cells stay missing.
+
+    A blank cell means the metric was not emitted at that step -- step 0 is the
+    pre-training validation pass and carries only ``val-*`` -- so it is dropped
+    rather than read as zero.
+    """
+    if not os.path.exists(path):
+        return [], {}
+    with open(path, newline="") as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        return [], {}
+    steps = [int(c.rsplit("_", 1)[-1]) for c in rows[0][1:]]
+    values: dict[str, dict[int, float]] = {}
+    for row in rows[1:]:
+        if not row or not row[0]:
+            continue
+        cells = {}
+        for step, cell in zip(steps, row[1:]):
+            try:
+                cells[step] = float(cell)
+            except (TypeError, ValueError):
+                continue
+        if cells:
+            values[row[0]] = cells
+    return steps, values
+
+
+# Timeline-only reductions, as per-step scalars. These are the numbers the
+# charts are drawn from -- the ones the step line in run.log cannot carry
+# because they need every request's own instants -- so the metrics view can
+# answer a question about a step without scrolling its charts.
+ROLLOUT_DOCS = {
+    "rollout/span_s": "Wall clock from the first episode admitted to the last one finished. Shorter than the gen phase, which also waits on grading and batch assembly.",
+    "rollout/gen_phase_s": "The trainer's whole generate span, rollout plus the grading and assembly tail.",
+    "rollout/gen_share_of_step": "Share of the training step spent in generate. The rest is the training half, during which the inference server is idle.",
+    "rollout/episodes": "Episodes that ran in this rollout.",
+    "rollout/episodes_per_min": "Episode completion rate over the span -- the throughput number a container-slot change has to move.",
+    "rollout/container_slots": "Peak concurrent episodes, i.e. how many container slots the run actually held.",
+    "rollout/requests": "Generate calls served, one per assistant turn.",
+    "rollout/tokens_out": "Tokens decoded across every request of the rollout.",
+    "rollout/tokens_prompt": "Prompt tokens seen, cached ones included.",
+    "rollout/prefix_cache_hit_rate": "Share of prompt tokens served from SGLang's prefix cache instead of being prefilled again.",
+    "rollout/decode_tok_s": "Cluster-wide decode throughput over the span: tokens out / span.",
+    "rollout/mean_inflight": "Mean requests actually decoding on the GPU, averaged over the span (decode seconds / span).",
+    "rollout/peak_inflight": "Most requests decoding at once.",
+    "rollout/tail_waste_s": "Span minus the ideal packing of the same episodes into the same slots: what the tail costs.",
+    "rollout/tail_waste_ratio": "Tail waste as a share of the span.",
+    "rollout/episode_p50_s": "Median episode duration.",
+    "rollout/episode_p90_s": "p90 episode duration.",
+    "rollout/episode_p99_s": "p99 episode duration.",
+    "rollout/episode_max_s": "The longest episode of the step.",
+    "rollout/straggler_ratio": "p99 / median episode duration.",
+    "rollout/turns_per_episode": "Mean assistant turns per episode.",
+    "rollout/tokens_per_turn": "Mean tokens decoded per request.",
+    "rollout/tool_calls": "Tool calls executed in this rollout.",
+    "rollout/tool_calls_per_episode": "Mean tool calls per episode.",
+    "rollout/tool_wall_s": "Tool execution wall clock, summed over every call.",
+    "rollout/decode_wall_s": "Decode wall clock, summed over every request.",
+    "rollout/decode_share_of_episode": "Decode as a share of summed episode wall clock -- the rest is tool calls and the agent loop's own overhead.",
+    "rollout/queue_wall_s": "Time requests spent waiting for a decode slot, summed.",
+    "rollout/prefill_wall_s": "Prefill wall clock, summed over every request.",
+    "rollout/reward_mean": "Mean reward over the episodes of this rollout.",
+    "rollout/resolved_rate": "Share of episodes the SWE-bench harness marked resolved.",
+    "rollout/exit/": "Share of episodes that ended with this exit status.",
+    "rollout/occupancy/": "The rollout's regions: how long each lasted and the slot-seconds it left on the floor against the phase's peak in-flight.",
+}
+
+
+def derived_metrics(steps: list[dict]) -> dict[str, dict[int, float]]:
+    """``{rollout/<tag>: {step: value}}`` from the per-step payloads.
+
+    A validation pass gets the same reductions under ``val-rollout/``: it is a
+    rollout at the same step number as a training one, so it needs its own
+    prefix for the same reason verl keeps ``val-core/*`` apart from ``critic/*``.
+    """
+    out: dict[str, dict[int, float]] = collections.defaultdict(dict)
+    for st in steps:
+        k = st.get("step")
+        if k is None:
+            continue
+        prefix = "rollout/" if st["phase"] == "train" else "val-rollout/"
+        d, r, w = st["durations"], st["rates"], st["ep_wall"]
+        ep_wall = w["decode"] + w["tool"] + w["other"]
+        phase_dur = st["phases"].get("step", {}).get("dur", 0.0)
+        vals = {
+            "span_s": st["span"],
+            "gen_phase_s": st["gen_dur"],
+            "gen_share_of_step": st["gen_dur"] / phase_dur if phase_dur else None,
+            "episodes": st["episodes"],
+            "episodes_per_min": r["ep_min"],
+            "container_slots": st["slots"],
+            "requests": st["requests"],
+            "tokens_out": st["out_tok"],
+            "tokens_prompt": st["prompt_tok"],
+            "prefix_cache_hit_rate": st["cached_tok"] / st["prompt_tok"] if st["prompt_tok"] else None,
+            "decode_tok_s": r["tok_s"],
+            "mean_inflight": r["mean_inflight"],
+            "peak_inflight": st["peak_inflight"],
+            "tail_waste_s": st["tail_waste_s"],
+            "tail_waste_ratio": st["tail_waste_s"] / st["span"] if st["span"] else None,
+            "episode_p50_s": d["p50"],
+            "episode_p90_s": d["p90"],
+            "episode_p99_s": d["p99"],
+            "episode_max_s": d["max"],
+            "straggler_ratio": d["p99"] / d["p50"] if d["p50"] else None,
+            "turns_per_episode": r["turns"],
+            "tokens_per_turn": r["tok_per_req"],
+            "tool_calls": st["tool_calls"],
+            "tool_calls_per_episode": st["tool_calls"] / st["episodes"] if st["episodes"] else None,
+            "tool_wall_s": w["tool"],
+            "decode_wall_s": w["decode"],
+            "decode_share_of_episode": w["decode"] / ep_wall if ep_wall else None,
+            "queue_wall_s": st["req_time"]["queue"],
+            "prefill_wall_s": st["req_time"]["prefill"],
+            "reward_mean": r["reward"],
+            "resolved_rate": r["resolved"],
+        }
+        for status, n in st["exits"]:
+            vals[f"exit/{status}"] = n / st["episodes"] if st["episodes"] else None
+        for region in st.get("occupancy", {}).get("regions", []):
+            vals[f"occupancy/{region['name']}/dur_s"] = region["dur"]
+            vals[f"occupancy/{region['name']}/lost_slot_s"] = region["lost"]
+        for tag, v in vals.items():
+            if v is not None:
+                out[prefix + tag][k] = round(float(v), 6)
+    return out
+
+
+def metrics_payload(steps: list[dict], csv_path: str, docs_path: str) -> dict:
+    """Every per-step scalar as one tag table: ``{steps, tags, docs}``.
+
+    Tags are dense over the union of both sources' steps, with ``None`` where a
+    tag was not emitted -- which is what lets the view say "n steps" per tag
+    instead of silently averaging over a different denominator per row.
+    """
+    csv_steps, by_tag = load_metrics_csv(csv_path)
+    derived = derived_metrics(steps)
+    by_tag.update(derived)
+    all_steps = sorted(set(csv_steps) | {s for cells in derived.values() for s in cells})
+    docs, patterns = load_docs(docs_path)
+    for tag in by_tag:
+        if tag in docs:
+            continue
+        # the validation copy of a rollout reduction means the same thing
+        if tag.startswith("val-rollout/"):
+            docs[tag] = "Validation pass. " + (ROLLOUT_DOCS.get("rollout/" + tag.split("/", 1)[1], "") or "")
+            continue
+        # a group's own line, then the nearest documented prefix
+        parts = tag.split("/")
+        found = ROLLOUT_DOCS.get(tag) or next(
+            (ROLLOUT_DOCS["/".join(parts[:i]) + "/"] for i in range(len(parts) - 1, 0, -1)
+             if "/".join(parts[:i]) + "/" in ROLLOUT_DOCS), "")
+        docs[tag] = found or next((d for prefix, d in patterns if tag.startswith(prefix)), "")
+    return {
+        "steps": all_steps,
+        "tags": {t: [cells.get(s) for s in all_steps] for t, cells in sorted(by_tag.items())},
+        # only the tags present, so METRICS.md's ~170 rows do not all ride along
+        "docs": {t: d for t, d in docs.items() if d and t in by_tag},
+        "csv": os.path.basename(csv_path) if csv_steps else None,
+    }
+
+
 def run_dir(directory: str) -> str:
     """The run's own ``analysis/<experiment>`` directory: the parent of the shard dir.
 
@@ -557,7 +787,7 @@ def experiment_name(directory: str) -> str:
     return os.path.basename(os.path.dirname(real)) if name == "timeline" else name
 
 
-def build(directory: str, experiment: str | None = None) -> dict:
+def build(directory: str, experiment: str | None = None, metrics_csv: str | None = None) -> dict:
     by_traj, train = load(directory)
     gens = [e for e in train if e["name"] in ROLLOUT_PHASES]
     if not gens:
@@ -571,8 +801,14 @@ def build(directory: str, experiment: str | None = None) -> dict:
         payload = step_payload(by_traj, gen, by_step.get(gen.get("step"), {}), instances, action_names)
         if payload:
             steps.append(payload)
+    here = os.path.dirname(os.path.abspath(__file__))
     return {
         "experiment": experiment or experiment_name(directory),
+        "metrics": metrics_payload(
+            steps,
+            metrics_csv or os.path.join(run_dir(directory), "metrics.csv"),
+            os.path.join(os.path.dirname(here), "METRICS.md"),
+        ),
         "kinds": KINDS,
         "instances": instances,
         "action_names": action_names,
@@ -588,8 +824,10 @@ def main() -> None:
     ap.add_argument("--experiment", default=None, help="run id shown in the title (default: inferred)")
     ap.add_argument("--out", default=None,
                     help="output HTML (default: timeline.html in the run dir, i.e. <dir>/..)")
+    ap.add_argument("--metrics", default=None,
+                    help="metrics.csv for the metrics view (default: the one in the run dir)")
     args = ap.parse_args()
-    data = build(args.dir, args.experiment)
+    data = build(args.dir, args.experiment, args.metrics)
     here = os.path.dirname(os.path.abspath(__file__))
     # The committed template is the "_example" file: it carries the __DATA__
     # placeholder, not a rendered run. Prefer an un-suffixed name if one appears.
@@ -601,7 +839,8 @@ def main() -> None:
     out = args.out or os.path.join(run_dir(args.dir), "timeline.html")
     with open(out, "w") as fh:
         fh.write(html)
-    print(f"wrote {out} ({os.path.getsize(out)/1e3:.0f} kB, {len(data['steps'])} steps)")
+    print(f"wrote {out} ({os.path.getsize(out)/1e3:.0f} kB, {len(data['steps'])} steps, "
+          f"{len(data['metrics']['tags'])} metric tags)")
 
 
 if __name__ == "__main__":
