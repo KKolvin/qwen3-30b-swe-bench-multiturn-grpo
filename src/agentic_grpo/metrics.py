@@ -71,6 +71,7 @@ class TurnTiming:
     completion_tokens: int = 0       # tokens the server says it generated
     cached_tokens: int = 0           # prompt tokens served from the prefix cache
     prompt_tokens: int = 0           # this turn's full context size (grows each turn)
+    replica: int = -1                # rollout replica that served it (-1: unknown)
 
     # --- tool execution (docker; the server never sees this) ---
     tool_start: float = 0.0

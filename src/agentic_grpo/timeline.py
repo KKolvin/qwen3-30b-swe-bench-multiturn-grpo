@@ -208,6 +208,7 @@ class TrajectoryTimeline:
                 "prompt_tokens": t.prompt_tokens or None,
                 "cached_tokens": t.cached_tokens or None,
                 "num_tool_calls": t.num_tool_calls or None,
+                "replica": t.replica if t.replica >= 0 else None,
             }
             if t.has_server_timing():
                 attrs.update(

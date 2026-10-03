@@ -28,7 +28,7 @@ from agentic_grpo.bash_tool import BASH_TOOL_NAME
 from agentic_grpo.config import int_env
 from agentic_grpo.editor_tool import EDIT_TOOL_NAME
 from agentic_grpo.metrics import TrajectoryMetrics, TurnTiming
-from agentic_grpo.sglang_timing import SGLANG_TIMING_KEY
+from agentic_grpo.sglang_timing import REPLICA_KEY, SGLANG_TIMING_KEY
 from agentic_grpo.timeline import trajectory_timeline
 
 logger = logging.getLogger("agentic_grpo.episode")
@@ -186,6 +186,8 @@ def turn_timing(turn: int, call_start: float, call_end: float, out: Any) -> Turn
         t.completion_tokens = int(srv.get("completion_tokens", 0) or 0)
         t.cached_tokens = int(srv.get("cached_tokens", 0) or 0)
         t.prompt_tokens = int(srv.get("prompt_tokens", 0) or 0)
+        replica = srv.get(REPLICA_KEY)
+        t.replica = replica if isinstance(replica, int) else -1
     return t
 
 

@@ -323,7 +323,7 @@ timestamps, from **both** halves of a step:
 
 | `cat` | Events | Written by |
 |---|---|---|
-| `traj` | `container_slot_wait`, `container_start`, `generate` (one per turn, carrying the server's `request_received` / `request_scheduled` / `decode_start` / `decode_finished` / `response_sent` plus `queue_s`/`prefill_s`/`decode_s`), `tool_call` (one per **call**, with the command), `format_error`, `cleanup`, `score`, `episode` | each `AgentLoopWorker`, from [`SWEBenchAgentLoop.run`](src/agentic_grpo/agent_loop.py) |
+| `traj` | `container_slot_wait`, `container_start`, `generate` (one per turn, carrying the server's `request_received` / `request_scheduled` / `decode_start` / `decode_finished` / `response_sent` plus `queue_s`/`prefill_s`/`decode_s`, and `replica`, the rollout replica that served the request, so per-request TTFT = `decode_start - request_received` can be compared across replicas), `tool_call` (one per **call**, with the command), `format_error`, `cleanup`, `score`, `episode` | each `AgentLoopWorker`, from [`SWEBenchAgentLoop.run`](src/agentic_grpo/agent_loop.py) |
 | `train` | `gen`, `reward`, `old_log_prob`, `adv`, `update_actor`, `update_critic`, `update_weights`, `save_checkpoint`, `testing`, `validate`, `step` — each with its `step` number | the trainer actor, by rebinding verl's `marked_timer` ([`patch_trainer_timeline`](src/agentic_grpo/timeline.py)) |
 
 verl keeps only the *durations* of the training phases (`timing_s/*`, §9); this keeps

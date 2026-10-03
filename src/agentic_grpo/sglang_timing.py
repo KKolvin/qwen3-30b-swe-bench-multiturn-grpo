@@ -53,6 +53,13 @@ logger = logging.getLogger("agentic_grpo.sglang_timing")
 # Key under which the timing dict rides on TokenOutput.extra_fields.
 SGLANG_TIMING_KEY = "sglang_timing"
 
+# Which rollout replica served the request, stamped inside the timing dict. The
+# server actor is the only place that knows for certain: the load balancer's
+# server_id never leaves verl's client, and with TP < n_gpus there are several
+# independent SGLang servers (each with its own queue and radix cache), so a
+# per-request TTFT is only comparable once you know whose queue it sat in.
+REPLICA_KEY = "replica"
+
 # meta_info field -> our name. Everything here is a UNIX wall-clock instant
 # (time.time()) except the two explicit durations, so it is comparable across
 # processes -- which is the whole point, since the agent loop lives in a
@@ -236,7 +243,11 @@ def _build_timed_server_class() -> type:
                 captured = getattr(self, _CAPTURE_ATTR, None)
                 timing = captured.pop(request_id, None) if captured else None
 
-            if timing and output is not None:
+            # Stamped even when the server reported no timestamps (timing is None):
+            # the replica is known regardless, and turn_timing treats a dict
+            # without timestamps as client-only timing.
+            timing = {**(timing or {}), REPLICA_KEY: self.replica_rank}
+            if output is not None:
                 try:
                     output.extra_fields[SGLANG_TIMING_KEY] = timing
                 except Exception:  # noqa: BLE001 - e.g. a future non-pydantic output type
