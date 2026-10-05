@@ -1,580 +1,678 @@
-# Timeline simulator: design rules
+# Timeline simulator 设计
 
-**这东西是干什么用的：** 手上有一堆某个 harness 吐出来的 trace、一份训练 recipe 和一堆
-config，没有 profile。simulator 要说出时间线长什么样、一步端到端要多久。trace 的格式是那个
-harness 当时高兴怎么写就怎么写的，所以 simulator **不要求格式**：它规定一条 floor（§2.3），
-trace 里有什么就用什么，并且明着标出哪些数是它自己编的。
+## 0. 这是干什么的
 
-回放 run `20260912-072938`、对上 `analysis/<run>/timeline/*.jsonl`，是用来证明它算得准的，
-不是它要交付的结果。§6 和 §8 是检验手段，不是产品。
+手上有一堆某个 harness 吐出来的 trace、一份训练 recipe、一堆 config，但没有 profile。simulator
+要回答两件事：
 
-机制上它是一个 trace-driven 的 discrete-event simulator，管 sync GRPO 一步里 rollout 那一侧：
-episode release -> worker slot -> SGLang scheduling -> tool -> reward eval，group barrier
-和训练各段当作 blocking span。它预测每个 decode step 的延迟、TTFT、TPOT，和一步的端到端
-wall clock。
+- 一步 GRPO 端到端要多久；
+- 这一步的时间线长什么样：什么时候在 decode，什么时候在等 tool，什么时候在等打分，什么时候在训练。
 
-This file is the contract it has to be built against, because every way it can fail is
-silent: a number copied out of the answer, a number fitted to this one workload, and a
-number invented at the adapter and then typed as if it had been measured.
+它是一个 trace-driven 的 discrete-event simulator。trace 告诉它「要干哪些活、每段活有多长」，
+它自己算「这些活放到这套系统上，各自什么时候发生」。
 
----
+trace 没有固定格式，harness 当时怎么高兴怎么写。所以 trace 里有什么就用什么，缺的只能估，
+**估出来的数必须明着标出来**。
 
+simulator 出错基本都是静默的，最常见的三种：
 
+1. 把答案抄进了输入（比如直接用 trace 里的到达时刻），看起来很准，其实什么都没预测；
+2. 参数是在这一条 trace 上拟合的，换个 workload 就错；
+3. 某个数是 adapter 编的，却被当成实测值用了。
 
-## 0. Scope
-
-**In:** synchronous GRPO. Burst release of `train_batch_size * n` episodes, group
-barrier, training holding the GPUs.
-
-**Out:** off-policy orchestration, and anything about *learning*. The
-simulator answers "what would the **system** do with this demand", never "what would
-the **policy** do". Staleness, curriculum, sampling temperature all change the
-trajectories themselves, and a replayed trace cannot represent that.
-
-本 simulator 的主要应用场景是「有 recipe、没跑过、想知道要多久」，这本身就是一个
-counterfactual，**界线在 system 和 policy 之间**，就是 §7 的第一行：
-
-- 改 TP、replica 数、concurrency cap、KV dtype、硬件——模型写出来的 token 不变，回放的
-  token 流照样成立，**这种 simulator 能回答**；
-- 改 turn cap、工具集、prompt 模板、换模型——trajectory 本身就变了，回放代表不了，**这种
-  simulator 必须认出来并且拒绝**，不能默默给个数（§7）。
-
-**「回放对得上」是里程碑，不是 scope。** 第一个可交付是吃一条自家 trace，回放出来对上
-`analysis/<run>/timeline/*.jsonl`。先在这里证明它算得准，才有资格对一条没人 profile 过的
-trace 报数。IR 里有几个字段 engine 现在不读（`Task.duration_is_cap`、`Request.max_new_tokens`），
-留着是因为当时不记、后面就补不回来了，不是因为已经在用。
-
-**Workload-neutral by construction.** The simulator must not be biased toward the
-SWE-bench agentic workload it is calibrated and validated on. A workload reaches it
-only as a trace; the same simulator must take a synthetic open-loop serving trace and
-be right about that too. §5 is the mechanism that enforces this; §2 is the check.
+后面大部分规矩都是在堵这三个口子。
 
 ---
 
+## 1. 能回答什么，不能回答什么
 
+**能回答：改系统，不改模型的行为。** 改 TP、replica 数、concurrency cap、KV dtype、换硬件——
+模型写出来的 token 不变，回放 trace 里的 token 流照样成立。
 
-## 1. The rule
+**不能回答，必须认出来并拒绝：**
 
-> **凡是能在 timeline 里观测到的量，一律是 simulator 的 output，不是 input。把要预测的那个量
-> 当成 input 喂进去，就是 target leakage：validation 必然通过，所以什么都没验证到。**
+- 改 turn cap、工具集、prompt 模板、换模型。trajectory 本身变了，旧 trace 代表不了。
+- staleness、curriculum、sampling temperature。同理，它们改的是 policy 写什么。
+- 一个模型副本拆到两台以上机器上跑。一台机器里 GPU 之间的通信又快又稳，测 cost model 的时候
+  顺带就测进去了；跨机器要走网卡，又慢，耗时还要看网络上同时有谁在抢，cost model 测不出来。
+  要算这个就得模拟网络本身，[simllm](https://github.com/openfabric-systems/simllm) 做的就是这个，
+  我们不重做。多个副本各占一台机器没问题，副本之间不通信。
 
-This decides nearly every question about what the simulator is allowed to be told.
+**两种时候，别混：**
 
-放到主用途上，这条规则还有个更硬的理由：**预测的时候根本没有 timeline，S 你想喂也喂不到。**
-所以它不是一条 discipline，是 feasibility constraint——要 S 才跑得动的 simulator，在它真正该
-用的场合根本跑不起来。手上碰巧有 timeline 的时候，这条规则表现为 target leakage；没有的
-时候，它表现为「这个 simulator 根本用不了」。
+| | 手上有什么 | 干什么 |
+| --- | --- | --- |
+| 开发时 | 我们自己的 run：trace + 真实 timeline | 拿真实 timeline 对答案，证明 simulator 是对的 |
+| 使用时 | 别人的 trace + config，**没有 timeline** | 报一个带 interval 的 e2e。没人能告诉你对不对 |
 
-The worked example: **prefix hit rate is not an input.** What the trace supplies is
-prefix *structure* — which earlier request each request extends, and by how much. The
-hit *rate* is derived by the simulator from the radix cache, its LRU eviction, the
-page size and the routing. The trace's own `cached_tokens` is then a validation
-target, and a sharp one:
+真正要交付的是使用时那一种。在自家 trace 上对上 `analysis/<run>/timeline/*.jsonl` 只是里程碑：
+证明了 simulator 有资格去给没有答案的 trace 报数。
+
+---
+
+## 2. 整体长什么样
 
 ```
-run 20260912-072938, 95,403 adjacent turn pairs
-  prompt_{k+1} < prompt_k + completion_k          0 cases  -> pure append holds exactly
-  cached_{k+1} - (prompt_k + completion_k)        p50 -113, p90 -69, 100% negative
+trace  ──adapter──>  IR（要干哪些活）  ──┐
+                                          ├──>  engine  ──>  预测 timeline
+config ────────────> config bundle     ──┘                  汇总表（e2e interval 等）
+                                                             provenance 报告（每个数从哪来）
 ```
 
-That deficit is `page_size=64` alignment plus the page SGLang holds back. A simulator
-that skips paging predicts a deficit of 0 and is caught immediately. That is what a
-derived quantity is for.
-
-The same rule disqualifies as inputs: batch composition, prefill/decode interleaving,  
-queue depth, TTFT, TPOT, token usage, retraction counts, arrival times of any turn  
-after the first, and the ramp/plateau/drain shape.
-
----
-
-
-
-## 2. Labels
-
-
-
-### 2.1 IR：simulator 唯一认得的 input
-
-IR = intermediate representation，编译器那个意思。**adapter 是 frontend，system layer 是
-backend，IR 是中间那层语言**：任何 harness 的 trace 先被 adapter 翻成 IR，simulator 只认
-IR，认不出它原来是什么格式。IR 就是 `[src/simulator/ir.py](src/simulator/ir.py)` 里那五个
-class：
-
-
-| class      | 是什么                      | 关键字段                                                                               |
-| ---------- | ------------------------ | ---------------------------------------------------------------------------------- |
-| `Workload` | 一整份 workload             | `sessions`、`source`（哪来的）                                                           |
-| `Session`  | 一串相关的 node               | `requests`、`tasks`、`leases`、`group`、`release_offset_s`                             |
-| `Request`  | 一次 inference 调用          | `prompt_tokens`、`completion_tokens`、`prefix_parent`、`shared_prefix_tokens`、`after` |
-| `Task`     | 非 inference 的活：工具、起容器、打分 | `duration_s`、`pool`、`after`                                                        |
-| `Lease`    | 跨多个 node 一直占着的资源 slot    | `pool`、`acquire_before`、`release_after`                                            |
-
-
-一个 Session 就是一张 DAG：node 是 Request 或 Task，edge 是 `after`。一个 SWE-bench
-episode 和一条 open-loop serving load 都得用这同一套 class 表达出来——那两条就是
-`tests/test_simulator_ir.py` 开头的两个 test。
-
-**IR 同时是一张 whitelist：能在 IR 里写出来的，才是合法 input。** 所以 IR 里没有 timestamp、
-没有 `cached_tokens`、没有 TTFT、没有到达时刻——S 那一类根本没有字段可填，全被赶到
-`[src/simulator/observed.py](src/simulator/observed.py)` 去了。§1 那条规则不靠自觉守，靠
-IR 里根本没有这些字段守。
-
-IR 也**不装 config**：`Lease` 只说要哪个 pool，不说那个 pool 有多大。IR 只装 workload，
-C 那一类走另一条路进来。
-
-### 2.2 labels
-
-simulator 碰到的每个量，都恰好带一个 label。label 回答的问题是**「手上只有 trace 和
-config，这个数从哪来？」**，不是「喂它进去算不算作弊」。后一个问题只在有 timeline 的时候
-才出现，前一个问题每次都出现。
-
-
-|       | 含义                                              | 预测时（只有 trace + config）从哪来                                                                          |
-| ----- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| **T** | 来自 trace——workload，逐 request 或逐 episode         | 看 tier，见下。floor 只保证给得出 token 流                                                                     |
-| **C** | 从 config、server args 或 engine 源码读出来，不许猜         | **C-observed** 从活着的 server 上读；**C-resolved** 没有活 server，跑 engine 自己的默认值解析代码解出来。两者都不算猜，但只有前者被验证过    |
-| **K** | 来自 orthogonal calibration grid，是**唯一**需要 fit 的量 | **K-measured** 本机 calibrate 出来的；**K-transferred** 查 calibration library 里最近的 grid point，且必须打印离它有多远 |
-| **S** | simulator 自己推导出来的                               | 拿不到，所以只能是 output。手上有自家 timeline 时，它同时是 validation target                                           |
-| **G** | gap：**我们自己的 run** 里可以补的 instrumentation         | 外来 trace 补不了，那种情况归 I                                                                               |
-| **I** | 这条 trace 里没有，只能估                                | 必须说清楚从哪个 distribution 抽的，那个 distribution 又是哪来的                                                     |
-| **A** | 假设（列在 §7，带风险等级和证伪办法）                            |                                                                                                    |
-
-
-**I 不是补丁，是主路径。** 大多数 harness 的 trace 里，大多数 duration 都是 I。三个后果：
-
-- 只要有 I 参与，e2e **必须报 interval，不能报一个点**；
-- 必须出一张 **sensitivity table：是哪个 I 把 interval 撑开的**。这张表才是真正交给用户的
-结果——「这一步 1.4–2.2h，这么宽主要是因为不知道 tool duration，去把它记下来，宽度砍一半」；
-- I 可以是抽出来的，但 seed 固定（§6 的 determinism 要求）。
-
-
-
-### 2.3 最低 trace contract
-
-「不能指望 trace 有格式」这句话不能就这么放着。得把它变成一条 floor 加一个 degradation
-ladder，labels 相对 tier 来定义。
-
-
-| tier   | 典型来源                       | 拿得到                                                             | 于是                                              |
-| ------ | -------------------------- | --------------------------------------------------------------- | ----------------------------------------------- |
-| **T0** | 只有对话：`.traj`、消息 jsonl、任何日志 | 配 tokenizer 和 prompt 模板可重建 token 数、prefix 结构、turn 数、exit reason | **duration 全是 I**                               |
-| **T1** | + 每条事件的时间戳                 | duration 靠差分                                                    | 差分出来的 duration 是**被污染的**，见 §2.4 check 1         |
-| **T2** | + API 的 usage 字段           | token 数精确                                                       | `cached_tokens` 是 **S**，adapter 必须拦进 `observed` |
-| **T3** | 我们自己的 timeline             | 全有，含 S 的 validation target                                      | 只用来 calibrate 和 diff                            |
-
-
-floor 落在 T0，这是好消息：几乎所有 harness 都给得出 token 流，而 token 流正是 cost model
-最吃的输入（§5：KV bytes 跟着 `sum_seqlen` 走）。缺的是非 GPU 那些 duration，而按
-[[tool-time-is-timeouts-not-work]]，tool 只占一个 episode 的 3.1%。所以 T0 加一份 config
-就够把占大头的 decode 从 first principles 算出来，剩下的用 I 带 interval。tier 越低，
-interval 越宽，但不会突然算不出来。
-
-**例外是训练段，而且这个例外很大。** §3 L7 把 training phase 当不透明的 blocking span 回放。
-没有 profile 的时候它就是 I，而按 §9 的数字，`old_log_prob` + `ref` + `adv` + `update_actor`
-
-- `update_weights` 加起来占一步的 52%。一条 T0 trace 的 e2e interval 会被这**一个** I 支配，
-除非另外从 recipe 那边给它建个模型。这是目前设计里最大的 gap，不能顺手带过。
-
-
-
-### 2.4 四条机械检查
-
-前两条是全部的 anti-overfit discipline，第三条是 workload neutrality，第四条管住 I 不许
-冒充别人。
-
-**1. No S on the input side.** 分界线一句话：**T 是「一段有多长」，S 是「它什么时刻发生」。**
-
-
-| T：duration 和结构                            | S：时刻和结果                         |
-| ----------------------------------------- | ------------------------------- |
-| 容器启动要多久、工具跑多久、grading 跑多久                 | 每个 turn 什么时候到 server（第一轮也算）     |
-| 每轮的 `prompt_tokens` / `completion_tokens` | 排队等多久、TTFT、TPOT、batch 里当时有谁     |
-| 接的是哪条请求、跟它共享多少 token（结构上**能**省多少）         | `cached_tokens`：实际从 cache 里省下多少 |
-
-
-左边这些，换 TP、换 KV dtype、改并发上限都不会变，所以可以照搬进来。右边这些恰恰是这些改动会
-撬动的——喂进去就等于把答案抄进了题面，simulator 再也不会犯错，也再也不会告诉你任何事。
-
-唯一的例外是 `Session.release_offset_s`（每个 session 相对 t=0 的释放偏移），sync GRPO 下
-全是 0.0。注意它的来源是 **recipe（C）**，不是 trace：外来 trace 自己的到达节奏是**那套系统
-当时的行为**，属于 S，绝对不能照抄进来。除此之外 trace 里的时间戳一个都不进来。
-
-**差分出来的 duration 不是 T。** T1 是最常见的 tier，而 T1 里拿 duration 只有一个办法：差
-两个时刻，`tool_dur ≈ t(下一个 request) − t(上一条 response)`。这个差里混着排队、client
-overhead、harness 自己的 think time，还有采集那一次运行的 contention。把它当 T 喂进去，等于
-把「系统当时等了多久」缝进了「活儿本身有多久」——**simulator 会在 e2e 上显得很准，因为答案
-是抄来的**。还是 target leakage，只是换了个入口。所以差分 duration 要么标成 I、当 upper
-bound 用，要么先证明采集那次没跑满。当场就能做的检查：把 config 里的 replica 数翻倍，看预测
-的 e2e 动不动。不动，就是被污染了。
-
-**2. No K fitted on a run trace.** K comes from the engine, on a designed grid.
-
-**3. Workload neutrality: the system layer may not contain the words**
-`episode`**,** `turn`**,** `tool`**, or** `swebench`**.** The interface between the workload layer
-and the system layer is a request stream — arrival events carrying
-`(prompt_tokens, prefix_parent, shared_len, completion_tokens)`. Closed-loop feedback
-("turn k+1 arrives after turn k's tool finishes") belongs to the workload layer and
-reaches the system layer only as an arrival time. If the system layer cannot tell
-which generator produced its input, it cannot be biased toward one.
-
-neutrality 是 spec，不是 hygiene。进来的 trace 本来就来自不认识的 harness，所以这不是「小心
-别被 SWE-bench 带偏」这种自觉，它就是产品要求本身。上面那条只管住了下游，上游还有一条一样
-重要：**harness 知识只许待在 adapter 里**。adapter 探测 tier、认领格式、逐字段声明来源，
-除它以外任何地方都不许知道 trace 长什么样。
-
-**4. 不许 I 冒充 T。** label 属于 **(量, trace)** 这一对，不属于量本身。`prompt_tokens` 对
-T2 trace 是 T，对 T0 trace 是 T-derived（要 tokenizer 加完全一致的模板），对只记了轮数的
-trace 是 I——同一个字段，三个 label。所以 label 必须跟着数据走、写进 IR，不能只写在这份文档
-的表格里。另外两条：**engine 不许读 provenance**（跟 `Task.kind` 同一条规矩）；**diff
-harness 拒绝给「上游输入含 I」的量打分**，否则你验的是自己的 prior。
-
-These land as code in `[src/simulator/ir.py](src/simulator/ir.py)`: the node type is
-`Session`, not `Episode` — the system layer legitimately needs it, as the sticky
-routing key, and must not know what correlates it. Observed quantities live apart in
-`[src/simulator/observed.py](src/simulator/observed.py)`, which turns "no S on the
-input side" into an import rule, enforced by
-`[tests/test_simulator_ir.py](tests/test_simulator_ir.py)`.
-
-**IR 现在还表达不了「不知道」**，这是 §8 第 1 步要补的。`Task.duration_s` 是必填 float；
-`Request.stop` 只能在 `eos` 和 `length` 里二选一，而 T0 trace 常常分不出来；
-`shared_prefix_tokens` 要 tokenizer 加完全一致的模板才算得出来；`Workload.source` 是单个
-字符串，一堆来源混在一起就不够用了。结果是：一条 T0 trace 现在能构造出**语法合法、语义全是
-编的** workload，而没有一个字段能把这件事说出来。
-
----
-
-
-
-## 3. What each layer needs
-
-
-
-### L1 Workload
-
-
-| Information                                                                |           | 备注                                                                                             |
-| -------------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------- |
-| episode id, group id (`n=8`), instance                                     | T         |                                                                                                |
-| per-turn `completion_tokens`                                               | T         |                                                                                                |
-| per-turn `prompt_tokens`                                                   | T         | 到这一轮为止整段对话的长度（含之前所有轮的 prompt、模型输出和工具返回），存绝对值不存增量。T0 下要靠 tokenizer + 完全一致的模板重建                  |
-| `prefix_parent`（接的是哪一条请求）                                                  | T         | 上一轮那条请求的 id                                                                                    |
-| `shared_prefix_tokens`                                                     | T         | 本请求开头有多少 token 与 `prefix_parent` 的完整序列相同。这是**能省的上限**，不是实际命中数                                   |
-| observation tokens                                                         | T         | 工具吐回来的token（context 涨了多少就是由`completion` + `observation` 决定）                                    |
-| tool duration                                                              | T / **I** | 这次工具调用实际花了多久，simulator 直接回放这个数。T3 是直接量的；T1 只能差分，**被污染**（§2 check 1）；T0 全靠 I                    |
-| tool kind（trace 记 `bash` / `edit` / `submit`；进 IR 后一律是 `Task.kind="tool"`） | T         | 只是出报表用的标签。engine **不许拿它搞 if else 分支**，否则就被我们的 workload 带偏了                                     |
-| timed-out flag（IR: `Task.duration_is_cap`）                                 | T         | （等以后做改 timeout 的 counterfactual，得靠它认出哪些条回放不了。现在不做，见 §0）                                        |
-| reward eval duration                                                       | T / **I** | `score` p50 21.6s，p90 30.4s。大多数 harness 的 trace 里没有这一段，那时候是 I                                  |
-| exit reason, turn count                                                    | T         |                                                                                                |
-| sampling params, `max_new_tokens`                                          | C         |                                                                                                |
-| prefix hit rate / `cached_tokens`                                          | **S**     |                                                                                                |
-| arrival time of every turn (except the frist turn)                         | **S**     | 「turn k+1 什么时候到」= turn k 什么时候decode完 + tool duration。tool duration 是白给的信息，什么时候decode 完需要sim去算。 |
-
-
-
-
-### L2 Router
-
-
-| Information                               |       | 备注                                                                                                                             |
-| ----------------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------ |
-| sticky by `request_id`, else least-loaded | C     | verl `GlobalRequestLoadBalancer`，见 `src/agentic_grpo/agent_loop.py:322`；如果这个id之前来过就派回同一台server，没见过的 id 就在 replica 里挑 load 小的那台 |
-| replica count, TP size                    | C     |                                                                                                                                |
-| which replica each request landed on      | **G** | 自家 run 里最大的 gap。没有它，§6 的 L1 per-request diff 做不了，成本是 `generate` 事件加一个字段。外来 trace 补不了——那边它本来就是 S，由 simulator 自己的 router 推出来     |
-
-
-
-
-### L3 Scheduler, per replica
-
-
-| Information                                                      |       | 备注                                                                   |
-| ---------------------------------------------------------------- | ----- | -------------------------------------------------------------------- |
-| `schedule_policy` (`fcfs`), `schedule_conservativeness` (1.0)    | C     | `sglang/srt/server_args.py`                                          |
-| `chunked_prefill_size`, `max_running_requests`, `page_size` (64) | C     | 从跑着的 server 上读，别照默认值抄——默认值是按 GPU memory 分支的                          |
-| `new_token_ratio` init / decay / floor                           | C     | 驱动 backoff 和 retraction                                              |
-| radix cache + LRU eviction                                       | C     | `sglang/srt/managers/schedule_policy.py`                             |
-| event loop: `overlap` or `normal`                                | **G** | 决定 CPU 调度那部分算不算暴露在 step time 里。`scheduler.py:1068` vs `:1095`，查一次就知道 |
-| batch composition per iteration                                  | **S** | `get_next_batch_to_run`，`scheduler.py:1805`                          |
-| prefill/decode interleaving                                      | **S** | `get_new_batch_prefill`，`scheduler.py:1895`                          |
-| queueing delay, TTFT, TPOT                                       | **S** | 主要预测目标                                                               |
-| retraction / preemption events                                   | **S** | 现有 trace 里全是 0，照样要建，理由见 §4                                           |
-
-
-
-
-### L4 Cost model
-
-
-| Information                                |       | 备注                            |
-| ------------------------------------------ | ----- | ----------------------------- |
-| layers, KV heads, head dim, active experts | C     | 读模型的 `config.json`，不要写死       |
-| dtype widths; KV placement under TP        | C     | 包括 `num_kv_heads < tp` 时的复制分支 |
-| HBM bandwidth                              | C     | 硬件规格                          |
-| `cuda_graph_max_bs`, capture buckets       | C     | step time 的台阶在这儿              |
-| **eta(B, ctx, prefill_len)**               | **K** | 全 simulator 唯一 fit 出来的量       |
-| per-step fixed overhead                    | **K** |                               |
-| prefill cost curve                         | **K** |                               |
-
-
-
-
-### L5 KV pool
-
-
-| Information                                            |       | 备注                                           |
-| ------------------------------------------------------ | ----- | -------------------------------------------- |
-| `max_total_num_tokens`                                 | C     | TP=4 下每 replica 4,560,512；gauge 在 busy 时一直有值 |
-| page size, allocation granularity, eviction thresholds | C     |                                              |
-| token usage over time, evictions, retraction           | **S** | 实测 p50 0.38，p99 0.47                         |
-
-
-
-
-### L6 Non-GPU resources
-
-
-| Information                                                   |           | 备注                                          |
-| ------------------------------------------------------------- | --------- | ------------------------------------------- |
-| worker count, per-worker container cap                        | C         |                                             |
-| eval container pool (per-worker semaphore, 4)                 | C         | 这就是 `eval_wait` p90 **248s**、max 755s 的直接原因 |
-| container start latency                                       | T / **I** | p50 3.3s。T3 是直接量的，其余 tier 基本都是 I            |
-| tool exec latency                                             | T / **I** | 同上                                          |
-| whether tool latency degrades at higher container concurrency | **A**     | 中等风险                                        |
-| CPU / network contention                                      | **A**     | 假设没有                                        |
-| `eval_wait`, slot queueing                                    | **S**     |                                             |
-
-
-
-
-### L7 Orchestration (sync GRPO)
-
-
-| Information                      |           | 备注                                                                                                                          |
-| -------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------- |
-| batch 256 x n=8, group barrier   | C         |                                                                                                                             |
-| training phase durations         | T / **I** | 当作不透明的 blocking span 回放，simulator 不建 FSDP 的模型。没有 profile 时它是 I，而按 §9 的数字它占一步的 52%——一条 T0 trace 的 e2e interval 会被它一个撑开（§2.3） |
-| weight-sync drain semantics      | C + T     |                                                                                                                             |
-| ramp / plateau / drain structure | **S**     | L2 diff 的主 target                                                                                                           |
-
-
-
-
-### L8 Client overhead
-
-
-| Information                        |       | 备注                                      |
-| ---------------------------------- | ----- | --------------------------------------- |
-| client -> server, server -> client | **A** | 当常数。实测 p50 4.3ms 和 1.9ms，加起来占一个请求的 0.2% |
-
-
----
-
-
-
-## 4. Mechanisms that must be built even though this workload never triggers them
-
-Every one of these is tempting to skip, because in the SWE-bench trace it is provably
-negligible. Skipping any of them welds this workload into the simulator's structure,
-where no code review will see it.
-
-
-| Tempting simplification               | 在这条 trace 上的理由                                   | 换哪种 workload 会崩                                            |
-| ------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------- |
-| no waiting queue                      | `num_queue_reqs` 恒为 0                            | 任何 open-loop 到达的 workload——那里排队**就是** latency 本身           |
-| prefill is negligible                 | cache hit 96.2%，真正 prefill 的只有 ~450 token        | 没有 prefix reuse 的 workload：prefill 变主导，preemption 的节奏整个反过来 |
-| no KV pool limit, no retraction       | `num_retracted_reqs` 恒为 0，`token_usage` p50 0.38 | 长 context 高并发——throughput 是悬崖，不是斜坡                         |
-| decode dominates, be sloppy elsewhere | decode 占一个 episode 的 94.8%                       | think-time 大的 workload                                     |
-
-
-Their never firing on this trace is itself one of the correctness checks.
-
----
-
-
-
-## 5. Where overfitting can actually enter
-
-It is worth being precise about this, because it concentrates the discipline.
-
-按 §2 check 3，neutrality 是 spec，不是 code review 上的洁癖。真实用途下进来的 trace 来自
-不认识的 harness，所以 calibration 一旦把某一种 workload 的形状吃进去，simulator 给别的
-workload 报出来的 e2e 就是错的，而且用户看不出它错在哪。下面那条对角线就是它怎么错的。
-
-- The **scheduler layer is ported, not fitted.** `get_next_batch_to_run`,
-`get_new_batch_prefill`, `update_running_batch`, radix LRU — deterministic source
-with zero free parameters. Transcribe it and it leaks nothing.
-- The **resource layers are semaphore semantics.** Nothing to fit.
-- The **cost model is the only thing learned from data.** So the entire
-workload-neutrality question reduces to: is the cost model a property of the engine
-and the hardware, or of this workload?
-
-Two rules keep it the former.
-
-**Calibrate on a designed grid, never on a run trace.** In run 20260912-072938,
-`corr(B, ctx/req) = -0.845` — batch size and context length are almost perfectly
-anti-correlated, because the drain tail is populated by exactly the longest episodes
-([[tail-cohort-length-bias]]). The trace covers a one-dimensional diagonal of a
-two-dimensional space:
+engine 里面：
 
 ```
-B   1- 16   ctx p50 51784      <- drain tail
+虚拟时钟 + 事件队列
+├─ router        照抄 verl，决定请求发去哪个 replica
+├─ scheduler     每个 replica 一个真的 SGLang Scheduler，model worker 换成 stub（§7）
+├─ cost model    scheduler 每跑一步，告诉它这一步花了多久（§8）
+├─ 资源池        container、打分用的 eval container，按 semaphore 排队
+└─ 编排          group barrier；训练各段按给定时长占住时间
+```
+
+一个 episode 在里面走一遍：放出来 → 拿到 container → 发第一轮请求 → router 选 replica →
+scheduler 把它排进 batch，一步一步 decode，每一步的耗时由 cost model 给 → 生成完 → 跑 tool
+（耗时从 trace 回放）→ 发下一轮请求 → …… → 提交，抢 eval container 打分 → 整个 batch 都打完分 →
+训练各段 → 下一步。
+
+注意：第二轮以后的请求**什么时候到**，是 simulator 自己算的——上一轮什么时候生成完（simulator 算）
+加上 tool 跑多久（trace 给）。
+
+---
+
+## 3. 最重要的规矩：答案不能当输入
+
+> 凡是在真实 timeline 里能看到的量，都是 simulator 要算的，不能喂给它。
+
+两个理由：
+
+- 喂进去等于把答案抄进题面。simulator 永远不会错，也永远告诉不了你任何事。
+- 更硬的理由：使用时根本没有 timeline，这些量想喂也拿不到。所以这不是自不自觉的问题，
+  不这么做就跑不起来。
+
+怎么分？看它换一套系统配置会不会变：
+
+| 可以喂：活本身有多长、有多少 | 不能喂：活放到这套系统上什么时候发生、结果如何 |
+| --- | --- |
+| 容器启动、tool、打分各要多久 | 每一轮请求什么时候到 server |
+| 每一轮的 `prompt_tokens` / `completion_tokens` | 排队多久、TTFT、TPOT、batch 里当时有谁 |
+| 这条请求接在哪条后面，结构上最多能复用多少 token | `cached_tokens`：实际从 cache 里省了多少 |
+
+左边这些，改 TP、改 KV dtype、改并发上限都不会变；右边这些正是这些改动会改变的。
+
+**例子：prefix hit rate 不是输入。** trace 能给的是结构：这条请求接在哪条后面、共享多少 token。
+实际命中多少由 radix cache、LRU eviction、`page_size` 和 router 一起决定，是 simulator 要算的。
+trace 里记的 `cached_tokens` 拿来对答案，而且很好用：
+
+```
+run 20260912-072938，95,403 对相邻 turn
+  prompt_{k+1} < prompt_k + completion_k        0 例   -> 下一轮 prompt 就是上一轮整段再加新内容
+  cached_{k+1} - (prompt_k + completion_k)      p50 -113，p90 -69，全部为负
+```
+
+少掉的那 ~113 个 token，来自 `page_size=64` 的对齐，加上 SGLang 扣下的最后一页。一个不管 paging
+的 simulator 会预测差值是 0，马上露馅。
+
+同样不能喂的还有：prefill / decode 怎么交错、队列深度、KV token usage、retraction 次数、
+ramp / plateau / drain 的形状。
+
+**唯一的例外**是 `Session.release_offset_s`：每个 session 相对 t=0 什么时候放出来，sync GRPO 下
+全是 0。它来自 recipe，不来自 trace——别人 trace 里的到达节奏是**那套系统当时的行为**，不能照抄。
+
+**最容易踩的坑：时间戳相减得到的耗时。** 很多 trace 只有时间戳，tool 耗时只能这么算：
+`下一个请求发出的时刻 − 上一个回复到达的时刻`。这个差里混着排队、client 开销、harness 自己的处理
+时间，还有采集那次运行有多挤。拿它当 tool 耗时喂进去，等于把「系统当时等了多久」塞进了「活本身
+有多久」，simulator 的 e2e 会显得很准，因为答案是抄来的。所以这种耗时要么当成估的数、只当
+upper bound 用，要么先证明采集那次系统没跑满。当场就能做的检查：把 config 里的 replica 数翻倍，
+看预测的 e2e 动不动。不动，就是被污染了。
+
+开发时对答案（§12），会分级把真实的到达时刻喂回去。那是对答案用的脚手架，只在开发时存在，
+千万别接进使用时的流程。
+
+---
+
+## 4. 输入一：IR
+
+IR 借的是编译器的说法：adapter 把各种 harness 的 trace 翻成 IR，simulator 只认 IR，不知道 trace
+原来长什么样。定义在 [src/simulator/ir.py](src/simulator/ir.py)：
+
+| class | 是什么 | 关键字段 |
+| --- | --- | --- |
+| `Workload` | 一整份 workload | `sessions`、`prefixes`、`source`（从哪来） |
+| `Session` | 一串相关的活，比如一个 episode | `requests`、`tasks`、`leases`、`group`、`release_offset_s`、`spawned_by` |
+| `Request` | 一次 inference 调用 | `prompt_tokens`、`completion_tokens`、`prefix_parent`、`shared_prefix_tokens`、`max_new_tokens`、`after` |
+| `Task` | 不是 inference 的活：tool、起容器、打分 | `duration_s`、`pool`、`after` |
+| `Lease` | 跨好几个活一直占着的资源，比如一个 episode 从头占到尾的 container | `pool`、`acquire_before`、`release_after` |
+| `Prefix` | 好几个 session 共享的一段内容，比如 system prompt、题面 | `tokens`、`parent` |
+| `Unknown` | 这个字段没人量过，要从哪个分布抽 | `dist`、`knob`、`scale` |
+
+`Request`、`Task`、`Prefix` 还各带两张小表：`prov` 和 `unknown`，见下面「IR 怎么说不知道」。
+
+一个 Session 是一张 DAG：node 是 Request 或 Task，edge 是 `after`（「等它做完我才能开始」）。
+一个 SWE-bench episode 和一条 open-loop serving 负载都要能用这同一套 class 写出来，
+[tests/test_simulator_ir.py](tests/test_simulator_ir.py) 开头两个 test 就是这两种。
+
+**IR 里故意没有时间。** 没有时间戳、没有 `cached_tokens`、没有 TTFT。§3 那条规矩不靠自觉，靠 IR
+里根本没有这些字段。真实系统的这些数放在 [src/simulator/observed.py](src/simulator/observed.py)，
+只用来对答案。
+
+**叫 `Session` 不叫 `Episode`，是故意的。** engine 需要知道哪些请求是一伙的（router 靠它把同一个
+session 的请求发到同一个 replica），但不许知道它们为什么是一伙的。engine 一旦知道这是 agent 的
+episode，就可能被我们这个 workload 带偏。
+
+**`Prefix`：第一轮请求不是冷的。** 没有 `Prefix` 的时候，第一轮请求只能写成「不接任何东西」，
+等于说它要从头 prefill。实测完全不是：
+
+```
+run 20260912-072938，4,243 个第一轮请求
+  cached / prompt        p10 0.39   p50 0.983   p90 0.996
+  合计                    9.24M / 11.19M = 82.6%
+  命中不到 50% 的         1,118 (26%)
+```
+
+同一个 group 的 8 条 rollout 共享 system prompt 和题面。那 26% 也不是噪声：530 个 group × 2 个
+replica = 1,060，跟 1,118 对得上——每个 group 在每个 replica 上冷一次，其余都命中。这个数正好
+可以拿来验 router。
+
+`Prefix` 只写长度和接在谁后面，不写内容。第一轮的 `prefix_parent` 指向一个 `Prefix`，后面的轮次
+指向上一轮的 Request。共享内容不等于要等它，所以 `after` 不能指向 `Prefix`，也不能跨 session——
+谁先到谁付 prefill，这由 simulator 算。按字节算这一项不大（只占全部 cached token 的 0.7%），
+但换成大量请求共享 system prompt 的 serving workload，它就是全部。
+
+**`max_new_tokens` 是个坑。** SGLang 接纳新请求时，会给每个在跑的请求预留
+`min(max_new_tokens - 已生成, 4096) × new_token_ratio` 个 token 的 KV（`schedule_policy.py:433`）。
+真 server 只知道 cap，不知道这条请求最后会写多少。所以 simulator 让请求停下的办法只能是：在第
+`completion_tokens` 个位置吐 EOS。**绝对不能**图省事把 `max_new_tokens` 设成 `completion_tokens`——
+那样预留就从「按 cap 估」变成「按答案留」，retraction 永远不会发生，而且不报任何错。
+
+陌生 trace 多半没记 cap，所以这个字段可以是空的，由 config bundle 填。engine 门口的
+`require_runnable` 拦住还空着的，比让 adapter 随手编一个强。
+
+**IR 怎么说「不知道」。** 陌生 harness 的 trace 一定缺字段。要是每个字段都必须填一个数，adapter
+除了编没有别的办法，编出来的还跟实测的长得一模一样——这就是 §0 那三种静默出错的第三种。所以
+`Request`、`Task`、`Prefix` 各带两张小表：
+
+- `prov`：每个字段的值哪来的。trace 读的、config 给的、推出来的（tokenizer 配模板重建、拿相邻
+  turn 相减）、估的。表里没有的字段就是没说，报告里照实列「没说」，不替它猜。
+- `unknown`：这个字段没人量过，要从哪个分布抽。
+
+字段本身还是裸的 `int` / `float`，engine 一行都不用改。一条规矩守着：`unknown` 里有的字段，`prov`
+必须写着「估的」。想挂个分布又想说这是实测值，validate 当场拒。
+
+**抽样放在 engine 前面：`realise`。** [src/simulator/realise.py](src/simulator/realise.py) 吃一个带
+分布的 workload 加一个 seed，吐一个全是具体数的 workload，engine 只认后者。这样 §6 那句「engine
+不许根据 provenance 改变行为」就不用靠自觉：到 engine 手里的时候，估的数和实测的数就是同一个
+float，想区别对待也没得区别。`prov` 跟着 workload 一路走进报告，engine 从不读它。
+
+**一个 node 可以等好几个 node。** `after` 是一个 list。一个 assistant turn 并行发三个 tool call、
+下一轮等三个都跑完，这在别的 harness 里是常态；串成一条链就是凭空加依赖，把 session 拉长。
+
+**subagent 用 `spawned_by`。** 子 agent 是独立的 session，由父 session 的某个 task 拉起，那个 task
+要等子 session 整个跑完才算完。这是唯一允许跨 session 的依赖：两个平级 session 互相等是编排，
+父子相等是 workload 本身的形状。子 agent 单独一个 session，也就单独一个 routing key，这正是想要
+的——它的 prompt 跟父亲几乎不共享，塞进父 session 会让 router 以为它们该在一台机器上。
+
+**还缺的：`Workload.source` 只有一个字符串**，几个来源混在一份 workload 里就不够用了。
+
+**还缺的：unknown 之间不能有关系。** 每个 unknown 字段各抽各的。可 token 数不是这样：下一轮的
+`prompt_tokens` 等于上一轮 prompt 加 completion 再加新内容，`shared_prefix_tokens` 也由它们算出来。
+一份连 token 数都没记的 trace，adapter 现在只能拒绝，因为分开抽出来的三个数一定对不上 `validate`
+的算术。要支持它，IR 得允许「这个字段 = 那几个字段的和」这类写法。只有对话的 trace 不受影响：
+用 tokenizer 重建出来的 token 数是 derived，天然自洽。
+
+`Task.duration_is_cap`（这次 tool 是不是超时被杀了）engine 现在不读。留着它，是因为当时不记，
+事后就补不回来了。
+
+---
+
+## 5. 输入二：config bundle
+
+IR 只装 workload，不装系统配置：`Lease` 只说要哪个 pool，不说 pool 多大。系统配置走另一个输入：
+
+| 从哪来 | 装什么 | 缺了怎么办 |
+| --- | --- | --- |
+| recipe | batch、`n`、group barrier、turn cap、worker 数、每个 worker 的 container 上限、eval pool 大小、session 的释放节奏 | 拒绝跑 |
+| SGLang server args | SGLang 版本；TP、replica 数、`page_size`、`chunked_prefill_size`、`max_running_requests`、`new_token_ratio` 的三个参数、`max_total_num_tokens`、overlap 开没开 | 有活着的 server 就直接读；没有就跑 SGLang 自己算默认值的那段代码 |
+| 模型 `config.json` + 硬件规格 | layer 数、KV head 数、head dim、active expert、dtype 宽度、HBM 带宽、`cuda_graph_max_bs` | 拒绝跑 |
+| calibration 结果 | cost model 的三个拟合量（§8） | 本机没测过，就用别的机器上最近的测量点，并打印离它多远 |
+
+**一项都不许拿「常见默认值」顶。** SGLang 很多默认值是按 GPU 显存分支的，照抄就是在编。整个
+bundle 要能原样存成一个文件、跟着预测结果走，不然这份预测没法复现。
+
+---
+
+## 6. 每个数都要说清 provenance
+
+simulator 用到的每个数，属于下面五种之一：
+
+| 从哪来 | 例子 | 注意 |
+| --- | --- | --- |
+| trace 给的 | token 数；tool 耗时（如果 trace 自己记了） | 同一个字段在不同 trace 里来路可能不同，见下 |
+| config 读的 | TP、`page_size`、HBM 带宽 | 从活 server 读的，比从默认值代码解出来的可靠 |
+| 实测拟合的 | 只有 cost model 的三个量 | 只在专门设计的测量 grid 上拟合，绝不在 run trace 上拟合（§8） |
+| simulator 算的 | 到达时刻、batch 组成、TTFT、`cached_tokens` | 永远是输出；开发时拿来对答案 |
+| 估的 | trace 里没有，只能从某个分布里抽 | 必须说清从哪个分布抽、那个分布又是哪来的 |
+
+我们自己的 run 里，有些量现在没记、但加一行 log 就能有（比如每个请求落在哪个 replica），这叫
+instrumentation gap。别人的 trace 补不了，只能算「估的」。
+
+**provenance 跟着数据走，不跟着字段走。** 同一个 `prompt_tokens`：trace 有 API usage 字段时是
+trace 给的；只有对话时要靠 tokenizer 加完全一致的模板重建；只记了轮数时就只能估。所以 provenance
+要写进 IR、跟着数据走，不能只写在这份文档的表里。engine 不许根据 provenance 改变行为——这一条
+靠 `realise`（§4）落实：抽样在 engine 之前做完，engine 拿到的全是裸 float，想区别对待也没得区别。
+
+**有估的数，就必须这样报：**
+
+- e2e 报一个 interval，不报一个点。输入是分布，输出就不可能是一个点。
+- 出一张 sensitivity table，说清是哪个估的数把 interval 撑开的。只说「1.4–2.2h」，用户不知道
+  该去补什么。
+- 随机抽样用固定 seed。不然对答案时分不清是模型错了，还是这次抽的数不一样。
+
+sensitivity table 的算法：每次只动一个估的数，从它分布的 p10 扫到 p90，其余固定在 p50，看 e2e 动
+多少，按动的大小排序。下表的数字只是示意：
+
+| 估的数 | 分布从哪来 | e2e 动了多少 |
+| --- | --- | --- |
+| 训练各段时长 | 没有模型，只有一个范围 | ±38 min |
+| tool 耗时 | cap 16 / cap 40 两个 run 的分布 | ±6 min |
+| 打分耗时 | `score` p50 21.6s | ±4 min |
+| 容器启动 | p50 3.3s | ±1 min |
+
+第一行就是要交给用户的那句话：「去把训练各段的时长记下来，interval 能缩掉一大半。」因为每次
+只动一个，各行加起来**不等于** interval 的总宽度，两个数都要报。
+
+**「一个估的数」在代码里叫 knob。** 每个 unknown 字段挂一个 knob 名，一个 knob 底下可能只有一个
+字段（训练段），也可能有十万个（tool 耗时），table 一行就是一个 knob，还要报它管着多少个字段：
+让用户去补一个数和去补十万个数，是完全不同的两件事。扫的时候 seed 不变，所以每个 node 自己那
+一抽在整条曲线上是同一个数，e2e 动的那点只能是这个 knob 带来的。
+
+**借来的分布要自己说清可能偏多少。** 一个 unknown 带两样东西：`dist` 说单个值长什么样，`scale`
+说这整条分布可能整体偏多少倍。两件事推不出彼此——tool 和 tool 之间差多少，跟 tool 耗时的中位数
+估错多少，根本没关系；拿前者当后者，sensitivity table 就会永远指着尾巴最重的那个量。`scale` 也
+正是没有就该说没有的东西：少了它，每个 node 各抽各的，几万个 node 一平均就什么都不剩。两万个
+tool task 抽 64 次，预测总时长只晃 2.1%，比两个 replica 之间 4.0%–16.8% 的噪声还小。那不叫预测。
+
+**目前设计里最大的洞是训练段。** simulator 不给 FSDP 建模，训练各段按给定时长当成一整块。没有
+profile 时它们只能估，而 `old_log_prob`、`ref`、`adv`、`update_actor`、`update_weights` 加起来
+占一步的 52%。所以只有对话的 trace，e2e 的 interval 会被这一个估的数主导，除非另外从 recipe
+给训练段建个模型。
+
+**trace 里可能有什么。** 按信息从少到多：
+
+| trace 里有 | 典型来源 | 于是 |
+| --- | --- | --- |
+| 只有对话 | `.traj`、消息 jsonl、各种日志 | 配 tokenizer 和 prompt 模板，能重建 token 数、prefix 结构、轮数、退出原因。所有耗时都只能估 |
+| + 每条事件的时间戳 | 大多数 harness | 耗时只能相减，是被污染的（§3） |
+| + API 的 usage 字段 | 记了 usage 的 harness | token 数精确。里面的 `cached_tokens` 是答案，adapter 要把它放进 `observed`，不进 IR |
+| + 每段活自己记了耗时 | 我们的 harness（`tool_called` 带 `elapsed`） | 耗时是直接量的，可以用 |
+
+这几行不是严格的高低：一条 trace 完全可能记了每段耗时却没有 usage 字段。所以 adapter 是**逐字段**
+判断来路，不是给整份文件打一个等级。
+
+最差的情况（只有对话）其实也不坏：几乎所有 harness 都给得出 token 流，而 token 流正是 cost model
+最需要的（KV 读多少字节由 context 长度决定）。缺的是非 GPU 部分的耗时，而 tool 只占一个 episode
+的 3.1%。所以只有对话加一份 config，就够把占大头的 decode 算出来，剩下的用 interval 兜住。
+trace 越差，interval 越宽，但不会突然算不出来。
+
+**我们自己的 run 有真实 timeline，但它不算「最好的 trace」。** timeline 是答案，不是输入。自家 run
+的 adapter 要把同一份文件劈成两半：换个 harness 也会有的部分（token 数、prefix 结构、记下来的
+耗时）进 IR；只有这套系统当时的行为才有的部分（到达时刻、`cached_tokens`、TTFT、排队时长）进
+`observed.py`。劈完之后，就当 timeline 不存在。
+
+---
+
+## 7. Scheduler：直接跑真的 SGLang，不自己抄
+
+**决定：** batch 怎么组、KV 怎么分、radix cache 怎么命中和 evict，都不自己写，直接跑 SGLang 0.5.8
+自己的 `Scheduler`，只把真正跑模型的 worker 换成一个什么都不算的 stub。这个做法借自 simllm 的
+`SimTpModelWorker`。
+
+**为什么不照源码抄一份。** 抄看起来没有参数要拟合，可抄的过程处处是隐藏参数：page 怎么对齐、
+扣下哪一页、`new_token_ratio` 什么时候衰减、chunked prefill 怎么切、retraction 先踢谁。哪一处抄错
+都不报错，只会让结果差几个百分点，然后被当成 cost model 的误差去调。跑真的，这类错误就不存在了。
+§3 那个 `cached_tokens` 少 113 个 token 的现象，不用建模就自动出来。
+
+**怎么接**（0.5.8 没有 plugin 机制，只能在进程里直接 patch）：
+
+| 改哪里 | 怎么改 | 为什么 |
+| --- | --- | --- |
+| `Scheduler.init_tp_model_worker`（`scheduler.py:494`） | 换成构造 `SimTpModelWorker` | worker 只在这里构造 |
+| KV pool | 在 CPU 上建 `ReqToTokenPool` / `TokenToKVPoolAllocator`，不分配真的 KV tensor，大小取 config 里的 `max_total_num_tokens` | eviction 和 retraction 在真实的容量边界上发生 |
+| `forward_batch_generation` | 不算任何东西，每条请求吐一个 token。没到 `completion_tokens` 时吐一个由 (请求 id, 位置) hash 出来的 token（避开 EOS 和 stop token），到了就吐 EOS。`stop="length"` 的请求不吐 EOS，让 SGLang 自己按 cap 停 | 什么时候停来自 trace；scheduler 看到的仍然只有 cap（§4） |
+| 主循环 | 不调 `event_loop_normal`（`scheduler.py:1068`，死循环 + ZMQ）。engine 自己一步一步调同样那几个函数：`process_input_requests` → `get_next_batch_to_run` → `run_batch` → cost model 给出这一步耗时、虚拟时钟往前走 → `process_batch_result`。overlap 模式下 `process_batch_result` 晚一步调，照 `event_loop_overlap` 的做法 | 时钟归 engine 管，SGLang 只负责做决定 |
+| 输出 | 截住 `send_to_tokenizer`，把「哪条请求在哪一步结束」交回 engine；每一步记下 `forward_mode`、`extend_lens`、`seq_lens`、`cached_tokens` | 预测 timeline 就从这里来 |
+
+**token id 从哪来。** radix cache 按内容匹配，不按长度，所以要从 IR 的结构造出 token id：`Prefix`
+和每条请求自己新加的那段，用 hash(id, 位置) 生成，保证彼此不撞；接在上一轮后面的那段，直接拿上一轮
+的 prompt id 加 stub 实际吐出的 output id，截到 `shared_prefix_tokens`。这件事在 workload 那一侧做，
+SGLang 看到的只是 token 序列。
+
+**SGLang 会不会偷看真实时钟？** 查过源码，scheduler 路径上会影响行为的只有三处：
+
+- `SGLANG_QUEUED_TIMEOUT_MS`（默认关，`scheduler.py:1708`）：开着的话会按真实时间踢掉排队太久的
+  请求。engine 启动时要断言它是关的。
+- `empty_cache_interval`：只调 `torch.cuda.empty_cache`，不影响调度。
+- radix 节点的 `last_access_time`（`time.monotonic()`）：这是 LRU 的排序依据，但 `evict_policy.py`
+  只比先后、不比差值。simulator 按事件顺序调用，先后就是对的。
+
+所以不用 patch `time`。
+
+**router 不在 SGLang 里。** 它是 verl 的 `GlobalRequestLoadBalancer`（`src/agentic_grpo/agent_loop.py:322`）：
+同一个 id 来过就发回同一台，没来过就挑当前 load 最小的那台。几十行，照抄进 engine。
+
+**要从 config 读的 scheduler 参数：** `schedule_policy`（我们是 `fcfs`）、`schedule_conservativeness`
+（1.0）、`chunked_prefill_size`、`max_running_requests`、`page_size`（64）、`new_token_ratio` 的
+初值 / 衰减 / 下限、overlap 开没开。我们的 run 没传 `disable_overlap_schedule`，按默认是开的；
+要确认就看一次 server log。
+
+**代价：**
+
+- 版本绑定：simulator 里跑的 SGLang 必须和 config 里 server 的版本一致，否则拒绝。每升一次 SGLang，
+  stub 都要重新对一遍。
+- 速度：我们的 run 每个 replica 大约 5.5 万步（gen 2418s ÷ 每步 44ms），真 scheduler 每一步都要在
+  上百个请求对象上跑一遍 Python。先量出跑一次完整模拟要多久，再决定 §11 的抽样次数 N=64 撑不撑得住。
+  撑不住就降 N，在报告里写明——**不许为了快换回自己抄的版本**。
+
+**还没验证：一个进程里能不能同时起多个 `Scheduler`。** `Scheduler.__init__` 还会建 ZMQ socket、
+加载 tokenizer，可能还会初始化 torch.distributed。起不了的话，就每个 replica 一个进程，engine 当
+协调者，按虚拟时钟同步推进。慢，但结果一样。
+
+---
+
+## 8. Cost model：每一步要多久
+
+整个 simulator 只有这一条式子：
+
+```
+T_step = (W_bytes + KV_bytes) / (BW × eta(B, ctx, prefill_len)) + overhead
+```
+
+- 一个 step 是 scheduler 的一次 forward。
+- `W_bytes`：这一步要读的权重字节，从模型 `config.json` 算。
+- `KV_bytes`：这一步要读的 KV 字节，由当前 batch 里所有请求的 context 长度算。包括
+  `num_kv_heads < tp` 时 KV 被复制的情况。
+- `BW`：HBM 带宽，硬件规格。
+- `eta`：这块硬件上、这个 engine 实际跑到了带宽上限的几成。没人写在任何地方，只能测。
+- `overhead`：每一步的固定开销。
+
+需要拟合的只有三个量：`eta`、`overhead`、prefill 的耗时曲线。prefill 曲线其实就是同一张 `eta`
+表在「batch 小、prefill 长」那一角的样子，不是第二个模型。`cuda_graph_max_bs` 和 capture 的
+batch 档位从 config 读，step 耗时的台阶就在那里。
+
+**`eta` 里还包了什么。** 一步里除了读 HBM 之外的所有耗时——kernel 没跑满、launch 开销、TP 的
+allreduce——都没单独建模，全折进 `eta`。单机内的 allreduce 走 NVLink，又小又稳，只跟 batch 大小
+有关，所以测 `eta` 时顺带就测进去了。也正因为这样，**`eta` 是按 TP 配置测的**：TP=4 测出来的
+不能直接拿去算 TP=8。
+
+**拟合 `eta`，不拟合时间。** 时间的量级跟 workload 有关，extrapolate 出去会离谱；`eta` 没有单位、
+有上下界、变化平滑，是 engine 加硬件的属性。它还把一直没解开的那个 3.7x 差距变成了一个能打印的数：
+在 p50 稳态，每个 replica 每一步每张卡读约 43GB 的 KV，花 44ms，算下来 `eta ≈ 0.12`（按 8TB/s）；
+standalone 跑同样的点大约 0.5。同一个测量点两个数，差的就是那个 gap。
+
+**只在专门设计的 grid 上测，绝不在 run trace 上拟合。** 原因是 run trace 里 batch 大小和 context
+长度几乎完全反相关（`corr = -0.845`）：rollout 尾巴上还没跑完的，恰好是最长的那些 episode。
+
+```
+B   1- 16   ctx p50 51784      <- 尾巴
 B  16- 48   ctx p50 28903
 B  48- 80   ctx p50 21255
 B  80-112   ctx p50 18671
-B 112-140   ctx p50 15999      <- plateau
+B 112-140   ctx p50 15999      <- 平台期
 ```
 
-A cost model fitted here cannot separate "cost grows with B" from "cost grows with
-context", and any workload off that diagonal is extrapolation. The grid must be
-orthogonal in `B x ctx x prefill_len` and must span the engine's capability, not this
-trace's footprint.
+trace 只覆盖了二维空间里的一条对角线。在这上面拟合，分不清耗时是随 batch 涨还是随 context 涨，
+换一个不在对角线上的 workload 就是 extrapolate。所以 grid 要在 `batch × context × prefill 长度`
+三个方向上各自独立地铺开，范围按 engine 能跑的来，不按这条 trace 碰到的来。
 
-**Fit efficiency, not time.**
-
-```
-T_step = (W_bytes + KV_bytes(sum_seqlen)) / (BW * eta(B, ctx)) + overhead
-```
-
-Fit `eta`. `T` has workload-dependent scale and extrapolates to nonsense; `eta` is
-dimensionless, bounded, smooth, and is a property of engine + hardware. It also turns
-the standing 3.7x standalone-vs-in-run mystery ([[moe-kernel-not-the-bottleneck]],
-[[decode-roofline-17pct-of-hbm]]) into a printable quantity: at the p50 steady state,
-each replica reads ~43GB of KV per rank per step and takes 44ms, so `eta ~ 0.12`
-against an 8TB/s roofline, versus ~0.5 standalone. Same grid point, two numbers,
-difference is the gap.
-
-**Proving neutrality requires held-out workloads**, and they are cheap — synthetic
-load against a standalone server, recorded in the same IR: open-loop Poisson with
-short prompts and no reuse (forces the queue); long prompt / 1 output token (forces
-prefill); short context at high batch (the corner the diagonal never visits); very
-long context to the pool ceiling (forces retraction). Plus the agentic axes already
-in the repo: context 28672 vs 61440, bash-only vs edit tool. Calibrate once, then
-predict all of them without touching a parameter.
+**grid 外面不 extrapolate。** `eta` 只在 grid 内 interpolate。落在 grid 外的 step 不给估计，标出来，
+并报离最近的测量点多远、在哪个方向出界。这种 step 超过一定比例（默认 5%）就整份拒绝报数。
+借别的机器上的测量结果也一样，距离必须打印出来——没在这台机器上验过的 `eta` 算出来的 e2e，
+跟编的没区别。
 
 ---
 
+## 9. 其他部分
 
+**router**：见 §7。每个请求实际落在哪个 replica，我们的 run 现在没记。这是自家 run 最大的
+instrumentation gap：没有它，§12 的第二级没法逐请求对答案。补它的成本是在 `generate` 事件里加一个字段。
 
-## 6. Diffing against the real timeline
+**KV pool**：TP=4 下每个 replica 的 `max_total_num_tokens` 是 4,560,512。实测 KV 占用 p50 0.38、
+p99 0.47，这是 simulator 要算出来的。
 
-这三级 diff 是用来检验 simulator 算得准不准的，本身不是产品。先在这里过关，才有资格去对
-一条没有 timeline 的 trace 报数（§0）。
+**非 GPU 资源**：
 
-Three levels, each releasing one more feedback loop. A mismatch at the outermost
-level alone is not diagnosable, which is why the inner two exist.
+- worker 数、每个 worker 的 container 上限，从 recipe 读。
+- 打分用的 eval container 是每个 worker 一个 semaphore，上限 4。`eval_wait` p90 248s、最长 755s，
+  直接原因就是它。
+- 容器启动 p50 3.3s。容器启动和 tool 耗时，我们的 trace 直接记了，别人的 trace 多半只能估。
+- 两条假设：tool 耗时不随 container 并发数变化（中等风险）；worker 之间没有 CPU / network 争抢。
+- 各个 pool 的排队时间是 simulator 要算的。
 
-**L0 — cost model only, no feedback.** Input: the real `(B, sum_seqlen)` series from
-the 1Hz gauge. Output: predicted step time, diffed against `B / gen_throughput`.
-Needs no replica attribution; runnable on existing data today.
+**编排（sync GRPO）**：batch 256 × n=8，group barrier。训练各段按给定时长当成一整块。weight sync
+的语义来自 config，时长来自 trace。ramp / plateau / drain 的形状是 simulator 要算的，是第三级
+对答案的主要目标。
 
-**L1 — scheduler; server closed-loop, client open-loop.** Input: the real
-`request_received` times and each request's token counts. The simulator forms its own
-batches and decides completion. Diff **paired, per request**: TTFT and `decode_s`
-across 99,646 samples. Needs the replica gap (§3 L2) closed.
+**client 开销**：当常数。实测 client→server p50 4.3ms，server→client p50 1.9ms，加起来占一个请求的 0.2%。
 
-**L2 — full closed loop.** Only episode release is given. Diff the emergent
-structure: ramp 365s / plateau 1238s / drain 463s, episodes per minute, gen span,
-step wall clock, the 1Hz concurrency curve.
+---
 
-**Error-accumulation probe.** In L1 and L2, add a switch that re-aligns to the real
-timestamps every `k` turns, and plot error against `k`. Accurate at `k=1` but not at
-`k=inf` means the feedback loop is amplifying a small bias; inaccurate already at
-`k=1` means the single-step model is wrong.
+## 10. 这条 trace 用不到、但必须能对的机制
 
-The simulator must be **deterministic** — every source of randomness comes from the
-trace, or from a fixed seed on the I distribution（§2）。预测时输出的是一个 interval，但对
-给定的 seed 必须逐位可复现。否则 diff 分不清模型误差和抽样噪声。
+在 SWE-bench trace 上，下面几样都能证明可以忽略。可要是真忽略了，这个 workload 的形状就焊死在
+simulator 里了，而且 code review 看不出来。
 
-**Tolerances come from the noise floor, not from taste.** The run has two independent
-SGLang replicas carrying statistically identical load, which is a free estimate of
-irreducible variance (2,862 paired samples where both are busy):
+跑真 scheduler 之后，前三行的机制 SGLang 本来就有，不用自己写，但**验证照样要做**。风险变成了
+「stub 或 engine 不小心把它绕过去了」：KV pool 建小了、虚拟时钟没让队列真的积起来、`max_new_tokens`
+被换成了答案。这些都不报错，只有专门的 workload 打得出来。
+
+| 想省掉的 | 在这条 trace 上为什么能省 | 换什么 workload 会出事 | 用来验它的 workload |
+| --- | --- | --- | --- |
+| 不建等待队列 | `num_queue_reqs` 一直是 0 | 任何 open-loop 到达的负载，排队就是 latency 本身 | open-loop Poisson，短 prompt，不复用 |
+| prefill 可以忽略 | cache 命中 96.2%，真要 prefill 的只有 ~450 token | 没有 prefix 复用时，prefill 变主导 | 长 prompt，只生成 1 个 token |
+| 不管 KV 容量和 retraction | `num_retracted_reqs` 一直是 0，KV 占用 p50 0.38 | 长 context 高并发，throughput 会断崖 | 超长 context，顶到 KV 上限 |
+| 只把 decode 做准 | decode 占一个 episode 的 94.8% | tool 很慢的 workload | closed-loop，每轮 tool 故意很慢 |
+
+最后一列就是用来证明 simulator 没被这个 workload 带偏的 held-out set：每一条「这条 trace 上可以省」，
+都配一个专门打它的 workload。另外还要跑两个：batch 大、context 短（trace 对角线从来不去的角落）；
+以及 repo 里现成的两组对比（context 28672 vs 61440、只有 bash vs 加了 edit tool）。
+
+这些机制在我们的 trace 上**一次都不触发**，这本身也是一项要对的检查。
+
+---
+
+## 11. 输出
+
+使用时（没有答案），每次输出三样东西，缺一样都不算完：
+
+1. **预测 timeline**，格式和 `analysis/<run>/timeline/*.jsonl` 完全一样（同样的 `cat` / `name` /
+   `t` / `t_end` 事件）。现成的 report 工具直接能画；对答案也就是比两份同格式的文件。
+2. **汇总表**：e2e 的 interval 和中位数、ramp / plateau / drain、每分钟完成多少 episode、每个
+   replica 的 step 耗时分布、各个 pool 的等待时间分位数。
+3. **provenance 报告**：每个参与计算的数从哪来（§6）；cost model 是本机测的还是借来的、离最近的
+   测量点多远；每个估的数从哪个分布抽的；再加上 sensitivity table。没有这一份，用户分不出哪些数
+   是编的。
+
+**interval 怎么算**：对所有估的数一起抽样 N 次（默认 64），seed 固定并写进报告；取 p10–p90 当
+interval，p50 当点估计。
+
+**可复现**：同样的 IR、config 和 seed，结果必须一位不差。随机性只能来自那个 seed。
+
+**宁可不报，也不报错的数。** 下面几种情况直接拒绝、非零退出，并写清缺什么、去哪补：
+
+| 情况 | 为什么不能凑合 |
+| --- | --- |
+| trace 和 config 对不上（这份 trace 不是在这套配置下跑出来的） | 那等于在问「换了 policy 会怎样」，回答不了（§1） |
+| config 里有必填项缺了 | 默认值按显存分支，照抄就是编 |
+| grid 外的 step 超过阈值 | extrapolate 出来的 `eta` 没有任何保证 |
+| 对答案时，被对的那个量依赖了估的数 | 那验的是自己的估计，不是模型 |
+| 一个模型副本拆到多台机器上 | 跨机器通信 `eta` 测不出来（§1） |
+| simulator 里的 SGLang 版本和 config 里的不一致 | 跑的是另一个 scheduler |
+
+---
+
+## 12. 怎么对答案（只在开发时）
+
+要有一份 trace 配一份真实 timeline 才能做，使用时一份都没有。这三级都过了，才有资格去给没有答案
+的 trace 报数。
+
+分三级，每一级多放开一个 feedback loop。只看最外层对不上时，你不知道错在哪，所以要有里面两级。
+
+- **第一级：只验 cost model。** 输入真实的每秒 `(batch 大小, 总 context 长度)` 序列，预测每一步
+  耗时，跟真实的 `batch / gen_throughput` 比。不需要知道请求落在哪个 replica，现有数据就能做。
+- **第二级：验 scheduler。** 输入真实的请求到达时刻和每个请求的 token 数，simulator 自己组 batch、
+  自己决定什么时候完成。**逐请求**比 TTFT 和 decode 时长，共 99,646 个请求。前提是先补上
+  「请求落在哪个 replica」。
+- **第三级：全闭环。** 只给 episode 什么时候放出来，其余全靠 simulator。比整体形状：ramp 365s /
+  plateau 1238s / drain 463s、每分钟完成的 episode 数、生成阶段总时长、一步的 wall clock、每秒的
+  并发曲线。
+
+**误差会不会滚雪球。** 在第二、三级加一个开关：每隔 k 轮把时间对齐回真实值一次，画误差随 k 的
+变化。k=1 准、k=∞ 不准，说明一个小偏差在 feedback loop 里被放大了；k=1 就不准，说明单步模型本身错了。
+
+**容差从 noise floor 来，不凭感觉。** 我们的 run 有两个独立的 replica，负载统计上一样，两者之间的
+差就是去不掉的噪声（2,862 个两边都忙的采样点）：
 
 ```
-num_running_reqs   mean relative difference   4.0%   (corr 0.979)
-gen_throughput     mean relative difference  16.8%
-step time, median  44.5ms vs 43.3ms        -> 2.7%
+num_running_reqs   平均相对差    4.0%   (corr 0.979)
+gen_throughput     平均相对差   16.8%
+step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 ```
 
-So a per-point agreement better than ~17% on a 1Hz gauge is meaningless, and ~3% is
-the floor on medians. Set acceptance there.
+所以按秒采样的曲线上，要求比 ~17% 更准没有意义；中位数上 ~3% 就是底。验收标准定在这里。
 
-Per-step latency itself has **no ground truth in any archived trace** — the finest
-granularity recorded is per request. `disable_log_stats` is already false, so the
-SGLang scheduler prints batch composition and throughput every `decode_log_interval`
-steps, but it goes to the Ray actor's log and run 20260912-072938's Ray session is
-gone. Archiving those lines into the timeline directory is nearly free and is the
-only route to validating a per-step prediction.
+**每一步的 latency 目前没有真值可对。** 存档的 trace 最细只到每个请求。SGLang 其实每隔
+`decode_log_interval` 步会打印 batch 组成和 throughput，但写在 Ray actor 的 log 里，run
+20260912-072938 的 Ray session 已经没了。把这几行 log 存进 timeline 目录几乎没成本，也是验证每步
+预测的唯一办法。
 
 ---
 
+## 13. 代码分层和 test 守的规矩
 
+| 层 | 在哪 | 允许知道什么 | 允许 import |
+| --- | --- | --- | --- |
+| adapter | `src/simulator/adapters/`：接口在 `base.py`，`agentic_timeline.py` 读自家 timeline，`agentic_messages.py` 只读对话文本 | trace 的格式；逐字段判断来路 | `simulator.ir`、`simulator.observed` |
+| IR | `src/simulator/ir.py` | 只有 workload | — |
+| realise | `src/simulator/realise.py` | IR，加一个 seed | `simulator.ir` |
+| observed | `src/simulator/observed.py` | 真实系统的结果，也就是答案 | `simulator.ir`（只借 id 类型） |
+| engine | 待建 | 抽样过的 IR + config | `simulator.ir` |
+| 对答案 | 待建 | 两边都知道 | 全部 |
 
-## 7. Assumptions
+规矩：
 
-
-| Assumption                                              | 风险               | 怎么证伪                                                                                   |
-| ------------------------------------------------------- | ---------------- | -------------------------------------------------------------------------------------- |
-| token counts are invariant under system counterfactuals | n/a              | 这是 §0 的 scope 边界，不是假设                                                                  |
-| trace 和 config 同源：这份 token 流就是在这份 config 下产生的           | **高**            | 比对 turn cap、模型名、工具集、prompt 模板指纹。对不上就拒绝报数，别默默算——那是 policy counterfactual，§0 之外          |
-| 差分出来的 duration 可以当 work duration 用（T1）                  | **高**            | 采集那次要是跑满了，这个差里就含排队。拿同一个 harness 空载重跑一遍，比 duration 分布。当场就能做的：把 replica 数翻倍，看预测的 e2e 动不动 |
-| T0 下 tokenizer + 模板重建出来的 token 数，等于 harness 当时实际发出的     | 中                | 手上有 T2 trace 的时候，拿它的 usage 字段对一次                                                       |
-| tool duration is independent of container concurrency   | **中**            | 比较 cap 16 和 cap 40 两个 run 的 tool duration 分布                                           |
-| prompts are pure appends of the previous turn           | **已验证** 0/95,403 | 做过了                                                                                    |
-| no CPU or network contention between workers            | 低                |                                                                                        |
-| client<->server overhead is constant                    | 低                | 已量，占一个请求的 0.2%                                                                         |
-| the two replicas are exchangeable                       | 低                | 已量：batch 差 4.0%，中位 step time 差 2.7%                                                    |
-| no failures or retries                                  | 低                |                                                                                        |
-
-
----
-
-
-
-## 8. Build order
-
-Each step has an independent deliverable. 第 1 步就用到 workload 的 trace，但只当**格式
-样本**看。它第一次参与算数是第 3 步，作为 validation set。它永远不碰参数。
-
-1. **Adapter contract。** 陌生 trace 进来，探测 tier（§2.3），逐字段声明来源，输出 IR +
-  provenance。用户真正碰到的就是这一层，所以它排第一，不排最后。可交付：一条只有对话的
-  T0 trace 能构造出合法的 workload，每个编出来的字段都带标记。顺带补上 IR 缺的「不知道」
-  和 per-session 的 `source`。
-2. **Orthogonal calibration grid** on a standalone server. Yields `eta`, and as a
-  by-product turns the 3.7x gap into a residual table over `(B, ctx)`.
-3. **L0 diff.** Accept or reject the cost model on its own.
-4. **Close the gaps:** replica id on the `generate` event; confirm the event-loop
-  variant; archive the scheduler's decode-batch log lines.
-5. **Discrete-event engine**, four resource pools, ported scheduler — including the
-  four mechanisms of §4 that this workload never exercises.
-6. **Synthetic held-out workloads.** Demonstrate neutrality.
-7. **L1 and L2 diffs** against the agentic trace. 到这里 simulator 才算验过（§6）。
-8. **I 的 sensitivity table，和带 interval 的 e2e。** 这一步才是交付物：吃一条 T0/T1 的陌生
-  trace 加一份 config，出一个带 interval 的 e2e，外加一张表——哪个 I 撑开了 interval，去补
-  哪个 instrumentation 最划算。
-
-Where it stands: step 0, the schema, is in — `src/simulator/ir.py`,
-`src/simulator/observed.py`, `tests/test_simulator_ir.py`. The converter is not written
-yet, and 它不该是一个文件：`trace_to_ir.py` 是照着我们自己的 trace 起的名字，第 1 步把它
-换成同一个 contract 下的多个 adapter。
+1. **engine 不许 import `simulator.observed`；任何 simulator 模块不许 import `agentic_grpo`。**
+   这两条已经有 test 守着（[tests/test_simulator_ir.py](tests/test_simulator_ir.py)）。
+2. **engine 里不许出现 `episode`、`turn`、`tool`、`swebench` 这几个词。** engine 和 workload 之间
+   只有一个请求流：每个到达事件带着 `(prompt_tokens, prefix_parent, shared_len, completion_tokens)`。
+   「第 k+1 轮要等第 k 轮的 tool 跑完」这种逻辑属于 workload 那一侧，到 engine 这里只剩一个到达时刻。
+   engine 分不出输入是谁生成的，就不会偏向谁。
+3. **关于 trace 格式的知识只能待在 adapter 里。** 进来的 trace 本来就来自不认识的 harness。
+4. **engine 不许根据 `Task.kind` 或 provenance 做分支。** `kind` 只是报表上的标签（trace 里的
+   `bash` / `edit` / `submit`，进 IR 后都是 `"tool"`）。provenance 这一半由 `realise` 兜住：
+   engine 只收抽样过的 workload，`require_runnable` 在门口拦下还带着分布的字段。
+5. **cost model 不许在 run trace 上拟合**（§8）。
+6. **没有答案也必须能跑完。** 使用时没有 timeline，任何「需要 `observed` 才走得通」的代码路径，
+   在真正该用的场合就是死路，而且开发时永远发现不了。检查办法：拿一份只有 trace、没有 timeline
+   目录的输入跑一遍完整流程，`Observations` 全空也要得出数。
 
 ---
 
+## 14. 假设
 
+| 假设 | 风险 | 怎么证伪 |
+| --- | --- | --- |
+| trace 和 config 是一套：这份 token 流就是在这份 config 下跑出来的 | **高** | 比对 turn cap、模型名、工具集、prompt 模板指纹。对不上就拒绝报数 |
+| 时间戳相减的耗时可以当活本身的耗时 | **高** | 同一个 harness 空载重跑一遍比分布；当场能做的是把 replica 数翻倍，看 e2e 动不动 |
+| 只有对话时，tokenizer + 模板重建的 token 数等于当时真实发出的 | **已量**（run 20261005-113503，144 条 episode）：prompt 93% 一字不差，completion 98.7%，其余差 +1 到 +9 个 token，来自模型采样出非标准的切分，重编码补不回来。另外第一轮 prompt 超过 `prompt_length`（这里 4096）会被从头截掉，文本里看不出来，所以这个数必须从 config bundle 拿 | `scripts/check_messages_reconstruction.py` |
+| tool 耗时不随 container 并发数变化 | **中** | 比较 cap 16 和 cap 40 两个 run 的 tool 耗时分布 |
+| 下一轮 prompt 就是上一轮整段再加新内容 | **已验证**：95,403 对里 0 例外 | — |
+| stub 吐什么 token 不影响调度，SGLang 只看长度和 id 是否相同 | 低 | 用两个不同 seed 的 hash 跑同一份 IR，每一步的记录必须完全一样 |
+| scheduler 不靠真实时钟做决定 | **已查源码**（§7） | queued timeout 开着就不成立，engine 启动时断言 |
+| 单机：TP 的 allreduce 可以折进 `eta` | 低（这台机器） | 跨机器就拒绝（§1），而不是放宽这条 |
+| worker 之间没有 CPU / network 争抢 | 低 | |
+| client 和 server 之间的开销是常数 | 低 | 已量，占一个请求的 0.2% |
+| 两个 replica 可以互换 | 低 | 已量，就是 §12 的 noise floor |
+| 没有失败和重试 | 低 | |
 
-## 9. Provenance
+---
 
-Every measurement quoted above is from run `20260912-072938` (Qwen3-30B-A3B,
-TP=4 x 2 replicas, 8x B200), computed from
-`/data0/shared/kewen.liu/agentic-timelines/20260912-072938/`:
-`timeline-13267*.jsonl` (99,646 `generate` events, 95,403 adjacent turn pairs) and
-`srv-metrics-1312837.jsonl` (7,193 samples with a running batch). Step budget from
-the `cat="train"` spans: step 5072s / 4377s, `gen` 2418s / 1824s, `update_actor`
-1796s / 1718s, `update_weights` 59s / 60s.
+## 15. 做的顺序
 
-`eta ~ 0.12` is derived here, not measured directly: 1.84M tokens of KV per replica
-at 96KB/token over 4 ranks is ~43GB per rank per step, or 5.4ms at 8TB/s, against a
-measured 44.5ms.
+每一步都能单独交付、单独验。用 ML 的话说：第 2 步的测量 grid 是 training set，也是整个 simulator
+唯一拟合参数的地方；自家 timeline 是 validation set；第 6 步的合成 workload 是第二个 held-out set，
+专门证明没被带偏。我们的 trace 在第 1 步只当格式样本看，第一次参与计算是第 3 步，当 validation set
+用，永远不碰参数。
 
-One loose end closed while writing this: the `is_cuda_graph` gauge reads 0 in all
-7,193 samples, but `stats.is_cuda_graph` is never assigned anywhere in SGLang 0.5.8 —
-it is a dead gauge, not evidence. CUDA graphs are on, and the 8x gap is not there.
+1. **adapter。** 陌生 trace 进来，逐字段判断来路，输出 IR 和 provenance。用户真正碰到的就是这一层，
+   所以排第一。交付：一条只有对话的 trace 能造出合法的 workload，每个编出来的字段都带标记。IR
+   这边的准备已经做完了（§4：`prov`、`unknown`、`realise`）。别照着自家 trace 写一个
+   `trace_to_ir.py`，要的是同一个接口下的多个 adapter。
+
+   接口在 [src/simulator/adapters/base.py](src/simulator/adapters/base.py)。每个 adapter
+   两个方法：`claims(path)` 说这份文件我认不认识，`convert(path, priors)` 读它。读完交出三样：IR、
+   observed、几句话说明哪些字段没找到。`load` 挑出唯一认领的那个 adapter，跑完再查四条：IR 合法；
+   两边的 `source` 一样；observed 里每个 id 都能在 IR 里找到对应的 request 或 session；每个「估的」
+   字段用的都是调用方给的 prior，而且那个 prior 不是在正在转的这份 trace 上量的。最后一条是为了
+   下面的削 trace 实验：删掉一个字段再用同一份 trace 的分布填回去，实验就白做了。
+
+   验收这一层只有一个办法有说服力：**把自家最全的那条 trace 一级一级削**。先删每段活自己记的
+   耗时，再删 usage 字段，再删时间戳，最后只剩对话。每一级跑一遍 adapter，看三件事：还能不能出
+   合法 workload；interval 是不是一级比一级宽；每一级的 interval 盖不盖得住信息最全那一级的点
+   估计。这是唯一能把「为了通用牺牲了多少精度」量出来的实验，而且只要一条 trace 就能做。
+2. **测量 grid。** 在 standalone server 上测出 `eta`。顺带把 3.7x 的 gap 变成一张按
+   `(batch, context)` 排的残差表。
+3. **第一级对答案。** 单独接受或否掉 cost model。
+4. **补 instrumentation。** `generate` 事件加上 replica id；确认 overlap 开没开；把 scheduler 的
+   decode batch log 存档。
+5. **接上真 scheduler，再搭 engine**（§7），按这个顺序：
+   - (a) 一个进程里能起几个 stub 化的 `Scheduler`，起不了就走多进程；
+   - (b) 量一次完整模拟要多久，定下 N；
+   - (c) 从 IR 造出 token id，包括 `Prefix`；
+   - (d) engine：虚拟时钟、router、资源池、group barrier、训练段。
+
+   §10 那四样机制 SGLang 本来就有，这一步要证明的是 stub 没把它们绕过去。
+6. **合成的 held-out workload。** 证明没被带偏（§10）。
+7. **第二、三级对答案。** 到这里 simulator 才算验过。
+8. **sensitivity table 和带 interval 的 e2e。** 这一步才是交付物，也是第一个完全没有答案的步骤：
+   吃一条陌生 trace 加一份 config，出一个带 interval 的 e2e，外加一张表说明哪个估的数撑开了
+   interval、去补哪项 instrumentation 最划算。前七步是拿答案换信心，到这一步没答案可换了，靠的
+   全是前七步攒下的。
+
+**现在到哪了：** 落地的是 schema 加抽样那一步——`src/simulator/ir.py`、
+`src/simulator/realise.py`、`src/simulator/observed.py`、`tests/test_simulator_ir.py`。IR 现在能
+说「不知道」，能写并行 tool call，能写 subagent，`max_new_tokens` 可以空着让 config 填（§4）。
+第 1 步做了一半：接口在 `adapters/base.py`，读自家 timeline 的 adapter 在
+`adapters/agentic_timeline.py`，一份 workload 对应一个训练 step。在 run 20260912-072938 的 step 1 上
+跑过：2,048 个 session、256 个 group 全部合法，1.8 秒转完；它算出的 structural share 减去 observed
+里的 `cached_tokens`，p50 是 114，第一轮的命中率 p10 0.396、p50 0.984，和 §3、§4 的数字对得上。
+削 trace 实验做到了「删掉所有耗时」这一级：用 run 20260908-052218 做 prior 填回去能过 check，拿
+同一个 run 做 prior 会被拒。再往下的「只有对话」一级还做不了，原因有两个：手上没有任何一份数据
+存了对话本身（timeline 和 trajectory dump 都只有命令和 token 数），以及 §4 说的 unknown 之间不能
+有关系。前一个原因已经补上：run 20261005-113503 开着 `AGENTIC_TRAJECTORY_DUMP_MESSAGES=1`，每条
+episode 的对话全文都存了下来，`adapters/agentic_messages.py` 只读这份文本，token 数全部 derived，耗时
+全部从 prior 估。拿它和读 timeline 的 adapter 在同一批 2,034 条 episode 上对：DAG 形状 2,034 条全部
+一样（每轮一个 request、每次 tool call 一个 task、同样的 lease 和打分尾巴），completion 98.0% 一字
+不差，prompt 的误差全部等于前面 completion 误差的累加。文本里读不出来的只剩：属于哪个 step（没有
+时间戳）、cap、停止原因、tool 有没有超时。这一级拿 prior 填耗时的路径也走通了。还缺的那条「unknown
+之间不能有关系」在这份数据上不触发，因为 token 数是 derived 不是 estimated。config bundle、engine
+都还没有。
+
+---
+
+## 16. 数据出处
+
+上面所有实测数字都来自 run `20260912-072938`（Qwen3-30B-A3B，TP=4 × 2 个 replica，8× B200），
+算自 `/data0/shared/kewen.liu/agentic-timelines/20260912-072938/`：
+
+- `timeline-13267*.jsonl`：99,646 个 `generate` 事件，95,403 对相邻 turn。第一轮的 prefix 数字（§4）
+  来自其中 `turn == 1` 的 4,243 个事件。
+- `srv-metrics-1312837.jsonl`：7,193 个有 running batch 的采样点。
+- 一步的时间分配来自 `cat="train"` 的 span：step 5072s / 4377s，`gen` 2418s / 1824s，
+  `update_actor` 1796s / 1718s，`update_weights` 59s / 60s。
+
+`eta ≈ 0.12` 是推出来的，不是直接测的：每个 replica 1.84M token 的 KV，每 token 96KB，分到 4 张卡上
+每张约 43GB，按 8TB/s 读要 5.4ms，实测一步 44.5ms。
+
+顺手查清的一件事：`is_cuda_graph` 这个 gauge 在 7,193 个采样里全是 0，但 SGLang 0.5.8 里根本没有
+地方给 `stats.is_cuda_graph` 赋值——它是个死 gauge，不是证据。CUDA graph 是开着的，5.4ms 和 44.5ms
+之间那 8 倍的差距不是它造成的。
