@@ -16,6 +16,18 @@ across runs. Run 20260820-023256 submitted 3870 patches and wrote 23 reports.
 We now give the harness a *unique* eval id per call (so its cache can never hit)
 and keep our own cache keyed on the patch bytes, where an identical patch really
 does deserve an identical verdict.
+
+**Memory cap.** The harness creates its eval container through docker-py with no
+memory limit at all. On run 20261005-143426 two eval containers running the
+matplotlib test suite against agent patches reached 263 + 196 GB of host RAM, on
+top of the ~1.2 TB the 4-GPU param_offload trainer parks on the host, and Ray's
+memory monitor killed the trainer at the start of step 2 (the agent containers
+were already capped via configs/agent.yaml). ``_grade_with_harness`` now hands
+the harness a ``docker.DockerClient`` proxy whose ``containers.create`` adds
+``mem_limit`` (``AGENTIC_EVAL_CONTAINER_MEMORY``, default 32g, same as the agent
+containers). A test run the kernel kills under that cap is graded as an eval
+error (reward 0, NOT cached, ``reward/eval_oom_rate``) rather than as a failed
+patch: "the tests never finished" is not a verdict on the patch.
 """
 
 from __future__ import annotations
@@ -52,6 +64,108 @@ def _eval_timeout() -> int:
     return int(raw) if raw.isdigit() else 900
 
 
+def _eval_container_memory() -> str:
+    """Memory cap for the harness's eval containers, in docker ``mem_limit`` syntax.
+
+    ``AGENTIC_EVAL_CONTAINER_MEMORY``; default ``32g`` (the agent containers'
+    ``--memory`` in configs/agent.yaml); ``0`` disables the cap.
+    """
+    raw = os.environ.get("AGENTIC_EVAL_CONTAINER_MEMORY", "32g").strip()
+    return "" if raw.lower() in {"", "0", "none", "off"} else raw
+
+
+def _parse_oom_kills(memory_events: str) -> int:
+    """``oom_kill N`` from a cgroup v2 ``memory.events`` file; 0 if absent."""
+    for line in memory_events.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "oom_kill" and parts[1].isdigit():
+            return int(parts[1])
+    return 0
+
+
+class _OOMWatchedContainer:
+    """docker-py ``Container`` proxy that reads the cgroup's OOM counter before teardown.
+
+    ``run_instance`` tears the container down in its own ``finally``
+    (``cleanup_container`` -> ``container.stop`` -> ``container.remove``) before
+    control comes back to us, so the way into ``stop`` is the only moment to ask
+    the cgroup what happened. ``docker inspect``'s ``State.OOMKilled`` is not
+    enough on its own: it describes the container's init process
+    (``tail -f /dev/null``), not the pytest the kernel actually killed;
+    ``/sys/fs/cgroup/memory.events`` ``oom_kill`` counts every kill in the
+    cgroup (verified on the rootless daemon: a 300 MB hog under a 64m cap ->
+    exit 137, ``oom_kill 1``). Everything else is forwarded untouched.
+    """
+
+    def __init__(self, inner, sink: dict):
+        self._inner = inner
+        self._sink = sink
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def _record_oom(self) -> None:
+        inner = self._inner
+        if inner.name in self._sink:
+            return
+        kills = 0
+        try:
+            res = inner.exec_run("cat /sys/fs/cgroup/memory.events")
+            kills = _parse_oom_kills(res.output.decode("utf-8", "replace"))
+        except Exception as exc:  # container already gone, exec unsupported, ...
+            logger.debug("memory.events unreadable for %s: %s", inner.name, exc)
+        if not kills:
+            try:
+                inner.reload()
+                if inner.attrs.get("State", {}).get("OOMKilled"):
+                    kills = 1
+            except Exception:  # pragma: no cover - best-effort fallback
+                pass
+        self._sink[inner.name] = kills
+
+    def stop(self, *args, **kwargs):
+        self._record_oom()
+        return self._inner.stop(*args, **kwargs)
+
+
+class _CappedContainers:
+    """``client.containers`` proxy: ``create`` gets ``mem_limit``/``memswap_limit``."""
+
+    def __init__(self, inner, mem_limit: str, sink: dict):
+        self._inner = inner
+        self._mem_limit = mem_limit
+        self._sink = sink
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def create(self, *args, **kwargs):
+        kwargs.setdefault("mem_limit", self._mem_limit)
+        # memswap == mem means no swap, same as --memory-swap=--memory in agent.yaml.
+        kwargs.setdefault("memswap_limit", self._mem_limit)
+        return _OOMWatchedContainer(self._inner.create(*args, **kwargs), self._sink)
+
+
+class _CappedDockerClient:
+    """``docker.DockerClient`` proxy for the harness: capped containers, OOM bookkeeping.
+
+    The harness's ``build_container`` calls ``client.containers.create(...)`` and
+    passes nothing about memory (only ``cap_add`` from ``docker_specs``), so the
+    cap has to be injected underneath it. ``oom_kills`` maps container name ->
+    ``oom_kill`` count, filled in as each container is stopped. One proxy per
+    grading call, so there is no shared state between the concurrent evals.
+    """
+
+    def __init__(self, client, mem_limit: str):
+        self._client = client
+        self.mem_limit = mem_limit
+        self.oom_kills: dict[str, int] = {}
+        self.containers = _CappedContainers(client.containers, mem_limit, self.oom_kills)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
 @dataclass
 class RewardResult:
     reward: float
@@ -70,6 +184,9 @@ class RewardResult:
     # container run. Watch ``reward/eval_cache_hit_rate``: a rate near 1.0 with a
     # diverse batch is the signature of the bug this module used to have.
     eval_cached: bool = False
+    # The kernel OOM-killed the test run under the eval container's memory cap
+    # (always paired with a non-empty eval_error; never cached).
+    eval_oom: bool = False
 
 
 def compute_reward(
@@ -119,7 +236,9 @@ def compute_reward(
         # That is NOT evidence the patch is wrong, so it must not be cached as
         # reward 0 -- doing so would bake one infra hiccup into every future
         # sample of this patch. Surfaces as reward/eval_error_rate.
-        return RewardResult(reward=0.0, resolved=False, eval_error=g["eval_error"])
+        return RewardResult(
+            reward=0.0, resolved=False, eval_error=g["eval_error"], eval_oom=g.get("eval_oom", False)
+        )
 
     rr = RewardResult(
         reward=1.0 if g["resolved"] else 0.0,
@@ -148,6 +267,7 @@ def apply_to_metrics(metrics, rr: RewardResult) -> None:
     metrics.p2p_total = rr.p2p_total
     metrics.pytest_output_length = rr.pytest_output_length
     metrics.eval_cached = rr.eval_cached
+    metrics.eval_oom = rr.eval_oom
 
 
 # --------------------------------------------------------------------------- #
@@ -237,7 +357,10 @@ def _grade_with_harness(
         KEY_PREDICTION: model_patch,
     }
 
+    mem_limit = _eval_container_memory()
     client = docker.from_env()
+    if mem_limit:
+        client = _CappedDockerClient(client, mem_limit)
     # The prune has to be in a finally: anything raising between here and the
     # report read (docker gone, a malformed report.json) would otherwise leave
     # the tree behind forever, which is exactly how logs/run_evaluation grew to
@@ -258,7 +381,22 @@ def _grade_with_harness(
             rewrite_reports=False,
         )
         out = _read_harness_report(run_id=eval_id, model_name=eval_id, instance_id=instance_id)
-        if not out["report_found"]:
+        oom_kills = sum(client.oom_kills.values()) if mem_limit else 0
+        if oom_kills:
+            # The kernel killed the test run inside the container's cgroup. Whatever
+            # the harness then parsed out of the truncated log (usually "every test
+            # failed", a report.json with resolved=False) is not a verdict on the
+            # patch, so it must neither count as reward 0 nor be cached. Surfaces
+            # as reward/eval_oom_rate (a subset of reward/eval_error_rate); the
+            # same instances showing up there step after step means a legitimate
+            # suite needs more than the cap -- raise AGENTIC_EVAL_CONTAINER_MEMORY.
+            out["eval_error"] = (
+                f"test run OOM-killed under the {mem_limit} eval container memory cap "
+                f"(oom_kill={oom_kills})"
+            )
+            out["eval_oom"] = True
+            out["resolved"] = False
+        elif not out["report_found"]:
             # No report.json means run_instance raised. Two very different causes land
             # here and only the harness's own log separates them:
             #   * the diff would not apply -- the agent wrote a bad patch. A genuine
@@ -318,6 +456,7 @@ def _read_harness_report(run_id: str, model_name: str, instance_id: str) -> dict
         "pytest_output_length": 0,
         "report_found": False,
         "eval_error": "",
+        "eval_oom": False,
     }
 
     test_output = log_dir / LOG_TEST_OUTPUT
