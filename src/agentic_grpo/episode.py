@@ -312,6 +312,72 @@ def dump_enabled() -> bool:
     return bool(os.environ.get("AGENTIC_TRAJECTORY_DUMP_DIR", ""))
 
 
+def messages_dump_enabled() -> bool:
+    """Also keep the conversation text: ``AGENTIC_TRAJECTORY_DUMP_MESSAGES=1`` on top of the dump.
+
+    Off by default because it is the one record that scales with context rather
+    than with turns: ~130 MiB per 2048-episode step (34.6M tokens of text on run
+    20260912-072938) against ~45 MiB for the dump above. It exists for
+    ``SIMULATOR.md`` §15: the simulator has to read traces that hold nothing but
+    the conversation, and the only way to check that its token-count
+    reconstruction is right is a real conversation whose per-turn counts the
+    timeline already knows.
+    """
+    return dump_enabled() and os.environ.get("AGENTIC_TRAJECTORY_DUMP_MESSAGES", "0") != "0"
+
+
+# Paths whose meta header this process has already written (or found present).
+_MESSAGES_HEADED: set[str] = set()
+
+
+def dump_messages(
+    uid: str,
+    instance_id: str,
+    exit_status: str,
+    reward: float,
+    messages: list[dict],
+    meta: dict | None,
+) -> None:
+    """Append one episode's conversation to ``messages-<pid>.jsonl``.
+
+    The first line of each file is a ``meta`` record: the chat template and the
+    tool schemas the prompts were rendered with. Text alone cannot be turned back
+    into the token stream the server saw; text plus exactly that template can,
+    and whether it comes out to the same count is the question the file is for.
+    Every later line is one episode, keyed by the same ``traj`` id as the
+    timeline, with the messages in the order the model saw them: system and user
+    prompt, then each assistant turn as the decoded raw text (special tokens
+    kept, so ``<tool_call>`` blocks and the end-of-turn token are intact), then
+    the tool observations or the format-error nudge that followed it. An
+    observation the episode never fed back (the submit that ended it) is not
+    there, because it was never in the context.
+
+    Best-effort like :func:`dump_trajectory`: a failure here must not touch the rollout.
+    """
+    dump_dir = os.environ.get("AGENTIC_TRAJECTORY_DUMP_DIR", "")
+    if not dump_dir:
+        return
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"messages-{os.getpid()}.jsonl")
+        with open(path, "a") as fh:
+            if path not in _MESSAGES_HEADED:
+                if fh.tell() == 0:  # append mode opens at the end, so 0 means a new file
+                    fh.write(json.dumps({"kind": "meta", **(meta or {})}, ensure_ascii=False) + "\n")
+                _MESSAGES_HEADED.add(path)
+            record = {
+                "kind": "episode",
+                "traj": uid,
+                "instance_id": instance_id,
+                "exit_status": exit_status,
+                "reward": reward,
+                "messages": messages,
+            }
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # pragma: no cover - diagnostics must not break training
+        logger.warning("messages dump failed for %s", instance_id, exc_info=True)
+
+
 def dump_trajectory(
     instance_id: str,
     exit_status: str,
@@ -381,6 +447,12 @@ class Episode:
         self.traj = Trajectory(prompt_ids)
         self.turns: list[TurnTiming] = []  # per-turn timeline, always collected
         self.actions: list[dict] = []  # only populated when dumping is enabled
+        # The conversation as the model saw it, or None unless
+        # AGENTIC_TRAJECTORY_DUMP_MESSAGES is on (see dump_messages). The agent
+        # loop appends through record_messages; meta is set by the loop too,
+        # since the tokenizer and tool schemas live there.
+        self.messages: list[dict] | None = [] if messages_dump_enabled() else None
+        self.messages_meta: dict | None = None
         # Event stream for the run timeline (None unless AGENTIC_TIMELINE_DIR is
         # set). Generate events are derived from `turns` at finish(); what is
         # recorded here is everything that has no other record: the two waits
@@ -513,6 +585,11 @@ class Episode:
         self.metrics.tool_obs_tokens.append(len(ids))
         self.traj.add_tool(ids)
 
+    def record_messages(self, msgs: list[dict]) -> None:
+        """Keep these messages for the conversation dump; a no-op when it is off."""
+        if self.messages is not None:
+            self.messages.extend(msgs)
+
     # --- grading -------------------------------------------------------------------
     def scoring(self, t_eval_slot: float) -> None:
         self.metrics.t_score_start = time.time()
@@ -540,6 +617,8 @@ class Episode:
     def flush(self, reward: float) -> None:
         """Write the dump line and the timeline, once metrics are final."""
         dump_trajectory(self.instance_id, self.exit_status, reward, self.actions, self.metrics)
+        if self.messages is not None:
+            dump_messages(self.uid, self.instance_id, self.exit_status, reward, self.messages, self.messages_meta)
         if self.tl is not None:
             # One write per episode: finish() adds the generate events (from
             # `turns`), the grading span and the episode envelope on top of what

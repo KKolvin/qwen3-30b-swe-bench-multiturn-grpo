@@ -238,8 +238,12 @@ class SWEBenchAgentLoop(AgentLoopBase):
         # (``'list' object has no attribute 'dim'``), so a failed rollout must
         # still carry a real prompt and degrade to a reward-0 sample rather than
         # taking down the whole step via ``asyncio.gather``.
-        prompt_ids = await self.apply_chat_template(self._initial_messages(instance), tools=self._tool_schemas)
+        initial = self._initial_messages(instance)
+        prompt_ids = await self.apply_chat_template(initial, tools=self._tool_schemas)
         ep = Episode(instance_id, prompt_ids)
+        if ep.messages is not None:
+            ep.record_messages(initial)
+            ep.messages_meta = self._messages_meta()
         sp = self._with_stop_tokens(sampling_params)
 
         try:
@@ -299,6 +303,9 @@ class SWEBenchAgentLoop(AgentLoopBase):
     async def _step(self, ep: Episode, env: Any, instance: dict, sp: dict[str, Any]) -> bool:
         """One assistant turn: generate, act, observe. False when the episode is over."""
         out = await self._generate(ep, sp)
+        if ep.messages is not None:
+            # Before the context check: the tokens are in the trajectory either way.
+            ep.record_messages([{"role": "assistant", "content": await self._decode(out.token_ids)}])
         if ep.context_full(self.response_length):
             return ep.stop("ContextLimit", truncated=True)
 
@@ -310,6 +317,7 @@ class SWEBenchAgentLoop(AgentLoopBase):
         obs_messages = await self._execute(ep, env, instance, calls)
         if obs_messages is None:  # submitted, or the repetition limit ended the episode
             return False
+        ep.record_messages(obs_messages)
         ids = await self.apply_chat_template(obs_messages, remove_system_prompt=True)
         return self._observe(ep, ids)
 
@@ -366,10 +374,9 @@ class SWEBenchAgentLoop(AgentLoopBase):
         ep.format_error(attempted, raw)
         if ep.consecutive_format_errors >= self.max_consecutive_format_errors:
             return ep.stop("FormatErrorLimit" if attempted else "NoToolCall")
-        ids = await self.apply_chat_template(
-            [{"role": "tool", "content": self._format_error(raw, attempted=attempted)}],
-            remove_system_prompt=True,
-        )
+        nudge = [{"role": "tool", "content": self._format_error(raw, attempted=attempted)}]
+        ep.record_messages(nudge)
+        ids = await self.apply_chat_template(nudge, remove_system_prompt=True)
         return self._observe(ep, ids)
 
     async def _execute(self, ep: Episode, env: Any, instance: dict, calls: list[tool_calls.ToolCall]) -> list[dict] | None:
@@ -488,6 +495,29 @@ class SWEBenchAgentLoop(AgentLoopBase):
             {"role": "system", "content": _render(self._system_tmpl, **tvars)},
             {"role": "user", "content": _render(self._instance_tmpl, **tvars)},
         ]
+
+    def _messages_meta(self) -> dict:
+        """What a reader of the conversation dump needs besides the text.
+
+        The token stream the server saw is the chat template applied to these
+        messages with these tool schemas; a reader rebuilding counts from text
+        (``SIMULATOR.md`` §6, the "derived" row) has to use exactly them, which
+        is why they travel with the file rather than being looked up later.
+        """
+        tok = self.tokenizer
+        return {
+            "model": getattr(tok, "name_or_path", None),
+            "chat_template": getattr(tok, "chat_template", None),
+            "tool_schemas": self._tool_schemas,
+            # verl left-truncates any rendered prompt longer than this
+            # (AgentLoopBase._cap_text_prompt_length: prompt_ids[-prompt_length:]),
+            # and the text here is pre-cap. On run 20260912-072938, 2.5% of first
+            # prompts hit the 4096 cap and lost the head of the system prompt.
+            "prompt_length": getattr(getattr(self, "rollout_config", None), "prompt_length", None),
+            "prompt_cap": "left-truncated to prompt_length when longer",
+            "assistant_text": "tokenizer.decode(token_ids), special tokens kept",
+            "tool_messages_rendered_with": "apply_chat_template(..., remove_system_prompt=True)",
+        }
 
     async def _decode(self, token_ids: list[int]) -> str:
         """Decode sampled tokens back to text (off-loop; the tokenizer is blocking).
