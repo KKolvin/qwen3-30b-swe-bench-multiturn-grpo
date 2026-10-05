@@ -200,6 +200,19 @@ environment:
   # get_sb_environment() resolves the SWE-bench instance image automatically.
   cwd: "/testbed"
   timeout: 60 # was 120
+  # Extra `docker run` flags (mini-swe-agent's DockerEnvironmentConfig.run_args;
+  # the default is just --rm, so it has to be repeated here). The memory cap is
+  # load-bearing: on run 20261005-113503 one agent-written test script
+  # (matplotlib-24026, `python3 /testbed/test_stackplot.py` plus the pytest run
+  # of it) grew to 1.3 TB of host RAM inside a single container, Ray's memory
+  # monitor saw the node at 95% and killed the trainer at the start of step 2.
+  # Containers had no limit at all. 32 GB is far above what any SWE-bench test
+  # suite needs and still lets a runaway process be killed by its own cgroup
+  # (the command fails with exit 137 and the agent sees that) instead of
+  # taking the node down. --memory-swap equal to --memory means no swap.
+  # Rootless docker here runs cgroup v2 with the memory controller delegated,
+  # which is what makes --memory enforceable without root.
+  run_args: ["--rm", "--memory=32g", "--memory-swap=32g"]
   interpreter: ["bash", "-c"]
   env:
     PAGER: cat

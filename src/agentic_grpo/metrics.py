@@ -207,6 +207,7 @@ class TrajectoryMetrics:
     patch_recovered: bool = False
     eval_error: str = ""          # harness raised (missing dep, docker, timeout)
     eval_cached: bool = False     # verdict reused from the patch-keyed cache
+    eval_oom: bool = False        # test run OOM-killed under the eval container cap
     patch_applied: bool = False   # patch_successfully_applied
     f2p_passed: int = 0           # FAIL_TO_PASS tests that passed
     f2p_total: int = 0
@@ -327,6 +328,13 @@ class TrajectoryMetrics:
             # If eval_error_rate is not ~0 the reward signal is not measuring the
             # agent at all -- treat any nonzero value as a broken run, not a hard task.
             "reward/eval_error_rate": sum(1 for m in batch if m.eval_error) / n,
+            # Subset of eval errors where the kernel killed the test run under the
+            # eval container's memory cap (AGENTIC_EVAL_CONTAINER_MEMORY, 32g).
+            # Two uncapped matplotlib evals at 263 + 196 GB took the node down on
+            # 2026-10-05; now they die alone and land here. The decision this
+            # moves: the same instances persistently nonzero here means a
+            # legitimate suite needs more than the cap -> raise it, never drop it.
+            "reward/eval_oom_rate": sum(1 for m in batch if m.eval_oom) / n,
             **group_rates,
             "reward/f2p_pass_rate": rate("f2p_passed", "f2p_total"),
             "reward/p2p_pass_rate": rate("p2p_passed", "p2p_total"),
