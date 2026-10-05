@@ -179,6 +179,15 @@ export AGENTIC_MAX_REPEATED_CALLS="${AGENTIC_MAX_REPEATED_CALLS:-6}"
 
 export AGENTIC_MAX_EVAL_CONTAINERS="${AGENTIC_MAX_EVAL_CONTAINERS:-4}"
 export AGENTIC_EVAL_TIMEOUT="${AGENTIC_EVAL_TIMEOUT:-900}"
+# Memory cap on the harness's EVAL containers (docker-py mem_limit, injected by
+# reward.py underneath the harness). The agent containers get theirs from
+# configs/agent.yaml run_args; these had none, and on run 20261005-143426 two
+# matplotlib eval pytests reached 263 + 196 GB on top of the ~1.2 TB the 4-GPU
+# param_offload trainer parks on the host -- Ray's memory monitor killed the
+# trainer at the start of step 2, the second run in a row lost that way. A test
+# run killed under the cap grades as an eval error (reward/eval_oom_rate), not
+# as a failed patch. 0 disables; raise it if the same instances keep landing there.
+export AGENTIC_EVAL_CONTAINER_MEMORY="${AGENTIC_EVAL_CONTAINER_MEMORY:-32g}"
 export AGENTIC_REWARD_CACHE_DIR="${AGENTIC_REWARD_CACHE_DIR:-/data0/shared/kewen.liu/agentic-reward-cache}"
 
 # Point every docker client at the ROOTLESS daemon (store on /data1). The docker
@@ -311,6 +320,23 @@ if [ -n "${AGENTIC_TRAJECTORY_DUMP:-}" ] || [ -n "${AGENTIC_TRAJECTORY_DUMP_DIR:
   DUMP_OVERRIDES=(
     +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TRAJECTORY_DUMP_DIR=\"${AGENTIC_TRAJECTORY_DUMP_DIR}\"
   )
+  # The conversation TEXT as well (default: off even when dumping). One
+  # messages-<pid>.jsonl per worker next to the dump: a header line with the chat
+  # template and tool schemas, then one line per episode with the system/user
+  # prompt, every assistant turn as decoded raw text, and every tool observation
+  # or nudge as the model saw it. It is the only record of the words -- the dump
+  # above keeps commands, the timeline keeps token COUNTS. Measured need: ~130 MiB
+  # per 2048-episode step (34.6M tokens on run 20260912-072938). For SIMULATOR.md
+  # §15: the simulator's conversation-only adapter is checked by rebuilding token
+  # counts from this text and comparing them with the timeline's.
+  #
+  #   AGENTIC_TRAJECTORY_DUMP=1 AGENTIC_TRAJECTORY_DUMP_MESSAGES=1 bash scripts/run_grpo.sh
+  if [ "${AGENTIC_TRAJECTORY_DUMP_MESSAGES:-0}" != "0" ]; then
+    echo "Conversation text -> ${AGENTIC_TRAJECTORY_DUMP_DIR}/messages-<pid>.jsonl (~130MiB/step)"
+    DUMP_OVERRIDES+=(
+      +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_TRAJECTORY_DUMP_MESSAGES=\"1\"
+    )
+  fi
 fi
 
 # --- Run timeline (default: ON) ---
@@ -463,6 +489,7 @@ python3 "${REPO_ROOT}/scripts/verl_entry.py" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_LIVE_CONTAINERS=\"${AGENTIC_MAX_LIVE_CONTAINERS}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_MAX_EVAL_CONTAINERS=\"${AGENTIC_MAX_EVAL_CONTAINERS}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_EVAL_TIMEOUT=\"${AGENTIC_EVAL_TIMEOUT}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_EVAL_CONTAINER_MEMORY=\"${AGENTIC_EVAL_CONTAINER_MEMORY}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_REWARD_CACHE_DIR=\"${AGENTIC_REWARD_CACHE_DIR}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_KEEP_FAILED_EVAL_LOGS=\"${AGENTIC_KEEP_FAILED_EVAL_LOGS:-0}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.AGENTIC_CONTAINER_START_RETRIES=\"${AGENTIC_CONTAINER_START_RETRIES:-3}\" \
