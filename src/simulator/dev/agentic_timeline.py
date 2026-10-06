@@ -3,7 +3,9 @@
 This is the trace with the most in it, which makes it the format sample for the
 degradation test of `SIMULATOR.md` §15, not the "best" input: it carries the
 answers right next to the workload, and the whole job here is to keep them apart
-(§3, §6). Per event:
+(§3, §6). Use time never has one of these (§1), which is why this adapter lives
+in :mod:`simulator.dev` and is not in the default
+:data:`simulator.adapters.ADAPTERS`. Per event:
 
 ======================  ====================================================
 ``generate``            ``prompt_tokens`` / ``completion_tokens`` -> Request, traced.
