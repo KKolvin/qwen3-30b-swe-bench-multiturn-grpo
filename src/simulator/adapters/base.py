@@ -67,13 +67,28 @@ class Prior:
     :attr:`source` is where it was measured, as a run id or a harness name. It is
     required because a prior that cannot say where it came from is an invented
     number with a distribution wrapped around it, and because :func:`check` uses
-    it to refuse a prior borrowed from the trace being converted.
+    it to refuse a prior borrowed from the trace being converted. A source spelled
+    ``run:<id>/<part>``, as the adapters spell a workload's, names the run before
+    the first slash, and :func:`check` compares runs, not whole strings: step 2 of
+    a run is not an independent measurement for step 1, nor its conversation dump
+    for its timeline.
+
+    :attr:`scale_sources` are the runs :attr:`scale` was measured across, for the
+    same refusal: a scale stretched to reach the trace being converted has seen
+    the answer. Empty when the scale is a claim rather than a measurement.
+
+    :attr:`default` is True when nobody stated this prior and the simulator's
+    default (:func:`simulator.adapters.priors.default_priors`) stands in. It
+    changes nothing about how the prior is used; it is there so the provenance
+    report can say "you did not give this, we used our run" (`SIMULATOR.md` §5).
     """
 
     knob: str
     dist: Dist
     source: str
     scale: Dist | None = None
+    scale_sources: tuple[str, ...] = ()
+    default: bool = False
 
     def __post_init__(self) -> None:
         if not self.knob:
@@ -92,7 +107,9 @@ class Priors:
 
     Supplied by the caller, never assembled by an adapter: which run's tool times
     stand in for a trace that recorded none is a decision about the experiment,
-    and it has to be visible in the call, not buried in a reader.
+    and it has to be visible in the call, not buried in a reader. The usual caller
+    is :func:`simulator.adapters.priors.resolve_priors`, which takes whatever the
+    config bundle states and fills the rest from our own run.
     """
 
     by_knob: Mapping[str, Prior] = field(default_factory=dict)
@@ -125,6 +142,11 @@ class Priors:
 
     def sources(self) -> frozenset[str]:
         return frozenset(p.source for p in self.by_knob.values())
+
+
+def same_run(a: str, b: str) -> bool:
+    """Whether two sources name the same run: the part before the first ``/``, see :class:`Prior`."""
+    return a.split("/", 1)[0] == b.split("/", 1)[0]
 
 
 @dataclass(frozen=True)
@@ -184,8 +206,8 @@ def check(conv: Conversion, priors: Priors) -> None:
 
     In order: the IR is valid; the observed half names the same source, so a
     workload cannot be diffed against somebody else's timeline; every observed
-    request and session pairs with a node the IR actually has; no prior was
-    measured on the trace being converted; and every Unknown in the workload is
+    request and session pairs with a node the IR actually has; no prior's shape or
+    scale was measured on the run being converted; and every Unknown in the workload is
     exactly one of the supplied priors, so an adapter cannot quietly estimate a
     field from a distribution it made up or read off the trace itself.
     """
@@ -196,11 +218,13 @@ def check(conv: Conversion, priors: Priors) -> None:
             f"{conv.adapter!r} read workload {w.source!r} but its observations say "
             f"{o.source!r}; the two halves of one trace must name the same source"
         )
-    borrowed_from_self = sorted(k for k, p in priors.by_knob.items() if p.source == w.source)
+    borrowed_from_self = sorted(k for k, p in priors.by_knob.items()
+                                if any(same_run(s, w.source) for s in (p.source, *p.scale_sources)))
     if borrowed_from_self:
         raise AdapterError(
-            f"priors {borrowed_from_self} were measured on {w.source!r}, the trace being "
-            f"converted; a stripped field filled from its own trace is the answer, not an estimate"
+            f"priors {borrowed_from_self} were measured on the run of {w.source!r}, the trace "
+            f"being converted; a stripped field filled from its own run is the answer, not an "
+            f"estimate. State these knobs in the config bundle, or build priors from another run"
         )
     request_ids = {r.id for s in w.sessions for r in s.requests}
     for r in o.requests:
