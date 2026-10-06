@@ -133,6 +133,7 @@ re-graded here.
 | `reward/zero_advantage_group_rate` | **The share of GRPO groups that taught the policy nothing.** Advantages are normalized within each group of `rollout.n: 8` samples of one prompt, so a group whose 8 rewards are all equal contributes exactly zero gradient — those 8 episodes started containers, decoded ~27k tokens and were graded for nothing. Measured **68.4 / 63.3 / 61.3%** on run 20260906-013757. Nothing else logged says this: `critic/advantages/{max,min}` read ±2.47 on all three steps, because they only collapse to 0 when *every* group is flat. This is the row that argues for filtering the dataset, changing `rollout.n`, or shaping a denser reward. Absent on validation (`n=1`, where every group is uniform by definition). | groups by `instance_id`, `max(r) == min(r)`, in [`aggregate`](src/agentic_grpo/metrics.py) |
 | `reward/solved_group_rate` | The half of those that are flat because the policy **already solves** the instance (all 8 resolved): **14.8 / 12.1 / 12.1%**. Wasted rollout rather than a hard task, and the one the dataset can be filtered on directly. `zero_advantage - solved` is the all-zero share (53.5 / 51.2 / 49.2%) — the hard-instance half, which needs reward shaping instead. | `min(r) >= 1.0` over the same groups |
 | `reward/eval_error_rate` | Fraction of trajectories where the grading harness itself raised (missing dep, docker failure, timeout). **Treat any nonzero value as a broken run, not a hard task** — the reward is then not measuring the agent. | the `except` in `compute_reward` stores `str(exc)` in `eval_error`; rate = fraction non-empty |
+| `reward/eval_oom_rate` | Fraction of trajectories whose test run the kernel OOM-killed under the eval container memory cap (`AGENTIC_EVAL_CONTAINER_MEMORY`, default 32g; the agent containers have the same cap via `configs/agent.yaml`). A subset of `eval_error_rate`: reward 0, not cached, because "the tests never finished" is not a verdict on the patch. Two uncapped matplotlib evals at 263 + 196 GB took the node down on 2026-10-05. The same instances persistently nonzero here means a legitimate suite needs more than the cap: raise it, never drop it. | `_grade_with_harness` reads `oom_kill` from the container cgroup's `/sys/fs/cgroup/memory.events` on the way into the harness's `container.stop` |
 | `reward/recovered_resolve_rate` | Resolve rate **among** the recovered patches only. The fallback's own report card: near zero means it is feeding the harness junk and should be turned off with `AGENTIC_PATCH_FALLBACK=0`; anywhere near `reward/resolve_rate` means it is recovering real solutions. | `resolved & patch_recovered` over `patch_recovered` |
 | `reward/f2p_pass_rate` | Micro-averaged FAIL_TO_PASS pass rate: `sum(f2p_passed) / sum(f2p_total)` over the batch, not a mean of per-instance rates. Measures partial progress on the bug the task is about. | success/failure list lengths under `report["tests_status"]["FAIL_TO_PASS"]` |
 | `reward/p2p_pass_rate` | Same for PASS_TO_PASS — the regression check. A drop means patches are breaking working code. | `report["tests_status"]["PASS_TO_PASS"]` |
@@ -250,6 +251,13 @@ per `AgentLoopWorker`, symlinked from the run's `analysis/` directory), each car
 * `instance_id`, `exit_status`, `reward`,
 * `actions` — the commands the agent actually ran, with truncated output,
 * `metrics` — the **full** `TrajectoryMetrics`, including the per-turn `turns` timeline.
+
+Adding `AGENTIC_TRAJECTORY_DUMP_MESSAGES=1` also writes `messages-<pid>.jsonl` next to it: a
+header line with the chat template and tool schemas, then one line per episode holding the
+conversation text in the order the model saw it (system and user prompt, each assistant turn
+as decoded raw text, each tool observation or nudge). Off by default because it is the one
+record that scales with context: ~130 MiB per 2048-episode step, against ~45 MiB for the
+dump. It is the input for the simulator's conversation-only trace adapter (SIMULATOR.md §15).
 
 `turns` is the only place the per-turn detail exists: it is deliberately stripped from
 the batch payload sent to the trainer (`to_dict(include_turns=False)`), because 80 turns

@@ -32,6 +32,7 @@ ray>=2.40.0
 cachetools>=5.0
 hydra-core>=1.3.2
 omegaconf>=2.3.0
+pyyaml>=6.0
 pydantic>=2.6
 numpy>=1.26
 

@@ -235,9 +235,64 @@ IR 只装 workload，不装系统配置：`Lease` 只说要哪个 pool，不说 
 | SGLang server args | SGLang 版本；TP、replica 数、`page_size`、`chunked_prefill_size`、`max_running_requests`、`new_token_ratio` 的三个参数、`max_total_num_tokens`、overlap 开没开 | 有活着的 server 就直接读；没有就跑 SGLang 自己算默认值的那段代码 |
 | 模型 `config.json` + 硬件规格 | layer 数、KV head 数、head dim、active expert、dtype 宽度、HBM 带宽、`cuda_graph_max_bs` | 拒绝跑 |
 | calibration 结果 | cost model 的三个拟合量（§8） | 本机没测过，就用别的机器上最近的测量点，并打印离它多远 |
+| prior（trace 没记的耗时） | 每个 knob 一个数：中位数要几秒；拿不准就给 `[lo, hi]` | 用我们自己 run 量的分布，报告里标「默认」 |
 
 **一项都不许拿「常见默认值」顶。** SGLang 很多默认值是按 GPU 显存分支的，照抄就是在编。整个
 bundle 要能原样存成一个文件、跟着预测结果走，不然这份预测没法复现。
+
+**prior 是唯一有默认的一项。** 前几行是系统配置，填错了预测就错，而且看不出来。prior 本来就是
+「估的」：它已经带着 interval，sensitivity table 会单独给它一行，报告会写它从哪来。用我们的 run
+顶上，最坏是那一行的 interval 偏了，用户看得见，也知道该补哪个数。拒绝跑反而让只有对话的 trace
+一个数都拿不到。
+
+默认值是一份存进 repo 的文件 `src/simulator/adapters/default_priors.json`，由
+`scripts/simulator_dev/build_default_priors.py` 生成：分布取 run 20260912-072938 step 1 的全部实测耗时，scale 取
+20261005-113503、20261005-143426、20261006-030010 三个 run 的 step 1 均值相对它的比值，再把 1.0
+包进去。
+
+**用户怎么配。** 在 bundle 的 YAML 里写一个 `priors` 段，例子在
+`configs/simulator/example_bundle.yaml`：
+
+```yaml
+priors:
+  eval_duration: 45            # 我们的 harness 打分大概 45 秒
+  tool_duration: [0.5, 2]      # 拿不准，0.5 到 2 秒之间
+  # 没写的 container_start、patch_recover、cleanup 用我们的
+```
+
+写完跑 `python scripts/show_priors.py <bundle>`，每个 knob 打一行：中位数、范围、用的是用户的数还是我们
+的。代码里是 `load_priors(path)`，返回的 `Priors` 直接交给 adapter。
+
+**不知道要填什么。** 跑 `python scripts/priors_template.py`，它把所有 knob 列出来，每个都注释掉、写着
+我们的数和它在我们 run 里占多少 task 时间：
+
+```yaml
+priors:
+  # eval_duration: 21.7        # running the tests that score one submitted patch. 66.3% of task time, our runs drifted 0.90-1.02x
+  # tool_duration: 0.22        # one tool call (bash, edit, submit, ...). 29.4% of task time, our runs drifted 0.89-1.00x
+  # container_start: 0.377     # starting the container one episode runs in. 3.7% of task time, our runs drifted 0.84-1.09x
+  # patch_recover: 0.737       # pulling the diff out of an episode that never submitted. 0.6% of task time, our runs drifted 0.92-1.00x
+  # cleanup: 0.000697          # removing the container when an episode ends. 0.0% of task time, our runs drifted 0.81-1.00x
+```
+
+按占比排，所以实际上只有头两行值得填：打分和 tool 加起来 96%。哪行都不填也能跑，全用我们的。
+
+只有两种写法：
+
+- `eval_duration: 40`：中位数 40 秒。把我们的分布整体挪过去，让中位数落在 40，一次和一次之间差多少
+  还用我们量的。别人一般说得出「打分大概要多久」，说不出它的尾巴长什么样。给一个数等于声明这个
+  中位数是对的，这一行没有 scale，interval 不会因为它变宽。
+- `tool_duration: [0.5, 2]`：拿不准，中位数在 0.5 到 2 秒之间。这个范围就是 scale，sensitivity table
+  扫的就是它。
+
+不管哪种，**我们自己的 scale 都不带过去**：它量的是我们几个 run 之间差多少，跟别人写的数准不准没
+关系。knob 名字写错直接拒绝，不然默认值原样留着，用户还以为自己改了。
+
+默认值不能拿来转它自己量过的 run：上面四个 run 的任何一个 step、包括对话 dump，`check` 都会拒，
+用户给了中位数也一样，因为分布形状还是那个 run 的。要转这几个 run，就用别的 run 现建 prior（削
+trace 实验就是这么做的）。
+
+训练各段的时长还没有 knob，默认值里也没有它。engine 有了训练段以后再加。
 
 ---
 
@@ -551,12 +606,13 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 
 | 层 | 在哪 | 允许知道什么 | 允许 import |
 | --- | --- | --- | --- |
-| adapter | `src/simulator/adapters/`：接口在 `base.py`，`agentic_timeline.py` 读自家 timeline，`agentic_messages.py` 只读对话文本 | trace 的格式；逐字段判断来路 | `simulator.ir`、`simulator.observed` |
+| adapter | `src/simulator/adapters/`：接口在 `base.py`，`agentic_messages.py` 只读对话文本，`priors.py` 读默认 prior 和 config bundle | trace 的格式；逐字段判断来路 | `simulator.ir`、`simulator.observed` |
 | IR | `src/simulator/ir.py` | 只有 workload | — |
 | realise | `src/simulator/realise.py` | IR，加一个 seed | `simulator.ir` |
 | observed | `src/simulator/observed.py` | 真实系统的结果，也就是答案 | `simulator.ir`（只借 id 类型） |
 | engine | 待建 | 抽样过的 IR + config | `simulator.ir` |
-| 对答案 | 待建 | 两边都知道 | 全部 |
+| 开发专用 | `src/simulator/dev/`：`agentic_timeline.py` 读自家 timeline（也是 adapter，守 adapter 那一行的 import 规矩），`priors.py` 从自家 run 量 prior、写 `default_priors.json`；脚本在 `scripts/simulator_dev/` | 自家 run，连同答案 | 全部 |
+| 对答案 | 待建，放进 `src/simulator/dev/` | 两边都知道 | 全部 |
 
 规矩：
 
@@ -574,6 +630,10 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 6. **没有答案也必须能跑完。** 使用时没有 timeline，任何「需要 `observed` 才走得通」的代码路径，
    在真正该用的场合就是死路，而且开发时永远发现不了。检查办法：拿一份只有 trace、没有 timeline
    目录的输入跑一遍完整流程，`Observations` 全空也要得出数。
+7. **使用时的代码不许 import `simulator.dev`。** 使用时的代码指 `src/simulator/` 下 `dev/` 以外的
+   所有文件，加上 `scripts/` 顶层的脚本。`dev` 里的东西只在我们自己的 run 上走得通，使用时调到它
+   就是第 6 条那种死路。默认的 `ADAPTERS` 里也没有读自家 timeline 的那个 adapter，开发时要显式传。
+   有 test 守着（[tests/test_simulator_ir.py](tests/test_simulator_ir.py)）。
 
 ---
 
@@ -583,7 +643,7 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 | --- | --- | --- |
 | trace 和 config 是一套：这份 token 流就是在这份 config 下跑出来的 | **高** | 比对 turn cap、模型名、工具集、prompt 模板指纹。对不上就拒绝报数 |
 | 时间戳相减的耗时可以当活本身的耗时 | **高** | 同一个 harness 空载重跑一遍比分布；当场能做的是把 replica 数翻倍，看 e2e 动不动 |
-| 只有对话时，tokenizer + 模板重建的 token 数等于当时真实发出的 | **已量**（run 20261005-113503，144 条 episode）：prompt 93% 一字不差，completion 98.7%，其余差 +1 到 +9 个 token，来自模型采样出非标准的切分，重编码补不回来。另外第一轮 prompt 超过 `prompt_length`（这里 4096）会被从头截掉，文本里看不出来，所以这个数必须从 config bundle 拿 | `scripts/check_messages_reconstruction.py` |
+| 只有对话时，tokenizer + 模板重建的 token 数等于当时真实发出的 | **已量**（run 20261005-113503，144 条 episode）：prompt 93% 一字不差，completion 98.7%，其余差 +1 到 +9 个 token，来自模型采样出非标准的切分，重编码补不回来。另外第一轮 prompt 超过 `prompt_length`（这里 4096）会被从头截掉，文本里看不出来，所以这个数必须从 config bundle 拿 | `scripts/simulator_dev/check_messages_reconstruction.py` |
 | tool 耗时不随 container 并发数变化 | **中** | 比较 cap 16 和 cap 40 两个 run 的 tool 耗时分布 |
 | 下一轮 prompt 就是上一轮整段再加新内容 | **已验证**：95,403 对里 0 例外 | — |
 | stub 吐什么 token 不影响调度，SGLang 只看长度和 id 是否相同 | 低 | 用两个不同 seed 的 hash 跑同一份 IR，每一步的记录必须完全一样 |
@@ -642,20 +702,36 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 `src/simulator/realise.py`、`src/simulator/observed.py`、`tests/test_simulator_ir.py`。IR 现在能
 说「不知道」，能写并行 tool call，能写 subagent，`max_new_tokens` 可以空着让 config 填（§4）。
 第 1 步做了一半：接口在 `adapters/base.py`，读自家 timeline 的 adapter 在
-`adapters/agentic_timeline.py`，一份 workload 对应一个训练 step。在 run 20260912-072938 的 step 1 上
+`dev/agentic_timeline.py`，一份 workload 对应一个训练 step。在 run 20260912-072938 的 step 1 上
 跑过：2,048 个 session、256 个 group 全部合法，1.8 秒转完；它算出的 structural share 减去 observed
 里的 `cached_tokens`，p50 是 114，第一轮的命中率 p10 0.396、p50 0.984，和 §3、§4 的数字对得上。
-削 trace 实验做到了「删掉所有耗时」这一级：用 run 20260908-052218 做 prior 填回去能过 check，拿
-同一个 run 做 prior 会被拒。再往下的「只有对话」一级还做不了，原因有两个：手上没有任何一份数据
-存了对话本身（timeline 和 trajectory dump 都只有命令和 token 数），以及 §4 说的 unknown 之间不能
-有关系。前一个原因已经补上：run 20261005-113503 开着 `AGENTIC_TRAJECTORY_DUMP_MESSAGES=1`，每条
-episode 的对话全文都存了下来，`adapters/agentic_messages.py` 只读这份文本，token 数全部 derived，耗时
-全部从 prior 估。拿它和读 timeline 的 adapter 在同一批 2,034 条 episode 上对：DAG 形状 2,034 条全部
-一样（每轮一个 request、每次 tool call 一个 task、同样的 lease 和打分尾巴），completion 98.0% 一字
-不差，prompt 的误差全部等于前面 completion 误差的累加。文本里读不出来的只剩：属于哪个 step（没有
-时间戳）、cap、停止原因、tool 有没有超时。这一级拿 prior 填耗时的路径也走通了。还缺的那条「unknown
-之间不能有关系」在这份数据上不触发，因为 token 数是 derived 不是 estimated。config bundle、engine
-都还没有。
+削 trace 实验已经整条跑完，脚本是 `scripts/simulator_dev/degrade_trace.py`，数据是 run 20261006-030010 的 step 1
+（timeline 和对话全文都有，2,037 条 episode；还有 11 条的 event 在 TimelineWriter 的 400 行 buffer 里没
+落盘），prior 取 run 20261005-113503 的 step 1，scale 用 20261005-143426 和 20260912-072938 每个 knob 的
+均值相对 prior 的比值撑开。结果：
+
+- 全量 timeline、删掉每段活的耗时、只剩对话，这三级都出合法 workload。中间两级（再删 usage、再删
+  时间戳）被 adapter 拒掉：token 数估不了，因为相邻 turn 的 prompt 是绑在一起的；没有 trainer 的 gen
+  span 就放不进 step。拒绝是如实的，不是算出一堆错数。
+- 只剩对话这一级，DAG 形状 2,037 条全部和 timeline 一样，completion 97.8% 一字不差、总量差 0.01%，
+  prompt 88% 一字不差（差的全是 completion 误差的累加），第一轮 prompt 和 group prefix 全对。文本
+  读不出来的还是那几样：属于哪个 step（对话 dump 里有 2,208 条，160 条 validation 得靠 timeline 才
+  剔得掉）、cap、停止原因、tool 有没有超时；observed 那半边是空的，所以这一级没法自己对答案。
+- interval 的检查没有全过。带 scale 时 task 总耗时、eval、per-session p90 盖住了全量那级的点，但
+  tool 和 container_start 的 interval 整个在点的上方：这次 run 的 tool 和 eval 比之前三个 run 都快，
+  container_start 和最快的那个持平（均值比 0.78 到 0.97），而 scale 是拿那几个 run 撑出来的，下沿
+  要么没够到要么正卡在边上。不带 scale 的 control 一个总量都盖不住，证实了只靠逐节点抽样的
+  interval 不是预测。
+- 删掉耗时那级和只剩对话那级的 interval 一样宽：文本把结构读得一字不差，所以再往下削掉的不是
+  精度，是 step 归属、答案和 timeout 标记。
+- 逐节点独立抽样丢掉了 session 内部的相关性（同一个 instance 的 eval 和 tool 是一起长一起短的），
+  所以总量盖住了，per-session 的 p50 还是偏低、max 偏高。
+
+report 在 `analysis/20261006-030010/degrade/step1/report.md`。下一步不是给中间两级补一个 timeline 加
+文本的混合 adapter（只剩对话那级已经证明文本够用），而是 scale 的来路：两个 run 不够，要么多拿几个
+run，要么把它当成 config bundle 里要人填的 claim。两条现在都有了：默认 prior 的 scale 用三个 run
+撑开，030010 也在里面；用户也可以在 bundle 里自己写 scale（§5）。config bundle 只落地了 prior 这
+一项，其余几项和 engine 都还没有。
 
 ---
 
