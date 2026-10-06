@@ -32,7 +32,7 @@ R4 cannot tell which training step an episode belonged to (no timestamps), so
 its input is the conversation dump filtered to the sessions R0 holds. The
 unfiltered count is reported next to it: that is what text alone would include.
 
-    python scripts/degrade_trace.py --run 20261006-030010 --step 1 \
+    python scripts/simulator_dev/degrade_trace.py --run 20261006-030010 --step 1 \
         --prior-run 20261005-113503 --scale-runs 20261005-143426 20260912-072938
 """
 
@@ -47,14 +47,15 @@ from collections import Counter, defaultdict
 from dataclasses import replace
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
-from simulator.adapters import check, priors_from_workload  # noqa: E402
+from simulator.adapters import check  # noqa: E402
 from simulator.adapters.agentic_messages import AgenticMessagesAdapter  # noqa: E402
-from simulator.adapters.agentic_timeline import AgenticTimelineAdapter  # noqa: E402
-from simulator.adapters.base import AdapterError, Conversion, Prior, Priors  # noqa: E402
-from simulator.ir import IRError, Uniform, Workload, validate  # noqa: E402
+from simulator.adapters.base import AdapterError, Conversion, Priors  # noqa: E402
+from simulator.dev.agentic_timeline import AgenticTimelineAdapter  # noqa: E402
+from simulator.dev.priors import priors_from_workload, scale_from_runs  # noqa: E402
+from simulator.ir import IRError, Workload, validate  # noqa: E402
 from simulator.realise import knobs, realise  # noqa: E402
 
 USER = os.environ.get("USER", "nobody")
@@ -152,21 +153,16 @@ def _median(xs) -> float:
 
 
 def build_priors(prior: Conversion, scale_convs: dict[str, Conversion]) -> tuple[Priors, list[dict]]:
-    base = priors_from_workload(prior.workload)
-    others = {run: priors_from_workload(c.workload) for run, c in scale_convs.items()}
-    out, table = [], []
-    for knob, p in sorted(base.by_knob.items()):
-        m0 = _mean(p.dist.values)
-        ratios = {run: _mean(o.by_knob[knob].dist.values) / m0
-                  for run, o in others.items() if knob in o.by_knob and m0 > 0}
-        lo, hi = min([1.0, *ratios.values()]), max([1.0, *ratios.values()])
-        scale = Uniform(lo, hi) if hi > lo else None
-        out.append(Prior(knob=knob, dist=p.dist, source=p.source, scale=scale))
-        table.append({"knob": knob, "n": len(p.dist.values), "mean_s": m0,
+    run_of = {c.workload.source: run for run, c in scale_convs.items()}
+    priors, ratios = scale_from_runs(priors_from_workload(prior.workload),
+                                     {run: priors_from_workload(c.workload) for run, c in scale_convs.items()})
+    table = []
+    for knob, p in sorted(priors.by_knob.items()):
+        table.append({"knob": knob, "n": len(p.dist.values), "mean_s": _mean(p.dist.values),
                       "median_s": _median(p.dist.values),
-                      "mean_ratio": {r: round(v, 3) for r, v in ratios.items()},
-                      "scale": [lo, hi] if scale else None})
-    return Priors.of(*out), table
+                      "mean_ratio": {run_of[s]: round(v, 3) for s, v in ratios[knob].items()},
+                      "scale": [p.scale.lo, p.scale.hi] if p.scale else None})
+    return priors, table
 
 
 def without_scale(w: Workload) -> Workload:

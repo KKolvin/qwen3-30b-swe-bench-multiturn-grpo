@@ -10,7 +10,7 @@ dump recorded for the same episode. This is the §14 assumption of
 ``SIMULATOR.md`` -- "tokenizer + template rebuilds the token counts" -- as a
 number rather than a hope.
 
-    python scripts/check_messages_reconstruction.py --dir /data0/shared/$USER/agentic-trajectories/<run>
+    python scripts/simulator_dev/check_messages_reconstruction.py --dir /data0/shared/$USER/agentic-trajectories/<run>
 
 Pairing is positional per worker file: the i-th episode line of
 ``messages-<pid>.jsonl`` is the i-th line of ``trajectories-<pid>.jsonl``, since

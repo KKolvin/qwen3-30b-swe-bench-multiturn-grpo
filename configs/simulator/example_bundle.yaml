@@ -1,0 +1,16 @@
+# Example config bundle for the simulator (SIMULATOR.md §5).
+# Only the `priors` section exists so far; recipe, server args and hardware come later.
+#
+# priors: how long the work your trace did not time takes, in seconds.
+# One line per knob, either
+#   knob: 2          the median is 2 s
+#   knob: [1, 4]     not sure: the median is somewhere between 1 and 4 s
+# Any knob you leave out uses our run (20260912-072938). Your number moves our
+# run's distribution so its median lands there; the spread between calls stays ours.
+# `python scripts/priors_template.py` lists every knob with our value;
+# `python scripts/show_priors.py <this file>` shows what each knob ends up using.
+
+priors:
+  eval_duration: 45            # our harness takes about 45 s to score a patch (ours: 21.7 s)
+  tool_duration: [0.5, 2]      # not sure; somewhere between 0.5 and 2 s (ours: 0.22 s)
+  # container_start, patch_recover, cleanup: not stated, so ours are used
